@@ -175,14 +175,23 @@ def chain_embedding(
         min_res_n: Annotated[int, typer.Option(
             help='Consider only chains with more than <min_res_n> residues.'
         )] = 0,
-        batch_size: Annotated[int, typer.Option(
+        batch_size_res: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
         )] = 1,
-        num_workers: Annotated[int, typer.Option(
+        num_workers_res: Annotated[int, typer.Option(
             help='Number of subprocesses to use for data loading.'
         )] = 0,
-        num_nodes: Annotated[int, typer.Option(
-            help='Number of nodes to use for inference.'
+        num_nodes_res: Annotated[int, typer.Option(
+            help='Number of nodes to use for inference of residue embeddings.'
+        )] = 1,
+        batch_size_aggregator: Annotated[int, typer.Option(
+            help='Number of samples processed together in one iteration.'
+        )] = 1,
+        num_workers_aggregator: Annotated[int, typer.Option(
+            help='Number of subprocesses to use for data loading.'
+        )] = 0,
+        num_nodes_aggregator: Annotated[int, typer.Option(
+            help='Number of nodes to use for inference of embeddings.'
         )] = 1,
         accelerator: Annotated[Accelerator, typer.Option(
             help='Device used for inference.'
@@ -219,9 +228,9 @@ def chain_embedding(
             src_from=SrcProteinFrom.structure,
             structure_format=structure_format,
             min_res_n=min_res_n,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            num_nodes=num_nodes,
+            batch_size=batch_size_res,
+            num_workers=num_workers_res,
+            num_nodes=num_nodes_res,
             accelerator=accelerator,
             devices=arg_devices(devices),
             out_format=OutFormat.separated,
@@ -238,9 +247,9 @@ def chain_embedding(
         src_from=SrcTensorFrom.structure,
         structure_format=structure_format,
         min_res_n=min_res_n,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_nodes=num_nodes,
+        batch_size=batch_size_aggregator,
+        num_workers=num_workers_aggregator,
+        num_nodes=num_nodes_aggregator,
         accelerator=accelerator,
         devices=arg_devices(devices),
         out_path=output_path,
@@ -296,14 +305,23 @@ def assembly_embedding(
         max_res_n: Annotated[int, typer.Option(
             help='Stop adding assembly chains when number of residues is greater than <max_res_n> residues.'
         )] = sys.maxsize,
-        batch_size: Annotated[int, typer.Option(
+        batch_size_res: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
         )] = 1,
-        num_workers: Annotated[int, typer.Option(
+        num_workers_res: Annotated[int, typer.Option(
             help='Number of subprocesses to use for data loading.'
         )] = 0,
-        num_nodes: Annotated[int, typer.Option(
-            help='Number of nodes to use for inference.'
+        num_nodes_res: Annotated[int, typer.Option(
+            help='Number of nodes to use for inference of residue embeddings.'
+        )] = 1,
+        batch_size_aggregator: Annotated[int, typer.Option(
+            help='Number of samples processed together in one iteration.'
+        )] = 1,
+        num_workers_aggregator: Annotated[int, typer.Option(
+            help='Number of subprocesses to use for data loading.'
+        )] = 0,
+        num_nodes_aggregator: Annotated[int, typer.Option(
+            help='Number of nodes to use for inference of embeddings.'
         )] = 1,
         accelerator: Annotated[Accelerator, typer.Option(
             help='Device used for inference.'
@@ -340,9 +358,9 @@ def assembly_embedding(
             src_from=SrcProteinFrom.structure,
             structure_format=structure_format,
             min_res_n=min_res_n,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            num_nodes=num_nodes,
+            batch_size=batch_size_res,
+            num_workers=num_workers_res,
+            num_nodes=num_nodes_res,
             accelerator=accelerator,
             devices=arg_devices(devices),
             out_format=OutFormat.separated,
@@ -360,9 +378,9 @@ def assembly_embedding(
         structure_format=structure_format,
         min_res_n=min_res_n,
         max_res_n=max_res_n,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_nodes=num_nodes,
+        batch_size=batch_size_aggregator,
+        num_workers=num_workers_aggregator,
+        num_nodes=num_nodes_aggregator,
         accelerator=accelerator,
         devices=arg_devices(devices),
         out_path=output_path,

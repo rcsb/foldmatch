@@ -114,7 +114,8 @@ fm-structure chain \
   --src-folder data/structures \
   --res-embedding-folder results/residue_embeddings \
   --output-path results/chain_embeddings \
-  --batch-size 4
+  --batch-size-res 1 \
+  --batch-size-aggregator 4
 
 # Using pre-computed residue embeddings (stored as .pt files)
 fm-structure chain \
@@ -122,7 +123,7 @@ fm-structure chain \
   --res-embedding-folder results/residue_embeddings \
   --output-path results/chain_embeddings \
   --no-compute-residue-embedding \
-  --batch-size 4
+  --batch-size-aggregator 4
 
 # Using pre-computed residue embeddings stored as .csv files
 fm-structure chain \
@@ -131,7 +132,7 @@ fm-structure chain \
   --output-path results/chain_embeddings \
   --no-compute-residue-embedding \
   --res-embedding-format csv \
-  --batch-size 4
+  --batch-size-aggregator 4
 ```
 
 **Key Options:**
@@ -143,6 +144,8 @@ fm-structure chain \
 - `--output-format`: `separated` (individual files) or `grouped` (single JSON)
 - `--output-name`: Filename when using `grouped` format (default: `inference`)
 - `--structure-file-extension`: Override the default file extension used to filter structure files in `--src-folder`. Pass an empty string to disable extension filtering.
+- `--batch-size-res`, `--num-workers-res`, `--num-nodes-res`: Residue embedding inference settings (used when `--compute-residue-embedding` is enabled)
+- `--batch-size-aggregator`, `--num-workers-aggregator`, `--num-nodes-aggregator`: Chain aggregator inference settings
 - All other options similar to `fm-structure residue`
 
 ---
@@ -191,6 +194,8 @@ fm-structure assembly \
 - `--structure-file-extension`: Override the default file extension used to filter structure files in `--src-folder`. Pass an empty string to disable extension filtering.
 - `--min-res-n`: Minimum residues per chain (default: 0)
 - `--max-res-n`: Maximum total residues for assembly (default: unlimited)
+- `--batch-size-res`, `--num-workers-res`, `--num-nodes-res`: Residue embedding inference settings (used when `--compute-residue-embedding` is enabled)
+- `--batch-size-aggregator`, `--num-workers-aggregator`, `--num-nodes-aggregator`: Assembly aggregator inference settings
 - All other options similar to `fm-structure residue`
 
 ---
@@ -245,7 +250,8 @@ fm-sequence chain \
   --fasta-file sequences.fasta \
   --res-embedding-folder results/residue_embeddings \
   --output-path results/chain_embeddings \
-  --batch-size 4
+  --batch-size-res 1 \
+  --batch-size-aggregator 4
 
 # Using pre-computed residue embeddings
 fm-sequence chain \
@@ -253,7 +259,7 @@ fm-sequence chain \
   --res-embedding-folder results/residue_embeddings \
   --output-path results/chain_embeddings \
   --no-compute-residue-embedding \
-  --batch-size 4
+  --batch-size-aggregator 4
 ```
 
 **Key Options:**
@@ -264,6 +270,8 @@ fm-sequence chain \
 - `--res-embedding-format`: Format of the pre-computed residue embedding files when `--no-compute-residue-embedding` is set. Options: `pt` (torch tensor files) or `csv` (default: `pt`). Ignored when residue embeddings are computed on-the-fly.
 - `--output-format`: `separated` (individual files) or `grouped` (single JSON)
 - `--output-name`: Filename when using `grouped` format (default: `inference`)
+- `--batch-size-res`, `--num-workers-res`, `--num-nodes-res`: Residue embedding inference settings (used when `--compute-residue-embedding` is enabled)
+- `--batch-size-aggregator`, `--num-workers-aggregator`, `--num-nodes-aggregator`: Chain aggregator inference settings
 - All other options similar to `fm-sequence residue`
 
 ---
