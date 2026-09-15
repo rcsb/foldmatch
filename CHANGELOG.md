@@ -17,6 +17,19 @@ While the major version is `0`, breaking changes are released in a minor bump.
   a significance quantity, the option turns the significance pass on even when
   neither `evalue` nor `bits` is in `--format-output` (and so, under
   `--significance-mode default`, requires the 11/1 gap penalties).
+- **Compositional bias correction** (`--comp-bias-corr`, `--comp-bias-corr-scale`)
+  on `fm-search query sequences` and `fm-search query db`, and as
+  `comp_bias_corr` / `comp_bias_corr_scale` on `align_candidates`. A port of
+  mmseqs's correction: each query position's score is offset according to its
+  local (40-residue) composition before Smith-Waterman, which lowers scores of
+  locally biased regions. With the same settings, raw scores, bit scores and
+  E-values match `mmseqs search` 18-8cc5c on identical pairs, except for
+  alignments containing a non-standard residue (`X`, `B`, `Z`, `J`, `U`, `O`,
+  `*`), which FoldMatch still scores with biotite's BLOSUM62. Off by default,
+  unlike mmseqs: on a 48-query SCOP benchmark it cost more true positives than
+  the false positives it removed. When on, E-values rise (median about 1.8x on
+  that benchmark) and alignments over biased regions get shorter, lowering
+  coverage. Pass `--comp-bias-corr` to compare with a default mmseqs run.
 
 ### Changed
 

@@ -32,6 +32,12 @@ run with ``--comp-bias-corr 0 --mask 0``: worst relative E-value error 4.7e-4,
 which is mmseqs's own 4-significant-digit output precision, and 400/400 sampled
 pairs had identical raw Smith-Waterman scores under biotite.
 
+mmseqs's default ``--comp-bias-corr 1`` changes the raw score these statistics
+are computed from, not the statistics themselves. FoldMatch ports that
+correction (``alignment.local_composition_bias``) but leaves it off by default;
+enable it with ``fm-search``'s ``--comp-bias-corr`` flag when comparing with a
+default mmseqs run.
+
 Caution when diffing against mmseqs yourself: its ``raw`` output column is
 reconstructed from the stored *integer* bit score and is lossy by +/-1. Since
 E = K*exp(-lambda*S)*area, a 1-unit score error moves E by exp(+/-lambda) ~ 1.31x.

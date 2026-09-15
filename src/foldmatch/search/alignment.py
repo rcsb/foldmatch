@@ -125,6 +125,27 @@ def _expand_cpu_affinity() -> int:
 # stray residue.
 _BIOTITE_ALPHABET = set("ACDEFGHIKLMNPQRSTVWYBZX*")
 
+# Compositional bias correction — a port of MMseqs2's ``--comp-bias-corr``
+# (SubstitutionMatrix::calcLocalAaBiasCorrection plus the rounding in
+# SmithWaterman::ssw_init, soedinglab/MMseqs2 18-8cc5c). See
+# :func:`local_composition_bias`. The offsets are computed in MMseqs2's own
+# scoring alphabet and background, so they match MMseqs2 for any query letters.
+# The substitution scores they are added to still come from biotite's BLOSUM62,
+# which scores non-standard residues (X, B, Z, J, U, O, *) differently from
+# MMseqs2, so alignments containing those can differ by a few score units.
+_MMSEQS_ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
+# Letters MMseqs2 folds onto its alphabet (setupLetterMapping); any other letter
+# outside the alphabet becomes X.
+_MMSEQS_LETTER_MAP = {"B": "D", "Z": "E", "J": "L", "U": "X", "O": "X"}
+# data/blosum62.out "# Background (precomputed optional)" line, in alphabet order.
+_MMSEQS_BLOSUM62_BACKGROUND = (
+    0.07422, 0.02469, 0.05363, 0.05431, 0.04742, 0.07415, 0.02621, 0.06792,
+    0.05815, 0.09891, 0.02499, 0.04465, 0.03854, 0.03426, 0.05161, 0.05723,
+    0.05089, 0.07292, 0.01303, 0.03228, 0.00001,
+)
+# Window over which the local composition is measured: [i-20, i+20).
+_COMP_BIAS_WINDOW = 40
+
 # Per-process globals populated by the multiprocessing initializer so the
 # (immutable, picklable-but-large) substitution matrix is built once per worker.
 _MATRIX = None
@@ -143,6 +164,11 @@ _K: Optional[float] = None
 # Which heavy per-hit strings the active output format requires; set per-process
 # by the pool initializer so workers only build (and pickle back) what's needed.
 _OUTPUT_NEEDS: "_FieldNeeds" = _FieldNeeds(False, False, False, False, False)
+# Compositional bias correction scale, or None when the correction is off; set
+# per-process by the pool initializer.
+_COMP_BIAS_SCALE: Optional[float] = None
+# MMseqs2's (integer BLOSUM62, background) pair for the correction, built lazily.
+_MMSEQS_SCORING: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
 
 @dataclass
@@ -159,7 +185,7 @@ class AlignmentMetrics:
     query_coverage: float      # aligned query residues / full query length == qcov
     subject_coverage: float    # aligned subject residues / full subject length == tcov
     aln_len: int               # alignment length (columns, gaps included) == alnlen
-    score: int                 # raw Smith-Waterman score == raw
+    score: int                 # raw Smith-Waterman score (comp-bias corrected when on) == raw
     # Karlin-Altschul significance. Scale depends on significance_mode:
     # calibrated ('default') or relative-only ('sampled').
     # Never BLAST-comparable — see module header.
@@ -213,6 +239,93 @@ def _to_protein(sequence: str):
     if not clean:
         return None, "", 0
     return seq.ProteinSequence(clean), clean, len(clean)
+
+
+def _mmseqs_blosum62() -> Tuple[np.ndarray, np.ndarray]:
+    """MMseqs2's integer BLOSUM62 and background, both in ``_MMSEQS_ALPHABET`` order.
+
+    MMseqs2 regenerates its integer matrix from data/blosum62.out; on the 20
+    amino acids that equals biotite's BLOSUM62, while its X row and column are a
+    flat -1. readProbMatrix scales the 20 amino-acid background entries by
+    ``1 - pBack[X]``.
+    """
+    global _MMSEQS_SCORING
+    if _MMSEQS_SCORING is None:
+        import biotite.sequence.align as align
+        std = align.SubstitutionMatrix.std_protein_matrix()
+        idx = [std.get_alphabet1().encode(c) for c in _MMSEQS_ALPHABET[:20]]
+        matrix = np.full((21, 21), -1, dtype=np.int64)
+        matrix[:20, :20] = std.score_matrix()[np.ix_(idx, idx)]
+        background = np.array(_MMSEQS_BLOSUM62_BACKGROUND, dtype=np.float64)
+        background[:20] *= 1.0 - background[20]
+        _MMSEQS_SCORING = (matrix, background)
+    return _MMSEQS_SCORING
+
+
+def local_composition_bias(sequence: str, scale: float = 1.0) -> np.ndarray:
+    """MMseqs2's per-position compositional bias correction for a query sequence.
+
+    Returns one integer offset per residue (of the stripped, uppercased
+    sequence, i.e. aligned with :func:`sanitize_sequence`). MMseqs2 adds offset
+    ``i`` to the score of query position ``i`` against *every* target residue,
+    lowering the score where the query is locally enriched in residues that
+    score well against each other. The target is never corrected.
+
+    For window ``W_i = [max(0, i-20), min(N, i+20))``::
+
+        cb[i] = scale * (sum_a pBack[a] * S(q_i, a)
+                         - sum_{j in W_i, j != i} S(q_i, q_j) / |W_i|)
+
+    rounded half away from zero (``|W_i|`` counts position ``i`` although the
+    sum skips it). The arithmetic follows the C++ types — a float32 accumulator,
+    summed in alphabet order — so values near a .5 boundary round as MMseqs2
+    rounds them.
+    """
+    text = sequence.strip().upper()
+    n = len(text)
+    if n == 0 or scale == 0:
+        return np.zeros(n, dtype=np.int64)
+    matrix, background = _mmseqs_blosum62()
+    lookup = {c: i for i, c in enumerate(_MMSEQS_ALPHABET)}
+    codes = np.fromiter(
+        (lookup.get(_MMSEQS_LETTER_MAP.get(c, c), 20) for c in text), dtype=np.int64, count=n,
+    )
+    # Integer window sums from per-letter prefix counts: S(q_i, .) . counts(W_i).
+    onehot = np.zeros((n + 1, 21), dtype=np.int64)
+    onehot[np.arange(1, n + 1), codes] = 1
+    prefix = np.cumsum(onehot, axis=0)
+    pos = np.arange(n)
+    lo = np.maximum(0, pos - _COMP_BIAS_WINDOW // 2)
+    hi = np.minimum(n, pos + _COMP_BIAS_WINDOW // 2)
+    rows = matrix[codes]
+    window_sum = (rows * (prefix[hi] - prefix[lo])).sum(axis=1) - rows[pos, codes]
+    # float deltaS_i = (float) sum; deltaS_i /= -1.0 * (float) windowLength;
+    delta = (window_sum.astype(np.float32).astype(np.float64)
+             / (-1.0 * (hi - lo).astype(np.float32).astype(np.float64))).astype(np.float32)
+    # deltaS_i += pBack[a] * (float) subMat[a];  (double sum stored back into a float)
+    for a in range(len(_MMSEQS_ALPHABET)):
+        delta = (delta.astype(np.float64)
+                 + background[a] * rows[:, a].astype(np.float32).astype(np.float64)).astype(np.float32)
+    corrected = (np.float32(scale) * delta).astype(np.float64)
+    return np.trunc(np.where(corrected < 0.0, corrected - 0.5, corrected + 0.5)).astype(np.int64)
+
+
+def _positional_query(query_protein, bias: np.ndarray):
+    """Score a query position-specifically: BLOSUM62 row of each residue plus its bias.
+
+    biotite has no per-position scoring hook, so the query becomes a sequence
+    over its own positions with an ``L x |protein alphabet|`` substitution
+    matrix. With zero bias this reproduces the plain BLOSUM62 alignment exactly
+    (score and trace).
+    """
+    import biotite.sequence as seq
+    import biotite.sequence.align as align
+    n = len(query_protein)
+    alphabet = seq.Alphabet(list(range(n)))
+    positional = seq.GeneralSequence(alphabet, list(range(n)))
+    scores = _MATRIX.score_matrix()[query_protein.code] + bias[:, None]
+    matrix = align.SubstitutionMatrix(alphabet, _MATRIX.get_alphabet2(), scores.astype(np.int32))
+    return positional, matrix
 
 
 def _count_runs(mask: np.ndarray) -> int:
@@ -358,8 +471,9 @@ def _bit_score(score: int, lam: float, k: float) -> float:
 
 
 def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Optional[float],
-                 db_residues: Optional[int], alp_params=None, needs: Optional["_FieldNeeds"] = None):
-    global _MATRIX, _GAP, _ESTIMATOR, _DB_RESIDUES, _LAMBDA, _K, _ALP, _OUTPUT_NEEDS
+                 db_residues: Optional[int], alp_params=None, needs: Optional["_FieldNeeds"] = None,
+                 comp_bias_scale: Optional[float] = None):
+    global _MATRIX, _GAP, _ESTIMATOR, _DB_RESIDUES, _LAMBDA, _K, _ALP, _OUTPUT_NEEDS, _COMP_BIAS_SCALE
     import biotite.sequence.align as align
     _OUTPUT_NEEDS = needs if needs is not None else _FieldNeeds(False, False, False, False, False)
     _MATRIX = align.SubstitutionMatrix.std_protein_matrix()  # BLOSUM62
@@ -375,15 +489,28 @@ def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Option
         _ESTIMATOR = align.EValueEstimator(lam, k) if lam is not None else None
         _LAMBDA, _K = lam, k
     _DB_RESIDUES = db_residues
+    _COMP_BIAS_SCALE = comp_bias_scale
 
 
 def _align(query_protein, query_str: str, query_len: int,
-           subject_protein, subject_str: str, subject_len: int) -> AlignmentMetrics:
+           subject_protein, subject_str: str, subject_len: int,
+           scoring=None) -> AlignmentMetrics:
+    """Local alignment of one pair. ``scoring`` is ``(positional_query, matrix)``
+    from :func:`_positional_query` when the compositional bias correction is on."""
     import biotite.sequence.align as align
-    aln = align.align_optimal(
-        query_protein, subject_protein, _MATRIX,
-        gap_penalty=_GAP, local=True, max_number=1,
-    )[0]
+    if scoring is None:
+        aln = align.align_optimal(
+            query_protein, subject_protein, _MATRIX,
+            gap_penalty=_GAP, local=True, max_number=1,
+        )[0]
+    else:
+        positional, matrix = scoring
+        aln = align.align_optimal(
+            positional, subject_protein, matrix,
+            gap_penalty=_GAP, local=True, max_number=1,
+        )[0]
+        # Identity is measured on residues, not positions: re-attach the real query.
+        aln = align.Alignment([query_protein, subject_protein], aln.trace, aln.score)
     score = int(aln.score)
     # Compute the bit score here so both return paths carry it. None when
     # significance is off; otherwise on whatever scale the active mode implies.
@@ -472,6 +599,11 @@ def _align_query(task):
     query_protein, query_clean, query_len = _to_protein(query_seq)
     if query_protein is None:
         return query_id, []
+    scoring = None
+    if _COMP_BIAS_SCALE is not None:
+        # Built from the raw sequence so MMseqs2's letter folding (e.g. J->L)
+        # applies; sanitize_sequence maps characters 1:1, so positions line up.
+        scoring = _positional_query(query_protein, local_composition_bias(query_seq, _COMP_BIAS_SCALE))
     hits: List[Hit] = []
     for subject_id, subject_seq, emb_score in candidates:
         subject_protein, subject_clean, subject_len = _to_protein(subject_seq)
@@ -480,6 +612,7 @@ def _align_query(task):
         metrics = _align(
             query_protein, query_clean, query_len,
             subject_protein, subject_clean, subject_len,
+            scoring=scoring,
         )
         hits.append(Hit(subject_id=subject_id, emb_score=emb_score, metrics=metrics))
     return query_id, hits
@@ -521,6 +654,8 @@ def align_candidates(
         max_evalue: Optional[float] = 1e-3,
         gap_open: int = 11,
         gap_extend: int = 1,
+        comp_bias_corr: bool = False,
+        comp_bias_corr_scale: float = 1.0,
         num_workers: Optional[int] = None,
         subject_db_size: Optional[int] = None,
         compute_significance: bool = True,
@@ -554,6 +689,13 @@ def align_candidates(
             ``max_evalue=None``. These three thresholds default to the same
             values as the ``fm-search query`` options that expose them.
         gap_open / gap_extend: positive BLOSUM62 gap penalties (negated internally).
+        comp_bias_corr: correct the Smith-Waterman scores for locally biased
+            amino-acid composition, as MMseqs2's ``--comp-bias-corr`` does (see
+            :func:`local_composition_bias`). Off by default (plain BLOSUM62);
+            ``True`` makes raw scores, bit scores and E-values match a default
+            ``mmseqs search`` (``--comp-bias-corr 1``).
+        comp_bias_corr_scale: multiplier applied to the correction before
+            rounding (``--comp-bias-corr-scale``, 0-1); ``0`` turns it off.
         num_workers: process-pool size. ``None`` (default) uses **all** CPUs:
             it first widens the process CPU-affinity mask (undoing any scheduler
             ``--cpu-bind`` pinning, kernel-clamped to the cgroup allocation) so a
@@ -608,6 +750,11 @@ def align_candidates(
                 "search space); pass it or set max_evalue=None."
             )
         compute_significance = True
+    if not 0.0 <= comp_bias_corr_scale <= 1.0:
+        raise ValueError(
+            f"comp_bias_corr_scale must be between 0 and 1, got {comp_bias_corr_scale}."
+        )
+    comp_bias_scale = float(comp_bias_corr_scale) if comp_bias_corr and comp_bias_corr_scale > 0 else None
     # Resolve the requested output columns to the set of heavy strings the
     # workers must build (default format needs none of them).
     output_fields = list(output_fields) if output_fields else list(DEFAULT_OUTPUT_FIELDS)
@@ -682,7 +829,9 @@ def align_candidates(
     if not serial and tasks:
         _expand_cpu_affinity()
 
-    init_args = (gap_open, gap_extend, lam, k, subject_db_size, alp_params, needs)
+    if comp_bias_scale is not None and tasks:
+        logger.info(f"Applying compositional bias correction (scale {comp_bias_scale:g})")
+    init_args = (gap_open, gap_extend, lam, k, subject_db_size, alp_params, needs, comp_bias_scale)
     if not serial and tasks:
         # Parallelize over (query, subject) *pairs* rather than whole queries by
         # chunking each query's candidate list, so even a single query with many

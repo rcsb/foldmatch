@@ -1,7 +1,11 @@
+import csv
+import math
 import re
 import tempfile
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 from foldmatch.search import alignment, output
 from foldmatch.search.alignment import _chunk_candidate_tasks
@@ -399,7 +403,10 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
     different modules, so nothing but this test keeps them in step.
     """
 
-    THRESHOLDS = ("min_seq_identity", "min_coverage", "max_evalue")
+    SHARED_DEFAULTS = (
+        "min_seq_identity", "min_coverage", "max_evalue",
+        "comp_bias_corr", "comp_bias_corr_scale",
+    )
 
     def test_defaults_are_in_step(self):
         import inspect
@@ -409,7 +416,7 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
         lib = inspect.signature(alignment.align_candidates).parameters
         for command in (cli.query_database_from_fasta, cli.query_database_from_database):
             cmd = inspect.signature(command).parameters
-            for name in self.THRESHOLDS:
+            for name in self.SHARED_DEFAULTS:
                 with self.subTest(command=command.__name__, threshold=name):
                     self.assertEqual(
                         lib[name].default, cmd[name].default,
@@ -417,6 +424,179 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
                         f"--{name.replace('_', '-')} defaults to "
                         f"{cmd[name].default!r}; update both (and the README).",
                     )
+
+
+_RESOURCES = Path(__file__).parent / "resources"
+# Residue count of the target DB the mmseqs fixture was computed against.
+_MMSEQS_FIXTURE_DB_RESIDUES = 9_805_184_914
+
+
+def _reference_composition_bias(sequence, scale=1.0):
+    """Loop-for-loop transcription of MMseqs2's calcLocalAaBiasCorrection + ssw_init rounding.
+
+    Independent of the vectorized implementation; numpy scalars stand in for the
+    C++ float/double types.
+    """
+    matrix, background = alignment._mmseqs_blosum62()
+    lookup = {c: i for i, c in enumerate(alignment._MMSEQS_ALPHABET)}
+    codes = [lookup.get(alignment._MMSEQS_LETTER_MAP.get(c, c), 20) for c in sequence.strip().upper()]
+    n = len(codes)
+    out = []
+    for i in range(n):
+        lo, hi = max(0, i - 20), min(n, i + 20)
+        sub_mat = matrix[codes[i]]
+        total = sum(int(sub_mat[codes[j]]) for j in range(lo, hi)) - int(sub_mat[codes[i]])
+        delta = np.float32(total)
+        delta = np.float32(np.float64(delta) / (-1.0 * np.float64(np.float32(hi - lo))))
+        for a in range(21):
+            delta = np.float32(np.float64(delta) + background[a] * np.float64(np.float32(sub_mat[a])))
+        value = float(np.float32(scale) * delta)
+        out.append(int(value - 0.5) if value < 0.0 else int(value + 0.5))
+    return out
+
+
+class TestLocalCompositionBias(unittest.TestCase):
+    SEQUENCES = [
+        _STORE["s1"], _STORE["s5"], _STORE["s7"], _STORE["s4"],
+        "Q" * 60, "GGGGS" * 12, "PLYISNDACEFHIKLMNPQRSTVWY" * 3,
+        "M", "MK", "mktayiakqrqisfv",
+        "MKTBZJUOX*AYIAKQRQ",   # letters MMseqs2 folds (B->D, Z->E, J->L, U/O->X) or maps to X
+    ]
+
+    def test_matches_reference_transcription(self):
+        for sequence in self.SEQUENCES:
+            for scale in (1.0, 0.5, 0.3):
+                with self.subTest(sequence=sequence[:15], scale=scale):
+                    self.assertEqual(
+                        alignment.local_composition_bias(sequence, scale).tolist(),
+                        _reference_composition_bias(sequence, scale),
+                    )
+
+    def test_poly_q_interior_value(self):
+        # From the MMseqs2 source: inside a poly-Q run, Q-Q (+5) is corrected to -1.
+        bias = alignment.local_composition_bias("Q" * 60)
+        self.assertTrue((bias[20:41] == -6).all(), bias.tolist())
+
+    # Expected offsets from a C transcription of the MMseqs2 18-8cc5c source (integer
+    # matrix generated from data/blosum62.out, setupLetterMapping,
+    # calcLocalAaBiasCorrection and the ssw_init rounding), so they share no
+    # constants with alignment.py. The first sequence depends on MMseqs2's flat -1 X
+    # row/column; the second on its B->D, Z->E, J->L folding.
+    MMSEQS_SOURCE_ORACLE = {
+        ("XTAXXTXAXAAXSTSTAXAAXXSXTTXSXXXXXXTXTXAXXXXXSXTXTSXST", 1.0):
+            [0, -1, -1, 0, 0, -1, 0, -1, 0, -1, -1, 0, -1, -1, -1, -1, -1, 0, -1, -1, 0, 0, -1, 0, -1, -1, 0,
+             -1, 0, 0, 0, 0, 0, 0, -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, 0, -1, 0, 0, 0, -1],
+        ("XTAXXTXAXAAXSTSTAXAAXXSXTTXSXXXXXXTXTXAXXXXXSXTXTSXST", 0.5):
+            [0, -1, -1, 0, 0, -1, 0, -1, 0, -1, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1],
+        ("JJEEJBJELBEBDLDEDLDDBLEBBJJZZBDBZBZDZEBZBEJZJDDZDELZJL", 1.0):
+            [0, 0, -1, -2, 0, -3, 0, -1, 0, -3, -2, -3, -3, 0, -3, -2, -3, 1, -3, -3, -3, 1, -3, -4, -4, 1, 1,
+             -3, -3, -4, -4, -4, -3, -3, -3, -3, -3, -3, -3, -3, -3, -3, 1, -3, 1, -3, -3, -3, -3, -3, 1, -3, 1, 1],
+        ("JJEEJBJELBEBDLDEDLDDBLEBBJJZZBDBZBZDZEBZBEJZJDDZDELZJL", 0.5):
+            [0, 0, -1, -1, 0, -1, 0, -1, 0, -1, -1, -1, -1, 0, -2, -1, -2, 0, -2, -2, -2, 1, -1, -2, -2, 1, 1,
+             -1, -1, -2, -2, -2, -1, -2, -1, -2, -1, -1, -2, -1, -2, -1, 1, -1, 0, -2, -2, -2, -2, -1, 1, -1, 0, 0],
+    }
+
+    def test_matches_mmseqs_source_oracle(self):
+        for (sequence, scale), expected in self.MMSEQS_SOURCE_ORACLE.items():
+            with self.subTest(sequence=sequence[:12], scale=scale):
+                self.assertEqual(alignment.local_composition_bias(sequence, scale).tolist(), expected)
+
+    def test_shape_and_zero_scale(self):
+        self.assertEqual(len(alignment.local_composition_bias("  mktay\n")), 5)
+        self.assertEqual(alignment.local_composition_bias("").tolist(), [])
+        self.assertFalse(alignment.local_composition_bias(_STORE["s1"], 0.0).any())
+
+
+class TestCompBiasMatchesMmseqs(unittest.TestCase):
+    """Stage-2 scores against real mmseqs 18-8cc5c on the same pairs.
+
+    resources/alignment/mmseqs_comp_bias_pairs.tsv holds 22 (query, target) pairs
+    with the exact integer scores mmseqs assigned (recovered from its printed
+    E-values) under --comp-bias-corr 0, --comp-bias-corr 1, and 1 with
+    --comp-bias-corr-scale 0.5, plus the E-value mmseqs printed at its defaults
+    for a 9,805,184,914-residue target DB. The pairs cover large score drops,
+    corrections that raise the score, corrections that change the alignment
+    path, and a 30-residue query.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(_RESOURCES / "alignment" / "mmseqs_comp_bias_pairs.tsv") as f:
+            cls.rows = list(csv.DictReader(f, delimiter="\t"))
+
+    def _hits(self, num_workers=1, **kwargs):
+        queries = {r["query"]: r["query_sequence"] for r in self.rows}
+        targets = {r["target"]: r["target_sequence"] for r in self.rows}
+        prefilter = {}
+        for r in self.rows:
+            ids, scores = prefilter.setdefault(r["query"], ([], []))
+            ids.append(r["target"])
+            scores.append(0.0)
+        res = alignment.align_candidates(
+            query_sequences=queries,
+            prefilter_results=prefilter,
+            fetch_subject_sequences=lambda ids: {i: targets[i] for i in ids if i in targets},
+            min_seq_identity=0.0,
+            min_coverage=0.0,
+            max_evalue=None,
+            num_workers=num_workers,
+            subject_db_size=_MMSEQS_FIXTURE_DB_RESIDUES,
+            **kwargs,
+        )
+        return {(q, h.subject_id): h for q, hits in res.items() for h in hits}
+
+    def _assert_scores(self, column, **kwargs):
+        hits = self._hits(**kwargs)
+        self.assertEqual(len(hits), len(self.rows))
+        for r in self.rows:
+            with self.subTest(query=r["query"], target=r["target"]):
+                self.assertEqual(hits[(r["query"], r["target"])].metrics.score, int(r[column]))
+
+    def test_fixture_exercises_the_correction(self):
+        changed = sum(r["raw_cbc0"] != r["raw_cbc1"] for r in self.rows)
+        raised = sum(int(r["raw_cbc1"]) > int(r["raw_cbc0"]) for r in self.rows)
+        self.assertGreaterEqual(changed, 15)
+        self.assertGreaterEqual(raised, 3)
+
+    def test_default_is_uncorrected(self):
+        self._assert_scores("raw_cbc0")
+
+    def test_on_matches_mmseqs_default(self):
+        self._assert_scores("raw_cbc1", comp_bias_corr=True)
+
+    def test_on_evalues_match_mmseqs(self):
+        hits = self._hits(comp_bias_corr=True)
+        for r in self.rows:
+            with self.subTest(query=r["query"], target=r["target"]):
+                expected = float(r["evalue_cbc1"])
+                got = hits[(r["query"], r["target"])].metrics.evalue
+                self.assertAlmostEqual(math.log(got), math.log(expected), delta=1e-3)
+
+    def test_off_matches_comp_bias_corr_0(self):
+        self._assert_scores("raw_cbc0", comp_bias_corr=False)
+
+    def test_scale_half_matches_mmseqs(self):
+        self._assert_scores("raw_cbc1_scale05", comp_bias_corr=True, comp_bias_corr_scale=0.5)
+
+    def test_scale_zero_is_off(self):
+        self._assert_scores("raw_cbc0", comp_bias_corr=True, comp_bias_corr_scale=0.0)
+
+    def test_scale_out_of_range_is_rejected(self):
+        for scale in (-0.1, 1.5):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                self._hits(comp_bias_corr_scale=scale)
+
+    def test_serial_and_parallel_agree_with_correction(self):
+        # Workers get the correction through the pool initializer, not a global
+        # set in the parent; both paths must score and place alignments identically.
+        def signature(hits):
+            return {k: (h.metrics.score, h.metrics.q_start, h.metrics.q_end, h.metrics.t_start, h.metrics.t_end)
+                    for k, h in hits.items()}
+        self.assertEqual(
+            signature(self._hits(num_workers=1, comp_bias_corr=True)),
+            signature(self._hits(num_workers=2, comp_bias_corr=True)),
+        )
 
 
 class TestWriteAlignedResults(unittest.TestCase):

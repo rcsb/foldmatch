@@ -616,6 +616,16 @@ def query_database_from_fasta(
         gap_extend: Annotated[int, typer.Option(
             help='Gap-extend penalty (positive) for Stage-2 alignment.'
         )] = 1,
+        comp_bias_corr: Annotated[bool, typer.Option(
+            help='Correct Stage-2 alignment scores for locally biased amino-acid '
+                 'composition. Changes the alignment itself (coordinates, '
+                 'identity, coverage) as well as the raw score, bits and E-value.'
+        )] = False,
+        comp_bias_corr_scale: Annotated[float, typer.Option(
+            min=0.0, max=1.0,
+            help='Scale applied to the compositional bias correction when '
+                 '--comp-bias-corr is set (0-1).'
+        )] = 1.0,
         significance_mode: Annotated[SignificanceMode, typer.Option(
             help="Scale for the BitScore/Pvalue/Evalue columns. 'default' uses "
                  "calibrated statistics, but requires the default gap penalties "
@@ -645,6 +655,7 @@ def query_database_from_fasta(
     """Search database using protein sequences from a FASTA file."""
 
     set_log_level(log_level)
+    _check_comp_bias_corr_scale(comp_bias_corr_scale)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -699,6 +710,8 @@ def query_database_from_fasta(
             max_evalue=max_evalue,
             gap_open=gap_open,
             gap_extend=gap_extend,
+            comp_bias_corr=comp_bias_corr,
+            comp_bias_corr_scale=comp_bias_corr_scale,
             num_workers=align_workers,
             output_file=output_file,
             significance_mode=significance_mode,
@@ -767,6 +780,16 @@ def query_database_from_database(
         gap_extend: Annotated[int, typer.Option(
             help='Gap-extend penalty (positive) for Stage-2 alignment.'
         )] = 1,
+        comp_bias_corr: Annotated[bool, typer.Option(
+            help='Correct Stage-2 alignment scores for locally biased amino-acid '
+                 'composition. Changes the alignment itself (coordinates, '
+                 'identity, coverage) as well as the raw score, bits and E-value.'
+        )] = False,
+        comp_bias_corr_scale: Annotated[float, typer.Option(
+            min=0.0, max=1.0,
+            help='Scale applied to the compositional bias correction when '
+                 '--comp-bias-corr is set (0-1).'
+        )] = 1.0,
         significance_mode: Annotated[SignificanceMode, typer.Option(
             help="Scale for the BitScore/Pvalue/Evalue columns. 'default' uses "
                  "calibrated statistics, but requires the default gap penalties "
@@ -796,6 +819,7 @@ def query_database_from_database(
     """Search subject database using all entries from query database."""
 
     set_log_level(log_level)
+    _check_comp_bias_corr_scale(comp_bias_corr_scale)
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS search: enabled")
@@ -853,6 +877,8 @@ def query_database_from_database(
             max_evalue=max_evalue,
             gap_open=gap_open,
             gap_extend=gap_extend,
+            comp_bias_corr=comp_bias_corr,
+            comp_bias_corr_scale=comp_bias_corr_scale,
             num_workers=align_workers,
             output_file=output_file,
             significance_mode=significance_mode,
@@ -1059,6 +1085,12 @@ def _filter_results_by_threshold(results, threshold: float | None):
     logging.debug(f"Filtered from {total_before} to {total_after} results")
     return filtered_results
 
+def _check_comp_bias_corr_scale(scale: float):
+    """Reject a scale Click's range check lets through (NaN) before Stage 1 runs."""
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError(f"--comp-bias-corr-scale must be between 0 and 1, got {scale}.")
+
+
 def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missing_msg: str) -> bool:
     """Decide whether to run Stage-2 sequence-identity alignment.
 
@@ -1095,6 +1127,8 @@ def _stage2_align_and_report(
         max_evalue: Optional[float],
         gap_open: int,
         gap_extend: int,
+        comp_bias_corr: bool,
+        comp_bias_corr_scale: float,
         num_workers: Optional[int],
         output_file: str,
         significance_mode: SignificanceMode = SignificanceMode.default,
@@ -1134,6 +1168,8 @@ def _stage2_align_and_report(
         max_evalue=max_evalue,
         gap_open=gap_open,
         gap_extend=gap_extend,
+        comp_bias_corr=comp_bias_corr,
+        comp_bias_corr_scale=comp_bias_corr_scale,
         num_workers=num_workers,
         subject_db_size=subject_store.total_residues(),
         # Only pay for the significance pass when a significance column
