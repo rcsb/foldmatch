@@ -43,7 +43,8 @@ def predict(
         structure_format=structure_format,
         min_res_n=min_res_n
     ) if src_from == SrcEsmFrom.structure else EsmProtFromFasta(
-        fasta_file=src_stream
+        fasta_file=src_stream,
+        min_res_n=min_res_n
     )
 
     logger.info(f"{src_from.name}-inference set running as iterator")

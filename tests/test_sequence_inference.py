@@ -3,7 +3,7 @@ import shutil
 import unittest
 
 from foldmatch.dataset.esm_prot_from_fasta import parse_fasta
-from foldmatch.types.api_types import Accelerator, OutFormat, SrcLocation, SrcTensorFrom
+from foldmatch.types.api_types import Accelerator, OutFormat, SrcEsmFrom, SrcLocation, SrcTensorFrom
 
 
 class TestParseFasta(unittest.TestCase):
@@ -137,6 +137,21 @@ class TestSequenceInference(unittest.TestCase):
         self.assertEqual(len(chain_embeddings), 2)
         self.assertEqual(tuple(chain_embeddings[0][0][0].shape), (1536,))
         self.assertEqual(tuple(chain_embeddings[1][0][0].shape), (1536,))
+
+    def test_sequence_chain_complete_inference_min_res_filter(self):
+        # 1acb_E has 245 residues and 2uzi_A has 58: min_res_n=100 must drop
+        # 2uzi_A before it is embedded, not just from downstream stores.
+        from foldmatch.inference.chain_complete_inference import predict
+        embeddings = predict(
+            src_stream=f"{self.__test_path}/resources/fasta/test_sequences.fasta",
+            src_from=SrcEsmFrom.fasta,
+            min_res_n=100,
+            accelerator=Accelerator.cpu
+        )
+        # [batch_index][batch_embeddings,batch_names]
+        names = [name for _, batch_names in embeddings for name in batch_names]
+        self.assertEqual(names, ["1acb_E"])
+        self.assertEqual(tuple(embeddings[0][0].shape), (1, 1536))
 
 
 def _remove_files_in_directory(directory_path):

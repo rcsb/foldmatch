@@ -658,6 +658,57 @@ class TestCliSearch(unittest.TestCase):
             )
         self.assertIn("not_a_field", str(ctx.exception))
 
+    def test_27_fasta_min_res_n_filters_index_store_and_queries(self):
+        """--min-res-n drops short sequences from the index, the sequence store
+        and the embedded queries alike.
+
+        test_sequences.fasta holds 1acb_E (245 aa) and 2uzi_A (58 aa), so with
+        min_res_n=100 only 1acb_E may survive. The FAISS index and the sequence
+        store must hold the same ids, otherwise Stage-2 silently skips hits that
+        are "missing from sequence store".
+        """
+        from foldmatch.cli.search import (
+            build_database_from_fasta,
+            query_database_from_fasta,
+        )
+        from foldmatch.search.faiss_database import FaissEmbeddingDatabase
+        from foldmatch.search.sequence_store import SequenceStore
+
+        fasta_file = Path(f"{self.__test_path}/resources/fasta/test_sequences.fasta")
+        subject_db = os.path.join(self.__temp_dir, "test_min_res_n_db")
+        build_database_from_fasta(
+            fasta_file=fasta_file,
+            output_db=subject_db,
+            tmp_embedding_folder=self.__temp_dir,
+            min_res_n=100,
+            accelerator=Accelerator.cpu,
+            use_gpu_index=False,
+        )
+
+        db_path = Path(subject_db)
+        db = FaissEmbeddingDatabase(db_folder=db_path.parent, index_name=db_path.name)
+        db.load_database()
+        self.assertEqual(list(db.chain_ids), ["1acb_E"])
+        store = SequenceStore(db_path.parent, db_path.name)
+        self.assertEqual(set(store.fetch(["1acb_E", "2uzi_A"])), set(db.chain_ids))
+
+        output_file = os.path.join(self.__temp_dir, "min_res_n_results.tsv")
+        query_database_from_fasta(
+            db_path=subject_db,
+            fasta_file=fasta_file,
+            tmp_embedding_folder=self.__temp_dir,
+            output_file=output_file,
+            min_res_n=100,
+            top_k=5,
+            threshold=None,
+            accelerator=Accelerator.cpu,
+            use_gpu_index=False,
+        )
+        with open(output_file) as f:
+            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+        self.assertTrue(rows)
+        self.assertEqual({cols[0] for cols in rows}, {"1acb_E"})
+
 
 if __name__ == '__main__':
     unittest.main()
