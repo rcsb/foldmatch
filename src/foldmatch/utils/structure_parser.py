@@ -48,7 +48,7 @@ def get_protein_chains(structure, min_res_n=0):
     for atom_ch in chain_iter(structure):
         atom_res = atom_ch[filter_polymer(atom_ch)]
         atom_res = atom_res[filter_amino_acids(atom_res)]
-        if len(atom_res) > 0 and len(get_residues(atom_res)[0]) > min_res_n:
+        if len(atom_res) > 0 and len(get_residues(atom_res)[0]) >= min_res_n:
             chain_ids.append(str(get_chains(atom_res)[0]))
     return tuple(chain_ids)
 

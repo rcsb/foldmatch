@@ -48,7 +48,7 @@ def residue_embedding(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
         min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with more than <min_res_n> residues.'
+            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
         )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
@@ -120,7 +120,7 @@ def structure_embedding(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
         min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with more than <min_res_n> residues.'
+            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
         )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
@@ -204,7 +204,7 @@ def chain_embedding(
             help='Format of the residue level embedding files. Options: pt (torch tensor files) or csv.'
         )] = ResEmbeddingFormat.pt,
         min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with more than <min_res_n> residues.'
+            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
         )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
@@ -291,7 +291,7 @@ def assembly_embedding(
             help='Format of the residue level embedding files. Options: pt (torch tensor files) or csv.'
         )] = ResEmbeddingFormat.pt,
         min_res_n: Annotated[int, typer.Option(
-            help='Consider only assembly chains with more than <min_res_n> residues.'
+            help='Consider only assembly chains with at least <min_res_n> residues.'
         )] = 0,
         max_res_n: Annotated[int, typer.Option(
             help='Stop adding assembly chains when number of residues is greater than <max_res_n> residues.'
@@ -395,7 +395,7 @@ def complete_embedding(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
         min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with more than <min_res_n> residues.'
+            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
         )] = 0,
         max_res_n: Annotated[int, typer.Option(
             help='Stop adding assembly chains when number of residues is greater than <max_res_n> residues.'

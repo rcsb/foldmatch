@@ -89,7 +89,7 @@ def from_structures_residue(
             help='Override the default file extension used to filter structure files in src-folder. Pass an empty string to disable extension filtering and process every file in the folder. When unset, the defaults for the chosen structure-format are used.'
         )] = None,
         min_res_n: Annotated[int, typer.Option(
-            help='Consider only chains with more than <min_res_n> residues.'
+            help='Consider only chains with at least <min_res_n> residues.'
         )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
@@ -169,7 +169,7 @@ def from_structures_chain(
             help='Override the default file extension used to filter structure files in src-folder.'
         )] = None,
         min_res_n: Annotated[int, typer.Option(
-            help='Consider only chains with more than <min_res_n> residues.'
+            help='Consider only chains with at least <min_res_n> residues.'
         )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
@@ -249,7 +249,7 @@ def from_structures_assembly(
             help='Override the default file extension used to filter structure files in src-folder.'
         )] = None,
         min_res_n: Annotated[int, typer.Option(
-            help='Consider only assembly chains with more than <min_res_n> residues.'
+            help='Consider only assembly chains with at least <min_res_n> residues.'
         )] = 0,
         max_res_n: Annotated[int, typer.Option(
             help='Stop adding assembly chains when number of residues is greater than <max_res_n> residues.'

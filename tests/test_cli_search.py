@@ -740,6 +740,15 @@ class TestCliSearch(unittest.TestCase):
                 self.assertEqual(predict.call_args.kwargs["min_res_n"], 37)
                 self.assertEqual(predict.call_args.kwargs["batch_size"], 3)
 
+    def test_29_build_chain_filter_keeps_chains_of_exactly_min_res(self):
+        """Build-time chain selection keeps chains with >= min_res residues,
+        matching FoldMatch's query-time filter. 1acb chain B has 63 residues."""
+        from foldmatch.utils.structure_parser import get_structure_from_src, get_protein_chains
+
+        structure = get_structure_from_src(f"{self.__test_path}/resources/pdb/1acb.cif", "mmcif")
+        self.assertEqual(get_protein_chains(structure, 63), ("A", "B"))
+        self.assertEqual(get_protein_chains(structure, 64), ("A",))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -44,6 +44,12 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `min_coverage=0.0, max_evalue=None`; `max_evalue=None` is also required when
   no `subject_db_size` is available, since an E-value threshold needs a search
   space.
+- **Structure-based chain selection keeps chains with at least `min_res_n`
+  residues** (was more than `min_res_n`). This covers `fm-search build
+  structures`, `fm-embedding` and `inference`, and matches `FoldMatch(min_res=...)`
+  at query time and the FASTA paths, which already used "at least". Databases and
+  embeddings built with a non-zero minimum now also include chains of exactly
+  that length.
 
 ### Fixed
 
