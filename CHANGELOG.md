@@ -45,6 +45,16 @@ While the major version is `0`, breaking changes are released in a minor bump.
   no `subject_db_size` is available, since an E-value threshold needs a search
   space.
 
+### Fixed
+
+- **`fm-search build structures --granularity assembly` now honours `--min-res`
+  and `--batch-size`.** Both were dropped for assembly builds, so every chain
+  went into the assembly embedding, while `fm-search query structure
+  --granularity assembly` skips chains shorter than `--min-res`; database and
+  query embeddings were computed over different chains. Assembly databases
+  built with the default `--min-res 10` now leave out chains shorter than 10
+  residues, so rebuild existing ones to match queries.
+
 ## [0.8.0] - 2026-07-21
 
 This release reworks how `fm-search` reports results and makes its alignment

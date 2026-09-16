@@ -709,6 +709,37 @@ class TestCliSearch(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual({cols[0] for cols in rows}, {"1acb_E"})
 
+    def test_28_build_database_forwards_min_res_and_batch_size(self):
+        """--min-res and --batch-size reach the inference pipeline for both
+        granularities. The assembly branch used to drop them, so assembly
+        databases kept short chains the query side filters out."""
+        from unittest.mock import patch
+        from foldmatch.cli.search import build_database_from_structures
+
+        structure_dir = Path(f"{self.__test_path}/resources/pdb")
+        for granularity, predict_name in (
+                (Granularity.chain, "chain_predict"),
+                (Granularity.assembly, "assembly_predict"),
+        ):
+            with self.subTest(granularity=granularity), \
+                    patch(f"foldmatch.search.embedding_computer.{predict_name}") as predict, \
+                    patch("foldmatch.search.embedding_database.EmbeddingDatabase"):
+                build_database_from_structures(
+                    structure_folder=structure_dir,
+                    output_db=os.path.join(self.__temp_dir, "test_forward_args"),
+                    tmp_embedding_folder=self.__temp_dir,
+                    structure_format=StructureFormat.mmcif,
+                    file_extension=".cif",
+                    min_res=37,
+                    batch_size=3,
+                    accelerator=Accelerator.cpu,
+                    use_gpu_index=False,
+                    granularity=granularity,
+                )
+                predict.assert_called_once()
+                self.assertEqual(predict.call_args.kwargs["min_res_n"], 37)
+                self.assertEqual(predict.call_args.kwargs["batch_size"], 3)
+
 
 if __name__ == '__main__':
     unittest.main()
