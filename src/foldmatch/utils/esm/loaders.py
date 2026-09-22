@@ -8,13 +8,25 @@ from esm.tokenization import TokenizerCollection, EsmSequenceTokenizer, Structur
 
 from huggingface_hub import  snapshot_download
 
+ESM_REPO_ID = "rcsb/rcsb-esm"
+# Pinned deliberately. Every model downstream reads these weights as FROZEN features: the
+# stage-1 aggregator was trained on them, and the sequence->3Di head's accuracy, its
+# fitted profile temperature, its target kernel and the Karlin-Altschul lambda/K in
+# search/scoring_system.py were all calibrated against this exact backbone. Left
+# unpinned, a new upload to the repo would silently change every one of those numbers
+# without changing a line of code here.
+ESM_REVISION = "636acb420daf674df37ab0220f56061a5de2f169"
+
+
 class DataRoot:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance.path = Path(snapshot_download(repo_id="rcsb/rcsb-esm"))
+            cls._instance.path = Path(
+                snapshot_download(repo_id=ESM_REPO_ID, revision=ESM_REVISION)
+            )
         return cls._instance
 
     def get(self):

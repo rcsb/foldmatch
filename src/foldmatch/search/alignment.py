@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -9,7 +10,7 @@ import numpy as np
 
 from foldmatch.types.api_types import SignificanceMode
 
-from . import karlin_altschul
+from . import karlin_altschul, scoring_system
 from .output import DEFAULT_OUTPUT_FIELDS
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,21 @@ _COMP_BIAS_WINDOW = 40
 # (immutable, picklable-but-large) substitution matrix is built once per worker.
 _MATRIX = None
 _GAP: Tuple[int, int] = (-11, -1)
+# Active ScoringSystem and its prepared numpy side, or None for the plain BLOSUM62 path.
+# When set with a structural target representation, the aligner scores a position-specific
+# query matrix against a subject encoded over the paired (amino acid, structural) alphabet.
+_SYSTEM = None
+_PREPARED = None
+# Per-query (positional sequence, matrix), built once and reused across the chunks of the
+# same query that land on this worker. Deliberately tiny: a 1000-residue query matrix over
+# 240 target codes is ~22 MiB, so this trades a couple of rebuilds for bounded memory.
+_QUERY_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_QUERY_CACHE_SIZE = 2
+# {query_id: (L, 20) float32 profile}. Shipped in the pool initargs so it is pickled once
+# per worker rather than once per candidate chunk — ``_chunk_candidate_tasks`` splits a
+# query across many chunks, and re-sending its profile with each would dominate the task
+# payload.
+_QUERY_PROFILES: Dict[str, "np.ndarray"] = {}
 # Karlin-Altschul E-value estimator (biotite) and the subject-DB residue total,
 # also per-process. _ESTIMATOR is None unless significance_mode='sampled'.
 _ESTIMATOR = None
@@ -472,10 +488,18 @@ def _bit_score(score: int, lam: float, k: float) -> float:
 
 def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Optional[float],
                  db_residues: Optional[int], alp_params=None, needs: Optional["_FieldNeeds"] = None,
-                 comp_bias_scale: Optional[float] = None):
+                 comp_bias_scale: Optional[float] = None, system=None, profiles=None):
     global _MATRIX, _GAP, _ESTIMATOR, _DB_RESIDUES, _LAMBDA, _K, _ALP, _OUTPUT_NEEDS, _COMP_BIAS_SCALE
+    global _SYSTEM, _PREPARED, _QUERY_CACHE, _QUERY_PROFILES
     import biotite.sequence.align as align
     _OUTPUT_NEEDS = needs if needs is not None else _FieldNeeds(False, False, False, False, False)
+    # The ScoringSystem is pure metadata and pickles cheaply; its numpy side (and the
+    # bundled kernel it names) is rebuilt per worker, which is also what makes this
+    # correct under spawn, where nothing is inherited.
+    _SYSTEM = system
+    _PREPARED = None if system is None else scoring_system.prepare(system)
+    _QUERY_CACHE = OrderedDict()
+    _QUERY_PROFILES = profiles if profiles is not None else {}
     _MATRIX = align.SubstitutionMatrix.std_protein_matrix()  # BLOSUM62
     # Gap penalties are passed through unmodified: biotite charges a length-L gap
     # as open + (L-1)*extend, which is exactly MMseqs2's convention, so 11/1 here
@@ -494,9 +518,15 @@ def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Option
 
 def _align(query_protein, query_str: str, query_len: int,
            subject_protein, subject_str: str, subject_len: int,
-           scoring=None) -> AlignmentMetrics:
-    """Local alignment of one pair. ``scoring`` is ``(positional_query, matrix)``
-    from :func:`_positional_query` when the compositional bias correction is on."""
+           scoring=None, subject_encoded=None) -> AlignmentMetrics:
+    """Local alignment of one pair.
+
+    ``scoring`` is ``(positional_query, matrix)`` — from :func:`_positional_query` when
+    the compositional bias correction is on, or from the active ScoringSystem when a
+    structural target representation is in play. ``subject_encoded`` is the subject over
+    the paired (amino acid, structural) alphabet in that second case; the plain
+    ``subject_protein`` is still what identity and the output columns are measured on.
+    """
     import biotite.sequence.align as align
     if scoring is None:
         aln = align.align_optimal(
@@ -506,10 +536,12 @@ def _align(query_protein, query_str: str, query_len: int,
     else:
         positional, matrix = scoring
         aln = align.align_optimal(
-            positional, subject_protein, matrix,
-            gap_penalty=_GAP, local=True, max_number=1,
+            positional, subject_encoded if subject_encoded is not None else subject_protein,
+            matrix, gap_penalty=_GAP, local=True, max_number=1,
         )[0]
-        # Identity is measured on residues, not positions: re-attach the real query.
+        # Identity is measured on residues, not on positions or paired symbols:
+        # get_sequence_identity compares symbol CODES, so both rows have to be the real
+        # protein sequences or identity collapses and every hit is filtered away.
         aln = align.Alignment([query_protein, subject_protein], aln.trace, aln.score)
     score = int(aln.score)
     # Compute the bit score here so both return paths carry it. None when
@@ -600,22 +632,71 @@ def _align_query(task):
     if query_protein is None:
         return query_id, []
     scoring = None
-    if _COMP_BIAS_SCALE is not None:
+    paired = _PREPARED is not None and _SYSTEM.target_repr != "amino"
+    if paired:
+        scoring = _query_scoring(query_id, query_protein, query_seq)
+        if scoring is None:
+            # No profile for this query: it cannot be scored under a profile system, and
+            # silently falling back to BLOSUM62 would mix two scoring systems (and two
+            # lambdas) in one result file.
+            logger.warning(
+                f"Query '{query_id}' has no 3Di profile; skipping under scoring system "
+                f"'{_SYSTEM.name}'")
+            return query_id, []
+    elif _COMP_BIAS_SCALE is not None:
         # Built from the raw sequence so MMseqs2's letter folding (e.g. J->L)
         # applies; sanitize_sequence maps characters 1:1, so positions line up.
         scoring = _positional_query(query_protein, local_composition_bias(query_seq, _COMP_BIAS_SCALE))
     hits: List[Hit] = []
-    for subject_id, subject_seq, emb_score in candidates:
+    for candidate in candidates:
+        subject_id, subject_seq, emb_score = candidate[0], candidate[1], candidate[2]
         subject_protein, subject_clean, subject_len = _to_protein(subject_seq)
         if subject_protein is None:
             continue
+        subject_encoded = None
+        if paired:
+            structural = candidate[3] if len(candidate) > 3 else None
+            if structural is None or len(structural) != subject_len:
+                logger.warning(
+                    f"Subject '{subject_id}' has no usable structural codes "
+                    f"({'missing' if structural is None else len(structural)} for "
+                    f"{subject_len} residues); skipped")
+                continue
+            subject_encoded = _PREPARED.target_sequence(subject_protein.code, structural)
         metrics = _align(
             query_protein, query_clean, query_len,
             subject_protein, subject_clean, subject_len,
-            scoring=scoring,
+            scoring=scoring, subject_encoded=subject_encoded,
         )
         hits.append(Hit(subject_id=subject_id, emb_score=emb_score, metrics=metrics))
     return query_id, hits
+
+
+def _query_scoring(query_id: str, query_protein, query_seq: str):
+    """``(positional_query, matrix)`` for this query under the active ScoringSystem.
+
+    Cached per worker because ``_chunk_candidate_tasks`` splits one query across several
+    chunks: rebuilding a 240-code matrix per chunk would dominate the alignment cost.
+    """
+    cached = _QUERY_CACHE.get(query_id)
+    if cached is not None:
+        _QUERY_CACHE.move_to_end(query_id)
+        return cached
+    profile = _QUERY_PROFILES.get(query_id)
+    if profile is None or len(profile) != len(query_protein):
+        if profile is not None:
+            logger.warning(
+                f"Query '{query_id}' profile has {len(profile)} rows for "
+                f"{len(query_protein)} residues; skipped")
+        return None
+    bias = None
+    if _COMP_BIAS_SCALE is not None:
+        bias = local_composition_bias(query_seq, _COMP_BIAS_SCALE)
+    scoring = _PREPARED.query_matrix(profile, query_protein.code, bias=bias)
+    _QUERY_CACHE[query_id] = scoring
+    while len(_QUERY_CACHE) > _QUERY_CACHE_SIZE:
+        _QUERY_CACHE.popitem(last=False)
+    return scoring
 
 
 def _chunk_candidate_tasks(tasks, worker_budget: int, tasks_per_worker: int = 4):
@@ -670,6 +751,9 @@ def align_candidates(
         significance_sample_length: int = 500,
         significance_seed: int = 0,
         output_fields: Optional[List[str]] = None,
+        scoring: Optional["scoring_system.ScoringSystem"] = None,
+        query_profiles: Optional[Dict[str, "np.ndarray"]] = None,
+        subject_codes: Optional[Dict[str, "np.ndarray"]] = None,
 ) -> Dict[str, List[Hit]]:
     """Stage 2: pairwise-align each prefilter candidate and re-rank by identity.
 
@@ -704,8 +788,10 @@ def align_candidates(
             N workers (also widening affinity so they can spread). Capped at the
             number of queries.
         subject_db_size: total residue count of the subject database, used as the
-            search space for the database E-value. If ``None``, no E-value is
-            reported (the pairwise p-value is still computed).
+            search space for the database E-value. If ``None`` — or ``0``, which is
+            what an empty store reports — no E-value is reported (the pairwise
+            p-value is still computed), and combining that with a ``max_evalue``
+            is rejected up front rather than failing in the result loop.
         compute_significance: when ``True``, annotate each hit with a bit score,
             a pairwise p-value and (if ``subject_db_size`` is given) a database
             E-value.
@@ -749,6 +835,18 @@ def align_candidates(
                 "max_evalue filtering requires subject_db_size (the database "
                 "search space); pass it or set max_evalue=None."
             )
+        if subject_db_size <= 0:
+            # An empty store reaches here as 0, not None: SequenceStore.total_residues()
+            # is COALESCE(SUM(length), 0). Without this check the search space is zero,
+            # no database E-value is computed, and the filter below compares None with a
+            # float — a TypeError from deep inside the result loop, long after the cause.
+            raise ValueError(
+                f"max_evalue filtering needs a non-empty database, but subject_db_size "
+                f"is {subject_db_size}: the search space is empty, so no E-value is "
+                f"defined. This usually means the sequence store is empty or was never "
+                f"built for this database. Rebuild it with 'fm-search build sequences', "
+                f"or pass max_evalue=None to rank hits without E-value filtering."
+            )
         compute_significance = True
     if not 0.0 <= comp_bias_corr_scale <= 1.0:
         raise ValueError(
@@ -783,21 +881,93 @@ def align_candidates(
         if query_seq is None:
             logger.warning(f"Query '{query_id}' has no sequence; skipping alignment")
             continue
-        candidates = [
-            (sid, subject_sequences[sid], float(score))
-            for sid, score in zip(subject_ids, emb_scores)
-            if sid in subject_sequences
-        ]
+        # The structural codes ride along only when a scoring system will read them:
+        # otherwise every candidate would pickle an unused array to the pool with each chunk.
+        if subject_codes is None or scoring is None:
+            candidates = [
+                (sid, subject_sequences[sid], float(score))
+                for sid, score in zip(subject_ids, emb_scores)
+                if sid in subject_sequences
+            ]
+        else:
+            candidates = [
+                (sid, subject_sequences[sid], float(score), subject_codes.get(sid))
+                for sid, score in zip(subject_ids, emb_scores)
+                if sid in subject_sequences
+            ]
         missing = len(subject_ids) - len(candidates)
         if missing:
             logger.warning(f"{missing} candidate(s) for query '{query_id}' missing from sequence store; skipped")
         tasks.append((query_id, query_seq, candidates))
 
+    # A scoring system owns its gap penalties, on the integer scale its matrix is rounded
+    # to. Keep the nominal values for the ALP lookup, which is keyed on BLOSUM62 11/1.
+    aligner_gap_open, aligner_gap_extend = gap_open, gap_extend
+    if scoring is not None:
+        deployed = scoring.gaps_deployed
+        aligner_gap_open, aligner_gap_extend = abs(deployed[0]), abs(deployed[1])
+        # A scoring system's statistics belong to that system. Letting it run under
+        # 'default' would apply the ALP constants for BLOSUM62 11/1 (lambda 0.2736) to a
+        # scale-100 score, and under 'sampled' would estimate lambda by sampling BLOSUM62
+        # while the aligner runs a different matrix entirely. Both report confident
+        # nonsense rather than failing, which is the whole reason ScoringSystem exists.
+        required = (SignificanceMode.scoring_system if scoring.statistics == "karlin_altschul"
+                    else SignificanceMode.default)
+        if compute_significance and significance_mode is not required:
+            raise ValueError(
+                f"scoring system '{scoring.name}' takes its statistics from "
+                f"'{scoring.statistics}', so significance_mode must be "
+                f"'{required.value}', not '{SignificanceMode(significance_mode).value}'; "
+                f"E-values and bit scores would otherwise be computed from constants "
+                f"fitted for a different scoring system.")
+        if scoring.target_repr == "amino" and (
+                scoring.weights != (1.0, 0.0) or scoring.score_scale != 1):
+            # An amino-only system is aligned with the module's BLOSUM62 matrix, so its
+            # own weights and scale never reach the score. That is exactly right for the
+            # shipped blosum62-11-1 and silently wrong for anything else.
+            raise NotImplementedError(
+                f"scoring system '{scoring.name}' is amino-only but not plain BLOSUM62 at "
+                f"scale 1; the aligner would use BLOSUM62 and ignore its matrix.")
+        if scoring.target_repr != "amino":
+            if query_profiles is None:
+                raise ValueError(
+                    f"scoring system '{scoring.name}' scores a query profile; pass "
+                    f"query_profiles={{query_id: (L, 20) array}}")
+            if scoring.target_repr in ("exact", "coded") and subject_codes is None:
+                raise ValueError(
+                    f"scoring system '{scoring.name}' needs a structural code per subject "
+                    f"residue; pass subject_codes={{subject_id: (L,) array}}")
+            if comp_bias_corr:
+                # The calibrated lambda/K were fitted without it, so allowing the
+                # combination would report significance for a scoring system nobody
+                # calibrated. query_matrix() accepts a bias, so this is one line to
+                # relax once constants exist for it.
+                raise ValueError(
+                    f"compositional bias correction is not calibrated for scoring system "
+                    f"'{scoring.name}'; run with --no-comp-bias-corr")
+
     # Resolve the significance parameters once and share them with the workers.
     # 'default' is a table lookup (no sampling pass); 'sampled' runs the estimator.
     lam = k = alp_params = None
     if compute_significance and tasks:
-        if significance_mode is SignificanceMode.default:
+        if significance_mode is SignificanceMode.scoring_system:
+            if scoring is None:
+                raise ValueError(
+                    "significance_mode='scoring_system' needs a scoring system to read "
+                    "lambda/K from; pass scoring=...")
+            if not scoring.is_calibrated:
+                raise ValueError(
+                    f"scoring system '{scoring.name}' has no calibrated lambda/K"
+                    + (" — its significance comes from karlin_altschul.py, so use "
+                       "significance_mode='default'" if scoring.statistics == "alp"
+                       else ""))
+            lam, k = scoring.lam_deployed, scoring.k
+            logger.info(
+                f"Using the calibrated significance of scoring system '{scoring.name}' "
+                f"(lambda={lam:.8g} on the scale-{scoring.score_scale} score, K={k:.4g}, "
+                f"fitted against {scoring.reference_set})"
+            )
+        elif significance_mode is SignificanceMode.default:
             try:
                 alp_params = karlin_altschul.params_for(gap_open, gap_extend)
             except ValueError as exc:
@@ -831,7 +1001,13 @@ def align_candidates(
 
     if comp_bias_scale is not None and tasks:
         logger.info(f"Applying compositional bias correction (scale {comp_bias_scale:g})")
-    init_args = (gap_open, gap_extend, lam, k, subject_db_size, alp_params, needs, comp_bias_scale)
+    profiles = None
+    if scoring is not None and query_profiles is not None:
+        # float32 halves what every worker receives; the matrix is rounded to int32
+        # anyway, so the extra precision never reaches a score.
+        profiles = {qid: np.asarray(p, dtype=np.float32) for qid, p in query_profiles.items()}
+    init_args = (aligner_gap_open, aligner_gap_extend, lam, k, subject_db_size, alp_params,
+                 needs, comp_bias_scale, scoring, profiles)
     if not serial and tasks:
         # Parallelize over (query, subject) *pairs* rather than whole queries by
         # chunking each query's candidate list, so even a single query with many

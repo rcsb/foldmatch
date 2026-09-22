@@ -99,6 +99,11 @@ class SignificanceMode(str, Enum):
     """Scale used for Stage-2 bit scores, p-values and E-values."""
     default = "default"  # calibrated constants + finite-size correction; needs gaps 11/1
     sampled = "sampled"  # lambda/K estimated by sampling; any gaps, unreliable magnitudes
+    # lambda/K read off the active ScoringSystem, which carries constants fitted for
+    # exactly its own matrix, gaps, target representation and reference null. This is
+    # the only mode that can serve a 3Di scoring system: 'default' covers BLOSUM62 at
+    # gaps 11/1 alone, and 'sampled' samples BLOSUM62 regardless of the active matrix.
+    scoring_system = "scoring_system"
 
 
 @dataclass
