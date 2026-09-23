@@ -23,6 +23,7 @@ from foldmatch.types.api_types import (
     LogLevel,
     SignificanceMode,
     FormatMode,
+    ScoringChoice,
 )
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -312,6 +313,11 @@ def build_database_from_fasta(
                  'batches (e.g. 65536+) better saturate many-core nodes during '
                  'IVF-PQ build; smaller batches use less memory.'
         )] = 32768,
+        three_di: Annotated[bool, typer.Option(
+            help="Also store a predicted 3Di code per residue, so the database can be "
+                 "searched with '--scoring three_di' (amino acids + 3Di) as well as "
+                 "amino acids alone. Costs one byte per residue and no extra model pass."
+        )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging level.'
         )] = LogLevel.info
@@ -319,6 +325,10 @@ def build_database_from_fasta(
     """Build an embedding database from protein sequences in a FASTA file."""
 
     set_log_level(log_level)
+    # The flag becomes the registry name of the encoding new databases are written with;
+    # everything below, and the manifest, speaks that name.
+    from foldmatch.search.scoring_system import DEFAULT_THREE_DI
+    three_di = DEFAULT_THREE_DI if three_di else None
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -333,6 +343,7 @@ def build_database_from_fasta(
         accelerator=accelerator,
         devices=arg_devices(devices),
         strategy=strategy,
+        three_di=three_di,
     )
 
     if not _is_rank_zero():
@@ -358,6 +369,39 @@ def build_database_from_fasta(
         fasta_file=fasta_file,
         min_res_n=min_res_n,
     )
+
+    if three_di is not None:
+        # The predicted 3Di codes travel in their own versioned sidecar rather than as a
+        # column on `sequences`, whose premise is that it is rebuildable from the FASTA.
+        # These are not: reproducing them needs the ESM3 revision, the head revision, a
+        # temperature and a kernel, all of which the manifest records. The manifest is
+        # written last, so an interrupted build leaves a store that reports itself absent.
+        from foldmatch.search import scoring_system
+        from foldmatch.search.three_di_store import ThreeDiStore
+        from foldmatch.utils.esm.loaders import ESM_REVISION
+        from foldmatch.utils.model import THREE_DI_REVISION
+        system = scoring_system.get(three_di)
+        store = ThreeDiStore(embedding_db.db_folder, embedding_db.index_name)
+        stored = store.create(
+            embedding_computer.get_three_di_batches(load_batch_size=load_batch_size),
+            force=True,
+        )
+        # Every indexed id must have codes: a hit whose subject has none would silently
+        # drop out of a 3Di search, turning a missing sidecar row into a missing result.
+        indexed = set(embedding_db.db.chain_ids)
+        missing = store.missing(indexed)
+        if missing:
+            store.remove()
+            raise ValueError(
+                f"{len(missing)} of {len(indexed)} indexed entries have no 3Di codes "
+                f"(e.g. {sorted(missing)[:3]}); the sidecar was removed rather than "
+                f"left partial.")
+        store.write_manifest(
+            system,
+            model_revision=THREE_DI_REVISION,
+            esm_revision=ESM_REVISION,
+            entry_count=stored,
+        )
 
 
 @query_db_app.command(
@@ -588,6 +632,15 @@ def query_database_from_fasta(
                  'Defaults to the value baked in at build time. '
                  'Ignored for flat/hnsw indexes.'
         )] = None,
+        scoring: Annotated[ScoringChoice, typer.Option(
+            help='Stage 2 scoring. "blosum62" (default): amino acids alone, exactly as '
+                 'before. "three_di": amino acids AND predicted 3Di, for a database built '
+                 'with --three-di. three_di uses the 3Di system recorded in that database '
+                 'and its own tuned gaps and calibrated E-values, so --gap-open, '
+                 '--gap-extend and --significance-mode are ignored; run it with '
+                 '--min-seq-identity 0, because reported identity is amino-acid identity, '
+                 'which the remote homologs 3Di finds do not have.'
+        )] = ScoringChoice.blosum62,
         seq_identity: Annotated[Optional[bool], typer.Option(
             help='Stage 2: after the embedding prefilter, pairwise-align each '
                  'query against its candidate subjects and report exact sequence '
@@ -655,6 +708,13 @@ def query_database_from_fasta(
     """Search database using protein sequences from a FASTA file."""
 
     set_log_level(log_level)
+    # Everything below takes a registry name as a plain string. blosum62 maps to NO
+    # scoring system, so it runs exactly the path it always has (--gap-open/--gap-extend
+    # and --significance-mode included); three_di resolves to whatever 3Di system the
+    # database was built with, and does so now - before the query's ESM3 pass, so a
+    # database without 3Di fails in seconds rather than after embedding every query.
+    scoring = (None if scoring is ScoringChoice.blosum62
+               else _resolve_three_di_system(db_path))
     _check_comp_bias_corr_scale(comp_bias_corr_scale)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
@@ -670,6 +730,11 @@ def query_database_from_fasta(
         accelerator=accelerator,
         devices=arg_devices(devices),
         strategy=strategy,
+        three_di=scoring,
+        # A query needs the full (L, 20) distribution, not the byte a database stores:
+        # the position-specific matrix is built from it, and quantising to a byte and
+        # back would lose the gradation that makes a soft query worth its keep.
+        three_di_output="profile",
     )
 
     if not _is_rank_zero():
@@ -701,6 +766,8 @@ def query_database_from_fasta(
     if run_stage2:
         from foldmatch.utils.fasta import iter_fasta
         query_sequences = dict(iter_fasta(fasta_file))
+        query_profiles = (embedding_computer.get_three_di_profiles()
+                          if scoring is not None else None)
         _stage2_align_and_report(
             embedding_db=embedding_db,
             prefilter_results=results,
@@ -718,6 +785,8 @@ def query_database_from_fasta(
             significance_sample_size=significance_sample_size,
             format_output=format_output,
             format_mode=format_mode,
+            scoring_name=scoring,
+            query_profiles=query_profiles,
         )
     else:
         write_embedding_results(results, output_file, format_mode)
@@ -752,6 +821,12 @@ def query_database_from_database(
                  'Defaults to the value baked in at build time. '
                  'Ignored for flat/hnsw indexes.'
         )] = None,
+        scoring: Annotated[ScoringChoice, typer.Option(
+            help='Stage 2 scoring. Only "blosum62" (amino acids, the default) is '
+                 'supported for a database-vs-database search: three_di needs a query '
+                 'profile, which this command has no ESM3 pass to produce. Use '
+                 '"fm-search query sequences" with the query FASTA instead.'
+        )] = ScoringChoice.blosum62,
         seq_identity: Annotated[Optional[bool], typer.Option(
             help='Stage 2: after the embedding prefilter, pairwise-align each '
                  'query against its candidate subjects and report exact sequence '
@@ -819,6 +894,21 @@ def query_database_from_database(
     """Search subject database using all entries from query database."""
 
     set_log_level(log_level)
+    # blosum62 is the unchanged path; anything else reaches the refusal below.
+    scoring = None if scoring is ScoringChoice.blosum62 else scoring.value
+
+    if scoring is not None:
+        # The query side needs the full (L, 20) distribution to build its
+        # position-specific matrix, and this command reads its queries straight out of
+        # SQLite with no ESM3 pass. Expanding each stored byte through the kernel is a
+        # real option - the kernel row IS the calibrated posterior for that code, and it
+        # recovers the argmax 99.2% of the time - but it needs the temperature applied
+        # once rather than twice, and has not been measured end to end. Refusing is
+        # honest; silently degrading to amino acids would not be.
+        raise ValueError(
+            "--scoring is not yet supported for a database-vs-database search: the "
+            "query side has no 3Di profile here. Use 'fm-search query sequences' with "
+            "the query FASTA instead.")
     _check_comp_bias_corr_scale(comp_bias_corr_scale)
 
     if use_gpu_index:
@@ -1118,6 +1208,35 @@ def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missin
     return False
 
 
+def _resolve_three_di_system(db_path: str) -> str:
+    """The 3Di scoring system a database was built with, read from its manifest.
+
+    The user asks for "three_di"; the database says which 3Di. Reading it here instead
+    of assuming the newest encoding means a database built under one encoding keeps
+    being searched under that one after a newer one ships. Only the small JSON manifest
+    is read, so this is cheap enough to run before the query's ESM3 pass.
+    """
+    from foldmatch.search import scoring_system
+    from foldmatch.search.embedding_database import _parse_db_path
+    from foldmatch.search.three_di_store import ThreeDiStore
+    db_folder, index_name, _ = _parse_db_path(db_path)
+    store = ThreeDiStore(db_folder, index_name)
+    if not store.exists():
+        reason = ("its 3Di sidecar has no manifest, so that build did not finish"
+                  if store.is_partial() else
+                  "it was built without --three-di")
+        raise ValueError(
+            f"--scoring three_di needs a database with 3Di codes, but {db_path}: {reason}. "
+            f"Rebuild it with 'fm-search build sequences --three-di', or search it with "
+            f"--scoring blosum62.")
+    name = store.read_manifest().get("scoring_system", {}).get("name")
+    if name not in scoring_system.REGISTRY:
+        raise ValueError(
+            f"{db_path} was built with 3Di system {name!r}, which this FoldMatch does not "
+            f"know; use the FoldMatch version that built it, or rebuild the database.")
+    return name
+
+
 def _stage2_align_and_report(
         embedding_db,
         prefilter_results,
@@ -1135,6 +1254,8 @@ def _stage2_align_and_report(
         significance_sample_size: int = 500,
         format_output: str = DEFAULT_FORMAT_OUTPUT,
         format_mode: FormatMode = FormatMode.headless_tsv,
+        scoring_name: Optional[str] = None,
+        query_profiles=None,
 ):
     """Run Stage-2 pairwise alignment on prefilter candidates and report.
 
@@ -1158,6 +1279,59 @@ def _stage2_align_and_report(
             f"sequences (fm-search build sequences)."
         )
 
+    scoring = subject_codes = None
+    if scoring_name is not None:
+        from foldmatch.search import scoring_system
+        if scoring_system.get(scoring_name).target_repr == "amino":
+            # An amino-acid-only system needs no sidecar and is exactly the unchanged
+            # path; treating every named system as 3Di made 'blosum62-11-1' demand codes
+            # a plain database never has.
+            scoring_name = None
+    if scoring_name is not None:
+        from foldmatch.search import scoring_system
+        from foldmatch.search.three_di_store import ThreeDiStore
+        from foldmatch.utils.esm.loaders import ESM_REVISION
+        from foldmatch.utils.model import THREE_DI_REVISION
+        scoring = scoring_system.get(scoring_name)
+        three_di_store = ThreeDiStore(embedding_db.db_folder, embedding_db.index_name)
+        if not three_di_store.exists():
+            hint = ("the sidecar is present but has no manifest, so that build did not "
+                    "finish" if three_di_store.is_partial() else
+                    "rebuild it with 'fm-search build sequences --three-di'")
+            raise ValueError(
+                f"Subject database has no 3Di codes ({three_di_store.path}); {hint}.")
+        # Refuses a different kernel, temperature, code count, head revision or ESM3
+        # revision. Every one of those would still align and still produce an E-value;
+        # only the answer would be wrong.
+        three_di_store.check_compatible(
+            scoring, model_revision=THREE_DI_REVISION, esm_revision=ESM_REVISION,
+            expected_entries=len(embedding_db.db.chain_ids))
+        # A callable, like fetch_subject_sequences: building the dict here would mean
+        # recomputing the candidate union that align_candidates already computes, and a
+        # candidate in one union but not the other would vanish with no error.
+        subject_codes = three_di_store.fetch
+        # The scoring system's own statistics are the only ones calibrated for it;
+        # 'default' would apply BLOSUM62's ALP constants to a scale-100 score.
+        significance_mode = SignificanceMode.scoring_system
+        if comp_bias_corr:
+            raise ValueError(
+                "--comp-bias-corr is not calibrated for 3Di scoring; rerun with "
+                "--no-comp-bias-corr")
+        if (gap_open, gap_extend) != (11, 1):
+            logging.warning(
+                f"--gap-open/--gap-extend ({gap_open}/{gap_extend}) are ignored under "
+                f"scoring system '{scoring.name}', which uses its own tuned gaps "
+                f"{scoring.gap_open:g}/{scoring.gap_extend:g}.")
+        if min_seq_identity > 0.0:
+            # Measured: a full-coverage hit at 28.2% amino-acid identity and E=1.2e-11 is
+            # dropped by the 0.3 default. That is precisely the remote-homology regime
+            # 3Di exists to find, and the filter is on AMINO-ACID identity even when the
+            # score is mostly structural.
+            logging.warning(
+                f"--min-seq-identity {min_seq_identity} filters on amino-acid identity "
+                f"and will discard the remote homologs 3Di scoring is for; pass "
+                f"--min-seq-identity 0 to keep them.")
+
     logging.info("Computing pairwise sequence alignments (Stage 2)...")
     aligned = alignment.align_candidates(
         query_sequences=query_sequences,
@@ -1172,6 +1346,9 @@ def _stage2_align_and_report(
         comp_bias_corr_scale=comp_bias_corr_scale,
         num_workers=num_workers,
         subject_db_size=subject_store.total_residues(),
+        scoring=scoring,
+        query_profiles=query_profiles,
+        subject_codes=subject_codes,
         # Only pay for the significance pass when a significance column
         # (evalue/bits) is actually requested — align_candidates turns it back
         # on by itself when max_evalue asks for an E-value to filter on.

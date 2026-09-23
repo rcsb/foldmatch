@@ -190,6 +190,48 @@ class PairedAlignmentTest(unittest.TestCase):
         self.assertAlmostEqual(serial.identity_aln, parallel.identity_aln, places=9)
 
 
+class IdentityIsAminoAcidAlongThe3DiPathTest(unittest.TestCase):
+    """Reported identity is always amino-acid identity, measured on the 3Di-chosen path.
+
+    3Di scoring decides WHICH columns align; identity then compares the amino acids in
+    those columns. It must be neither identity over 3Di symbols nor identity from a
+    separate amino-acid-only alignment. An unrelated amino-acid sequence carrying the same
+    3Di states separates the three: 3Di aligns it end to end, only chance amino acids
+    agree along that path, and BLOSUM62 alone would pick a different, shorter path.
+    """
+
+    def test_identity_is_measured_on_the_3di_alignment_with_amino_acids(self):
+        rng = np.random.default_rng(0)
+        target = "".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), len(SEQUENCE)))
+        states = ss.three_di_codes(three_di_string(len(SEQUENCE), seed=1))
+        fields = ["query", "target", "fident", "alnlen", "qaln", "taln"]
+        hit = alignment.align_candidates(
+            query_sequences={"q": SEQUENCE}, prefilter_results={"q": (["t"], [0.9])},
+            fetch_subject_sequences=lambda ids: {"t": target},
+            scoring=ss.get("3di-v1-exact"), query_profiles={"q": one_hot(states)},
+            subject_codes={"t": states}, significance_mode=SignificanceMode.scoring_system,
+            subject_db_size=len(target), min_seq_identity=0.0, min_coverage=0.0,
+            max_evalue=None, num_workers=1, output_fields=fields)["q"][0].metrics
+
+        # 3Di drove a full-length path through unrelated amino acids...
+        self.assertEqual(len(hit.q_aln), len(SEQUENCE))
+        self.assertTrue(set(hit.q_aln + hit.t_aln) <= set("ACDEFGHIKLMNPQRSTVWY-"),
+                        "aligned strings must be amino acids, not paired symbols")
+        # ...and identity counts identical AMINO ACIDS in exactly those columns.
+        by_hand = sum(a == b and a != "-" for a, b in zip(hit.q_aln, hit.t_aln)) / len(hit.q_aln)
+        self.assertAlmostEqual(hit.identity_aln, by_hand, places=12)
+        self.assertLess(hit.identity_aln, 0.15, "identity over 3Di symbols would be ~1.0")
+
+        plain = alignment.align_candidates(
+            query_sequences={"q": SEQUENCE}, prefilter_results={"q": (["t"], [0.9])},
+            fetch_subject_sequences=lambda ids: {"t": target}, compute_significance=False,
+            min_seq_identity=0.0, min_coverage=0.0, max_evalue=None, num_workers=1,
+            output_fields=fields)["q"]
+        if plain:
+            self.assertNotEqual(len(plain[0].metrics.q_aln), len(hit.q_aln),
+                                "identity must come from the 3Di path, not a BLOSUM62 one")
+
+
 class CodedTargetTest(unittest.TestCase):
     """The sequence-only database path, where the target's 3Di is a predicted byte."""
 

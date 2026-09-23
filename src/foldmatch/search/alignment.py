@@ -753,7 +753,7 @@ def align_candidates(
         output_fields: Optional[List[str]] = None,
         scoring: Optional["scoring_system.ScoringSystem"] = None,
         query_profiles: Optional[Dict[str, "np.ndarray"]] = None,
-        subject_codes: Optional[Dict[str, "np.ndarray"]] = None,
+        subject_codes=None,
 ) -> Dict[str, List[Hit]]:
     """Stage 2: pairwise-align each prefilter candidate and re-rank by identity.
 
@@ -874,6 +874,11 @@ def align_candidates(
         for sid in subject_ids
     }
     subject_sequences = fetch_subject_sequences(all_subject_ids)
+    if callable(subject_codes):
+        # Accept the same shape as fetch_subject_sequences: a caller that had to build
+        # the dict itself would have to recompute this union, and any candidate present
+        # in one union and not the other would vanish from the results with no error.
+        subject_codes = subject_codes(all_subject_ids)
 
     tasks = []
     for query_id, (subject_ids, emb_scores) in prefilter_results.items():

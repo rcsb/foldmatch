@@ -95,6 +95,19 @@ class FormatMode(str, Enum):
     tsv = "tsv"                    # tab-separated with a header row
 
 
+class ScoringChoice(str, Enum):
+    """What a user picks for Stage-2 scoring. Deliberately not a versioned registry name.
+
+    ``three_di`` means "amino acids + predicted 3Di, under whichever 3Di system the subject
+    database was built with" - resolved from the database's manifest at query time. So a
+    user never types a version, yet a database built under one encoding keeps being
+    searched under that encoding after a newer one ships, instead of being silently
+    re-interpreted (or refused) by whatever is newest.
+    """
+    blosum62 = "blosum62"    # amino acids only - the behaviour before 3Di
+    three_di = "three_di"    # amino acids AND predicted 3Di; needs a --three-di database
+
+
 class SignificanceMode(str, Enum):
     """Scale used for Stage-2 bit scores, p-values and E-values."""
     default = "default"  # calibrated constants + finite-size correction; needs gaps 11/1

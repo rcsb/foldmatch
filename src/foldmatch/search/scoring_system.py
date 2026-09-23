@@ -481,6 +481,40 @@ class PreparedScoring:
         p = np.exp(scaled)
         return p / p.sum(axis=1, keepdims=True)
 
+    @property
+    def buckets(self) -> int:
+        """Confidence buckets per predicted state, for a ``coded`` target."""
+        if self.system.target_repr != "coded":
+            raise ValueError(f"{self.system.name} does not use confidence buckets")
+        if self.system.n_codes % N_STATES:
+            raise ValueError(
+                f"{self.system.n_codes} codes is not a whole number of buckets "
+                f"per {N_STATES} states")
+        return self.system.n_codes // N_STATES
+
+    def encode_target(self, profile: np.ndarray) -> np.ndarray:
+        """One byte per residue: predicted state x confidence bucket.
+
+        This is the target-side counterpart of :meth:`query_matrix`, and the single
+        definition of the encoding in this package - the kernel's rows are indexed by
+        exactly these codes, so a second implementation that bucketed differently would
+        point every residue at the wrong row while still producing valid-looking codes.
+
+        The bucket spans the *usable* confidence range: a 20-state distribution cannot be
+        less confident than 1/20, so the range is rescaled from [1/20, 1] to [0, 1] before
+        bucketing. The system's temperature is applied first, because the kernel was
+        fitted on softened confidences.
+        """
+        buckets = self.buckets
+        profile = self.soften(profile)
+        state = profile.argmax(axis=1)
+        confidence = profile.max(axis=1)
+        lowest = 1.0 / N_STATES
+        scaled = (confidence - lowest) / (1.0 - lowest)
+        bucket = np.clip((scaled * buckets).astype(int), 0, buckets - 1)
+        return (state * buckets + bucket).astype(np.uint8 if self.system.n_codes <= 256
+                                                 else np.int64)
+
     def query_matrix(self, profile: np.ndarray, amino_codes: np.ndarray,
                      bias: Optional[np.ndarray] = None):
         """``(positional_sequence, matrix)`` scoring query position i against every target symbol.
@@ -651,6 +685,11 @@ THREE_DI_V1_CODED = ScoringSystem(
     calibration="8000 cross-CATH-topology pairs, censored tail fit at q=0.9, "
                 "descaled scores; kernel fitted on the validation split at T=1.080",
 )
+
+#: The 3Di encoding a new ``build sequences --three-di`` database is written with. A
+#: search does NOT read this - it reads the system recorded in the database's manifest -
+#: so changing it affects only databases built afterwards.
+DEFAULT_THREE_DI = "3di-v1-coded"
 
 REGISTRY: Dict[str, ScoringSystem] = {
     s.name: s for s in (BLOSUM62_11_1, THREE_DI_V1_EXACT, THREE_DI_V1_CODED)

@@ -32,7 +32,10 @@ class CoreBatchWriter(BasePredictionWriter):
     ):
         if prediction is None:
             return
-        embeddings, dom_ids = prediction
+        # A module with a 3Di head returns a third element; these writers store the
+        # embedding only, so it is unpacked and dropped rather than silently changing
+        # what they write.
+        embeddings, dom_ids = prediction[0], prediction[1]
         deque(map(
             self._write_embedding,
             embeddings,
@@ -141,18 +144,24 @@ class ParquetBatchWriter(BasePredictionWriter):
             df_id,
             write_interval="batch",
             buffer_size=16384,
+            with_three_di=False,
     ):
         super().__init__(write_interval)
         self.out_path = output_path
         self.df_id = df_id
         self.buffer_size = buffer_size
+        self.with_three_di = with_three_di
         self._writer = None
         self._id_buffer = []
         self._emb_buffer = []
-        self._schema = pa.schema([
-            ('id', pa.string()),
-            ('embedding', pa.list_(pa.float32()))
-        ])
+        self._three_di_buffer = []
+        # The 3Di column is opt-in and decided here rather than per batch: a schema that
+        # appeared partway through a run would split the shard into incompatible row
+        # groups, and every reader of an existing database keeps the two-column file.
+        fields = [('id', pa.string()), ('embedding', pa.list_(pa.float32()))]
+        if with_three_di:
+            fields.append(('three_di', pa.binary()))
+        self._schema = pa.schema(fields)
 
     def _get_writer(self, rank):
         if self._writer is None:
@@ -172,7 +181,12 @@ class ParquetBatchWriter(BasePredictionWriter):
     ):
         if prediction is None:
             return
-        embeddings, dom_ids = prediction
+        embeddings, dom_ids = prediction[0], prediction[1]
+        three_di = prediction[2] if len(prediction) > 2 else None
+        if self.with_three_di and three_di is None:
+            raise ValueError(
+                "this writer was built with with_three_di=True but the module returned "
+                "no 3Di codes; the shard would be written with an empty column")
         self._id_buffer.extend(dom_ids)
         # Keep flattened float32 arrays (not Python lists) in the buffer — far
         # cheaper in memory until we flush. .flatten() copies, so the buffer
@@ -181,6 +195,10 @@ class ParquetBatchWriter(BasePredictionWriter):
             emb.detach().to('cpu', torch.float32).numpy().flatten()
             for emb in embeddings
         )
+        if self.with_three_di:
+            # One byte per residue, stored as opaque bytes: the codes are only meaningful
+            # against the kernel that defines them, which the database manifest records.
+            self._three_di_buffer.extend(codes.tobytes() for codes in three_di)
         if len(self._id_buffer) >= self.buffer_size:
             self._flush(trainer.global_rank)
 
@@ -188,16 +206,17 @@ class ParquetBatchWriter(BasePredictionWriter):
         """Write the buffered rows as a single Parquet row group."""
         if not self._id_buffer:
             return
-        table = pa.table(
-            {
-                'id': self._id_buffer,
-                'embedding': pa.array(self._emb_buffer, type=pa.list_(pa.float32())),
-            },
-            schema=self._schema,
-        )
+        columns = {
+            'id': self._id_buffer,
+            'embedding': pa.array(self._emb_buffer, type=pa.list_(pa.float32())),
+        }
+        if self.with_three_di:
+            columns['three_di'] = pa.array(self._three_di_buffer, type=pa.binary())
+        table = pa.table(columns, schema=self._schema)
         self._get_writer(rank).write_table(table)
         self._id_buffer.clear()
         self._emb_buffer.clear()
+        self._three_di_buffer.clear()
 
     def on_predict_end(self, trainer, pl_module):
         # Flush whatever didn't reach a full buffer before closing.

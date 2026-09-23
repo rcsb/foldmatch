@@ -115,12 +115,22 @@ class EmbeddingComputer:
             devices: Devices = 'auto',
             strategy: Strategy = Strategy.auto,
             accelerator: Accelerator = Accelerator.auto,
+            three_di: Optional[str] = None,
+            three_di_output: str = "codes",
     ):
-        """Compute chain embeddings from protein sequences in a FASTA file."""
+        """Compute chain embeddings from protein sequences in a FASTA file.
+
+        ``three_di`` names a scoring system (e.g. ``'3di-v1-coded'``) whose predicted 3Di
+        encoding is written alongside each embedding, from the same ESM3 pass. This is the
+        sequence-only case: there are no coordinates to read a structural alphabet from,
+        so predicting it is the only way a sequence database can carry one at all.
+        """
 
         chain_predict(
             src_stream=fasta_file,
             src_from=SrcEsmFrom.fasta,
+            three_di=three_di,
+            three_di_output=three_di_output,
             min_res_n=min_res_n,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -133,6 +143,58 @@ class EmbeddingComputer:
             strategy=strategy,
             return_predictions=False,
         )
+
+    def get_three_di_batches(self, load_batch_size: int = 32768) -> Iterator[tuple[str, np.ndarray]]:
+        """Stream ``(id, codes)`` from the shards' ``three_di`` column. Rank-0 only.
+
+        A separate pass over the same Parquet files as :meth:`get_embedding_batches`,
+        projecting a different column, so the index build is untouched by the existence
+        of 3Di codes - and so a database can be built without them by simply not calling
+        this.
+        """
+        parquet_files = sorted(Path(self.embedding_folder).glob(f"{self.out_name}-*.parquet"))
+        for parquet_file in parquet_files:
+            pf = pq.ParquetFile(parquet_file)
+            if 'three_di' not in pf.schema_arrow.names:
+                raise ValueError(
+                    f"{parquet_file} has no 'three_di' column: the embeddings were "
+                    f"computed without a 3Di head, so this database cannot carry codes")
+            for record in pf.iter_batches(batch_size=load_batch_size,
+                                          columns=['id', 'three_di']):
+                ids = record.column('id').to_pylist()
+                codes = record.column('three_di').to_pylist()
+                for identifier, blob in zip(ids, codes):
+                    yield identifier, np.frombuffer(blob, dtype=np.uint8)
+
+    def get_three_di_profiles(self, load_batch_size: int = 32768) -> dict:
+        """``{id: (L, 20) float32}`` from the shards' ``three_di`` column.
+
+        The query counterpart of :meth:`get_three_di_batches`: the same column, written
+        by a run configured with ``three_di_output='profile'``, read back as the
+        distribution rather than as codes. Returned whole rather than streamed because a
+        query set is small and the aligner wants them all at once; a *database* must use
+        the code path instead, which is 1/40th the size.
+        """
+        profiles = {}
+        parquet_files = sorted(Path(self.embedding_folder).glob(f"{self.out_name}-*.parquet"))
+        for parquet_file in parquet_files:
+            pf = pq.ParquetFile(parquet_file)
+            if 'three_di' not in pf.schema_arrow.names:
+                raise ValueError(
+                    f"{parquet_file} has no 'three_di' column: these embeddings were "
+                    f"computed without a 3Di head")
+            for record in pf.iter_batches(batch_size=load_batch_size,
+                                          columns=['id', 'three_di']):
+                for identifier, blob in zip(record.column('id').to_pylist(),
+                                            record.column('three_di').to_pylist()):
+                    flat = np.frombuffer(blob, dtype=np.float16)
+                    if flat.size % 20:
+                        raise ValueError(
+                            f"{identifier}: {flat.size} float16 values is not a whole "
+                            f"number of 20-state rows — was this shard written with "
+                            f"three_di_output='codes'?")
+                    profiles[identifier] = flat.reshape(-1, 20).astype(np.float32)
+        return profiles
 
     def get_embedding_batches(self, load_batch_size: int = 32768) -> Iterator[tuple[list[str], np.ndarray]]:
         """Stream (ids, [B, D] float32) batches from all per-rank Parquet shards. Rank-0 only."""
