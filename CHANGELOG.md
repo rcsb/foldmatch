@@ -30,6 +30,10 @@ While the major version is `0`, breaking changes are released in a minor bump.
   the false positives it removed. When on, E-values rise (median about 1.8x on
   that benchmark) and alignments over biased regions get shorter, lowering
   coverage. Pass `--comp-bias-corr` to compare with a default mmseqs run.
+- **`--cleanup-embeddings`** on `fm-search build structures` and `fm-search
+  build sequences`: deletes the build's intermediate embedding shards from
+  `--tmp-embedding-folder` once the database is built. Off by default, so the
+  shards are kept as before.
 
 ### Changed
 
@@ -50,6 +54,102 @@ While the major version is `0`, breaking changes are released in a minor bump.
   at query time and the FASTA paths, which already used "at least". Databases and
   embeddings built with a non-zero minimum now also include chains of exactly
   that length.
+- **The ESM3 weights are pinned.** FoldMatch now downloads `rcsb/rcsb-esm` at
+  revision `636acb420daf674df37ab0220f56061a5de2f169` instead of whatever its
+  `main` branch points to, and refuses any `esm3_sm_open_v1.pth` other than the
+  one with sha256
+  `5ead5a135c658068db6a4f1b933e72d6110992c4668822e1c0e2dcc53e38acd9`. These are
+  the weights FoldMatch already used, so embeddings do not change. In the usual
+  Hugging Face cache layout the check reads the file's blob name, which is its
+  sha256, and costs nothing; when the layout hides it (a `local_dir` download or
+  a copied snapshot), the 2.8 GB file is hashed once per process. An offline
+  installation (`HF_HUB_OFFLINE=1`) whose cache holds only an older
+  `rcsb/rcsb-esm` snapshot must run `download-models` once online.
+  Every `torch.load` now passes `weights_only=True` (already PyTorch's default
+  from 2.6), so model and residue-embedding files cannot run pickled code.
+- **FASTA sequences are normalised before ESM3.** ASCII whitespace inside
+  sequence lines is removed and ASCII letters are uppercased before a sequence
+  is embedded, stored in the sequence store or aligned in Stage 2, on every
+  FASTA path (`fm-search build sequences`, `fm-search query sequences`,
+  `fm-embedding`, `inference`) and in `FoldMatch.sequence_embedding` (Python
+  API). ESM3 used to read lowercase letters, and spaces or tabs inside a line,
+  as unknown residues, so the chain embeddings of such records were wrong
+  (cosine 0.31-0.34 to the correct ones on the test fixture): rebuild databases
+  and redo embeddings made from lowercase or soft-masked FASTA. `--min-res-n`,
+  and `min_res`/`max_res` of `FoldMatch.sequence_embedding`, now count residues
+  without whitespace. Uppercase FASTA without whitespace inside its sequence
+  lines gives exactly the same results as before.
+- **FASTA problems and existing outputs are reported before the ESM3 pass.**
+  `fm-search build sequences` now refuses an existing `.index`, `.metadata`,
+  `.invlists`, `.sequences` or `.rescodes.*` file before computing any
+  embedding; before, the existing database was only refused after the whole
+  pass, and a leftover `.sequences` file made the build fail at the end.
+  `fm-search build structures` checks `.index`, `.metadata` and `.invlists` up
+  front in the same way. `build sequences` and `query sequences` scan the FASTA
+  once on every rank before ESM3 and log a warning for duplicate ids, sequences
+  containing `<` or `>`, and non-ASCII sequences, then go ahead as before. If
+  the sequence store written after the pass disagrees with that scan (the FASTA
+  changed during the build), the build fails and removes the database files it
+  wrote, so it can simply be run again. A FASTA with no sequence of at least
+  `--min-res-n` residues (or an empty one) is refused before ESM3 too, instead
+  of failing after the pass with "No embeddings provided". `fm-search query
+  sequences` and `fm-search query db` decide whether Stage 2 runs before ESM3
+  or the search, and check the sequence stores it will read: `--seq-identity`
+  without a store, an incomplete store and an E-value filter over an empty
+  database are reported there.
+- **An interrupted sequence-store build is detected.** A `.sequences` file
+  whose build stopped part way (it now records its totals last) is refused
+  with an "incomplete" error instead of being read as the whole database:
+  delete the database and rebuild it.
+- **Embedding shards are named per run.** The intermediate files in
+  `--tmp-embedding-folder` are now `emb_<run id>-<rank>.parquet`. The run id is
+  `FOLDMATCH_RUN_ID` when set; in a task of an `srun` step it is built from the
+  job id, step id, restart count and a digest of the command's arguments, so
+  the tasks of a step agree and the commands it runs one after another do not;
+  otherwise, including the batch step of an `sbatch` script, the launching
+  process draws a random id and passes it to the ranks it starts. `fm-search
+  query sequences` deletes its query shards after the search; build shards are
+  kept unless `--cleanup-embeddings` is given. A rank above 0 started without a
+  shared id refuses to start: set `FOLDMATCH_RUN_ID` to the same value for every
+  rank whenever something other than `srun` or Lightning starts the ranks, that
+  is `torchrun`, or a multi-node run outside SLURM started on each node with
+  `NODE_RANK` (set it on every node: otherwise the other nodes refuse and node 0
+  waits for them until the one-day process-group timeout). Every rank also
+  refuses to start when shards with its run id are already in
+  `--tmp-embedding-folder` (the same command run twice in one `srun` step, or a
+  reused `FOLDMATCH_RUN_ID`). After a FASTA pass, rank 0 checks that the shards
+  hold exactly one embedding per entry, and a missing rank is now an error
+  instead of being dropped silently.
+- **`--max-evalue` against an empty database is an error.** With an E-value
+  filter (including the default `--max-evalue 1e-3`), `fm-search query
+  sequences`, `fm-search query db` and `align_candidates` now refuse a database
+  whose residue count is 0 or negative, with a message that names the likely
+  cause (an empty or unbuilt sequence store) and the two ways out: delete the
+  database and rebuild it with `fm-search build sequences`, or pass
+  `--max-evalue inf` (`max_evalue=None`). The CLI reports it before the ESM3
+  pass or the search. Before, a query against an empty sequence store returned
+  no hits with only "missing from sequence store" warnings, and
+  `align_candidates` failed with an unrelated error from deep inside the
+  alignment loop.
+- **`--min-coverage` help text corrected** on `fm-search query sequences` and
+  `fm-search query db`: a hit is kept only if the query coverage and the subject
+  coverage both reach the value, so it is dropped when either side is below.
+  The old text suggested the opposite. Filtering itself is unchanged.
+- **Faster BLOSUM62 Stage 2.** Sequence identity is computed vectorised from the
+  alignment trace, which makes `align_candidates` about 1.1-1.3x faster in a
+  serial run. The output is byte-identical.
+- **Long FASTA sequences need far less ESM3 memory.** For sequence-only input
+  (the FASTA paths of `fm-search`, `fm-embedding` and `inference`, and
+  `FoldMatch.sequence_embedding` in the Python API), ESM3 now runs without its
+  geometric attention, which has no coordinates to attend to there but
+  allocated a tensor that grows with the square of the sequence length. ESM3
+  ran out of memory at 2,750 residues on a 40 GB A100; 16,000 residues now fit
+  in about 10 GiB. On a CPU node a 4,000-residue sequence needed 83 GiB and now
+  needs 8.3 GiB, and a 1,500-residue sequence takes 10 s instead of 56 s on an
+  M1 Max CPU. Embeddings are bit-identical. Structure inputs are unchanged. In
+  the Python API, ESM3 calls on one model from several threads now run one at
+  a time, so that no structure embedding runs while another thread has
+  geometric attention switched off.
 
 ### Fixed
 
@@ -60,6 +160,29 @@ While the major version is `0`, breaking changes are released in a minor bump.
   query embeddings were computed over different chains. Assembly databases
   built with the default `--min-res 10` now leave out chains shorter than 10
   residues, so rebuild existing ones to match queries.
+- **Multi-GPU runs without SLURM lost the embeddings of every rank but rank 0.**
+  Each process drew its own shard-name prefix, so rank 0 built the database, or
+  ran the query, from its own shard only and silently dropped the others. All
+  ranks now share one run id (see *Changed*). Rebuild databases that were built
+  outside SLURM on more than one device (`--devices` greater than 1, or the
+  default `--devices auto` on a machine with several GPUs).
+- **Apple Silicon GPU (MPS).** On Apple Silicon, where MPS is the default
+  accelerator, embedding failed in the chain aggregator with
+  `NotImplementedError: aten::_nested_tensor_from_mask_left_aligned`. The
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` workaround made it run, but gave wrong chain
+  embeddings for chains padded within a batch, that is with `--batch-size`
+  greater than 1. **Rebuild databases and redo embeddings computed on MPS with
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` and `--batch-size` greater than 1.** FASTA
+  input now runs on MPS without the fallback flag and agrees with CPU to about
+  1e-6 (relative), and the MPS memory cache is released after every batch.
+  Structure input on MPS still needs `PYTORCH_ENABLE_MPS_FALLBACK=1`, because
+  ESM3's structure encoder uses an operator MPS lacks; its chain and assembly
+  embeddings are now correct at any batch size as well. Chain and assembly
+  embeddings on CPU and CUDA are byte-identical to before (CUDA checked on an
+  A100). Code that calls `ResidueEmbeddingAggregator` directly with a padding
+  mask outside the batched inference fast path (autograd enabled, training, or
+  an unbatched input with a mask) now also leaves the padded rows out of the
+  sum, which changes, and corrects, its output.
 
 ## [0.8.0] - 2026-07-21
 
