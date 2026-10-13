@@ -1,9 +1,14 @@
 import csv
 import math
+import multiprocessing
+import multiprocessing.pool
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -136,6 +141,67 @@ class TestAlignCandidatesParallelism(unittest.TestCase):
         self.assertIn("q2", res)
         self.assertEqual(res["q2"], [])
         self.assertEqual(len(res["q1"]), 2)
+
+
+class StartMethodTest(unittest.TestCase):
+    """The Stage-2 pool's start method is pinned to the pre-3.14 platform default (G12).
+
+    ``mp.Pool`` follows the interpreter's global default, which Python 3.14 changes
+    to 'forkserver' on Linux and which an embedding application can change with
+    ``set_start_method``. The pool goes through ``mp.get_context`` with the method
+    that was the default before ('fork' on Linux, 'spawn' on macOS), so neither
+    changes how the workers start.
+    """
+
+    def _run(self, num_workers):
+        return alignment.align_candidates(
+            query_sequences={"q1": _STORE["s1"], "q2": _STORE["s5"]},
+            prefilter_results={
+                "q1": (["s1", "s2", "s3", "s6", "s8"], [0.9, 0.8, 0.7, 0.6, 0.5]),
+                "q2": (["s5", "s7", "s4"], [0.95, 0.55, 0.2]),
+            },
+            fetch_subject_sequences=_fetch,
+            min_seq_identity=0.0,
+            min_coverage=0.0,
+            max_evalue=None,
+            num_workers=num_workers,
+            compute_significance=False,
+        )
+
+    def test_platform_defaults(self):
+        for platform, method in (("linux", "fork"), ("darwin", "spawn"),
+                                 ("win32", "spawn"), ("freebsd14", "fork")):
+            with self.subTest(platform=platform), mock.patch.object(alignment.sys, "platform", platform):
+                self.assertEqual(alignment._pool_start_method(), method)
+
+    @unittest.skipIf(sys.version_info >= (3, 14), "Python 3.14 changed the POSIX default")
+    def test_is_the_interpreter_default_before_3_14(self):
+        # A fresh interpreter, so nothing in this process can have set the method.
+        default = subprocess.run(
+            [sys.executable, "-c", "import multiprocessing; print(multiprocessing.get_start_method())"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(alignment._pool_start_method(), default)
+
+    @unittest.skipIf(sys.platform == "win32", "no forkserver on Windows")
+    def test_pool_ignores_the_global_default(self):
+        recorded = []
+
+        class SpyPool(multiprocessing.pool.Pool):
+            def __init__(self, *args, context=None, **kwargs):
+                recorded.append(context.get_start_method())
+                super().__init__(*args, context=context, **kwargs)
+
+        saved = multiprocessing.get_start_method(allow_none=True)
+        # Python 3.14's POSIX default, and never the pinned method.
+        multiprocessing.set_start_method("forkserver", force=True)
+        try:
+            with mock.patch("multiprocessing.pool.Pool", SpyPool):
+                pooled = self._run(num_workers=2)
+        finally:
+            multiprocessing.set_start_method(saved, force=True)
+        self.assertEqual(recorded, [alignment._pool_start_method()])
+        self.assertEqual(_signature(pooled), _signature(self._run(num_workers=1)))
 
 
 class TestParseFormatOutput(unittest.TestCase):

@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -83,6 +84,18 @@ def _available_cpus() -> int:
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
+
+
+def _pool_start_method() -> str:
+    """Start method of the Stage-2 worker pool: the platform default up to Python 3.13.
+
+    That is ``'fork'`` on Linux (and other POSIX systems) and ``'spawn'`` on
+    macOS and Windows. Pinned through ``multiprocessing.get_context`` instead of
+    inherited, so Python 3.14's switch of the POSIX default to ``'forkserver'``
+    (or a ``set_start_method`` call by an embedding application) cannot silently
+    change how the workers start.
+    """
+    return "spawn" if sys.platform in ("darwin", "win32") else "fork"
 
 
 def _resolve_num_workers(requested: Optional[int], n_tasks: int) -> int:
@@ -887,7 +900,7 @@ def align_candidates(
             f"queries in {len(pair_tasks)} chunks across {n_workers} CPU workers"
         )
         import multiprocessing as mp
-        with mp.Pool(
+        with mp.get_context(_pool_start_method()).Pool(
             processes=n_workers,
             initializer=_worker_init,
             initargs=init_args,
