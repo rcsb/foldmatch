@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 # parse_fasta from this module. The canonical implementations now live in the
 # dependency-light foldmatch.utils.fasta.
 from foldmatch.utils.fasta import iter_fasta, iter_fasta_offsets, parse_fasta, read_record_at
-from foldmatch.utils.sequence import normalize_sequence, scan_fasta
+from foldmatch.utils.sequence import FastaPreflight, normalize_sequence, scan_fasta
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,10 @@ class EsmProtFromFasta(Dataset):
     Sequences are normalised (:func:`normalize_sequence`: ASCII whitespace
     removed, ASCII letters uppercased) before ESM3 sees them, and
     ``min_res_n`` applies to the normalised length, as in the sequence store.
+
+    ``fasta_file`` may also be the :class:`FastaPreflight` of the file, whose
+    offsets come from the same scan; the pre-flight pass then doubles as the
+    index build and the file is not read twice.
     """
 
     def __init__(
@@ -36,17 +40,26 @@ class EsmProtFromFasta(Dataset):
         min_res_n=0
     ):
         super().__init__()
-        self.fasta_file = str(fasta_file)
-        # np.fromiter streams the generator straight into the array without an
-        # intermediate Python list, keeping the index build itself low-memory.
-        self._offsets = np.fromiter(
-            (
-                offset
-                for offset, _name, length in scan_fasta(self.fasta_file)
-                if min_res_n <= 0 or length >= min_res_n
-            ),
-            dtype=np.int64,
-        )
+        if isinstance(fasta_file, FastaPreflight):
+            if fasta_file.min_res_n != min_res_n:
+                raise ValueError(
+                    f"Pre-flight of {fasta_file.path} was made with min_res_n="
+                    f"{fasta_file.min_res_n}, not {min_res_n}"
+                )
+            self.fasta_file = str(fasta_file.path)
+            self._offsets = fasta_file.offsets
+        else:
+            self.fasta_file = str(fasta_file)
+            # np.fromiter streams the generator straight into the array without an
+            # intermediate Python list, keeping the index build itself low-memory.
+            self._offsets = np.fromiter(
+                (
+                    offset
+                    for offset, _name, length in scan_fasta(self.fasta_file)
+                    if min_res_n <= 0 or length >= min_res_n
+                ),
+                dtype=np.int64,
+            )
         # Per-process file handle, opened lazily. Never pickled (see __getstate__)
         # so each DataLoader worker opens its own handle and seeks independently.
         self._fh = None

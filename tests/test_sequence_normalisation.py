@@ -212,6 +212,7 @@ class LowercaseFastaTest(unittest.TestCase):
                 patch("foldmatch.search.embedding_database.EmbeddingDatabase.search_by_embeddings",
                       return_value={}), \
                 patch("foldmatch.cli.search._resolve_stage2", return_value=True), \
+                patch("foldmatch.cli.search._check_stage2_stores"), \
                 patch("foldmatch.cli.search._stage2_align_and_report", side_effect=stage2):
             search.query_database_from_fasta(
                 db_path=str(self.tmp / "db"), fasta_file=self.messy, tmp_embedding_folder=self.tmp,

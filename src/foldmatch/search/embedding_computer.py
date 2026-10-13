@@ -16,7 +16,7 @@ from foldmatch.types.api_types import (
     Granularity, SrcEsmFrom, Devices, Strategy,
 )
 from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, run_id
-from foldmatch.utils.sequence import scan_fasta
+from foldmatch.utils.sequence import FastaPreflight, preflight_fasta
 
 logger = logging.getLogger(__name__)
 
@@ -127,20 +127,32 @@ class EmbeddingComputer:
             devices: Devices = 'auto',
             strategy: Strategy = Strategy.auto,
             accelerator: Accelerator = Accelerator.auto,
+            preflight: Optional[FastaPreflight] = None,
     ):
-        """Compute chain embeddings from protein sequences in a FASTA file."""
+        """Compute chain embeddings from protein sequences in a FASTA file.
 
-        # One embedding per entry that passes min_res_n, the same filter the
-        # dataset applies; rank 0 checks the shards against it after the pass.
-        self.expected_count = sum(
-            1 for _offset, _name, length in scan_fasta(fasta_file)
-            if min_res_n <= 0 or length >= min_res_n
-        )
+        ``preflight`` is the :func:`preflight_fasta` result for this file and
+        ``min_res_n``, as the CLI computes it on every rank before the pass;
+        its offsets feed the dataset, so the file is scanned once. Without it
+        the pre-flight runs here (problems are only logged).
+        """
+
+        if preflight is None:
+            preflight = preflight_fasta(fasta_file, min_res_n)
+            preflight.check(strict=False)
+        elif Path(preflight.path).resolve() != Path(fasta_file).resolve() or preflight.min_res_n != min_res_n:
+            raise ValueError(
+                f"Pre-flight of {preflight.path} (min_res_n={preflight.min_res_n}) does not "
+                f"match {fasta_file} (min_res_n={min_res_n})"
+            )
+        # One embedding per kept entry; rank 0 checks the shards against it after the pass.
+        self.expected_count = preflight.entries_kept
         self.refuse_existing_shards()
         # The other ranks Lightning launches inherit the exported run id.
         with exported_run_id(self.run_id):
             chain_predict(
-                src_stream=fasta_file,
+                # EsmProtFromFasta takes the pre-flight for the path and reuses its offsets.
+                src_stream=preflight,
                 src_from=SrcEsmFrom.fasta,
                 min_res_n=min_res_n,
                 batch_size=batch_size,

@@ -1,3 +1,4 @@
+import glob
 import os
 import logging
 import typer
@@ -6,6 +7,7 @@ from typing import Annotated, Optional, List
 
 from foldmatch import __version__
 from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.search.db_path import parse_db_path
 from foldmatch.search.output import (
     CLUSTER_OUTPUT_FIELDS,
     DEFAULT_FORMAT_OUTPUT,
@@ -167,6 +169,9 @@ def build_database_from_structures(
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS index: enabled")
+
+    # Read-only, on every rank, before ESM3.
+    _refuse_existing_outputs(output_db, _INDEX_SUFFIXES)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -333,6 +338,7 @@ def build_database_from_fasta(
     """Build an embedding database from protein sequences in a FASTA file."""
 
     set_log_level(log_level)
+    preflight = _fasta_preflight(fasta_file, min_res_n, output_db=output_db)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -347,6 +353,7 @@ def build_database_from_fasta(
         accelerator=accelerator,
         devices=arg_devices(devices),
         strategy=strategy,
+        preflight=preflight,
     )
 
     if not _is_rank_zero():
@@ -366,12 +373,15 @@ def build_database_from_fasta(
     # Persist a sidecar id->sequence store so this database can be the
     # subject (or query) of a Stage-2 pairwise-alignment search. Built
     # directly from the FASTA — the DB ids ARE the FASTA headers — using the
-    # same min_res_n filter so store and index stay in lock-step.
+    # same min_res_n filter so store and index stay in lock-step. Rank 0 only,
+    # after the pass, so ranks never race on the SQLite file.
     from foldmatch.search.sequence_store import SequenceStore
-    SequenceStore(embedding_db.db_folder, embedding_db.index_name).create(
+    store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
+    store.create(
         fasta_file=fasta_file,
         min_res_n=min_res_n,
     )
+    _check_store_matches_preflight(store, preflight, output_db)
     if cleanup_embeddings:
         embedding_computer.remove_shards()
 
@@ -672,6 +682,19 @@ def query_database_from_fasta(
 
     set_log_level(log_level)
     _check_comp_bias_corr_scale(comp_bias_corr_scale)
+    preflight = _fasta_preflight(fasta_file, min_res_n)
+    # Read-only, on every rank, before ESM3: whether Stage 2 runs, and whether
+    # the subject's sequence store can serve it.
+    from foldmatch.search.sequence_store import SequenceStore
+    subject_store = SequenceStore(*parse_db_path(db_path)[:2])
+    run_stage2 = _resolve_stage2(
+        seq_identity,
+        subject_store.exists(),
+        f"Subject database has no sequence store ({subject_store.path}); "
+        f"--seq-identity requires a database built from FASTA (fm-search build sequences).",
+    )
+    if run_stage2:
+        _check_stage2_stores(subject_store, max_evalue)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -686,6 +709,7 @@ def query_database_from_fasta(
         accelerator=accelerator,
         devices=arg_devices(devices),
         strategy=strategy,
+        preflight=preflight,
     )
 
     if not _is_rank_zero():
@@ -706,15 +730,6 @@ def query_database_from_fasta(
     embedding_computer.remove_shards()
     logging.info(f"Searched {len(results)} sequence(s)")
     results = _filter_results_by_threshold(results, threshold)
-
-    from foldmatch.search.sequence_store import SequenceStore
-    subject_store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
-    run_stage2 = _resolve_stage2(
-        seq_identity,
-        subject_store.exists(),
-        f"Subject database has no sequence store ({subject_store.path}); "
-        f"--seq-identity requires a database built from FASTA (fm-search build sequences).",
-    )
 
     if run_stage2:
         from foldmatch.utils.fasta import iter_fasta
@@ -847,6 +862,26 @@ def query_database_from_database(
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS search: enabled")
 
+    # Stage 2 needs sequences for BOTH sides: queries from the query DB's store,
+    # subjects from the subject DB's store. Decided, and the stores checked,
+    # before the search.
+    from foldmatch.search.sequence_store import SequenceStore
+    query_store = SequenceStore(*parse_db_path(query_db_path)[:2])
+    subject_store = SequenceStore(*parse_db_path(subject_db_path)[:2])
+    missing = []
+    if not query_store.exists():
+        missing.append(f"query database ({query_store.path})")
+    if not subject_store.exists():
+        missing.append(f"subject database ({subject_store.path})")
+    run_stage2 = _resolve_stage2(
+        seq_identity,
+        not missing,
+        f"Stage-2 sequence identity requires a sequence store for: {', '.join(missing)}. "
+        f"Build databases with 'fm-search build sequences'.",
+    )
+    if run_stage2:
+        _check_stage2_stores(subject_store, max_evalue, query_store=query_store)
+
     # Load subject database
     logging.info("\nLoading subject database...")
     from foldmatch.search.embedding_database import EmbeddingDatabase
@@ -869,25 +904,6 @@ def query_database_from_database(
 
     # Filter by threshold if specified
     results = _filter_results_by_threshold(results, threshold)
-
-    # Stage 2 needs sequences for BOTH sides: queries from the query DB's store,
-    # subjects from the subject DB's store.
-    from foldmatch.search.embedding_database import _parse_db_path
-    from foldmatch.search.sequence_store import SequenceStore
-    q_folder, q_name, _ = _parse_db_path(query_db_path)
-    query_store = SequenceStore(q_folder, q_name)
-    subject_store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
-    missing = []
-    if not query_store.exists():
-        missing.append(f"query database ({query_store.path})")
-    if not subject_store.exists():
-        missing.append(f"subject database ({subject_store.path})")
-    run_stage2 = _resolve_stage2(
-        seq_identity,
-        not missing,
-        f"Stage-2 sequence identity requires a sequence store for: {', '.join(missing)}. "
-        f"Build databases with 'fm-search build sequences'.",
-    )
 
     if run_stage2:
         query_sequences = query_store.fetch(results.keys())
@@ -1112,6 +1128,101 @@ def _check_comp_bias_corr_scale(scale: float):
     """Reject a scale Click's range check lets through (NaN) before Stage 1 runs."""
     if not 0.0 <= scale <= 1.0:
         raise ValueError(f"--comp-bias-corr-scale must be between 0 and 1, got {scale}.")
+
+
+# Files a database build writes next to ``--output-db``. Any of them already
+# present refuses the build before ESM3 (create_db and SequenceStore.create
+# would only refuse it after the whole pass).
+_INDEX_SUFFIXES = (".index", ".metadata", ".invlists")
+_SEQUENCE_DB_SUFFIXES = _INDEX_SUFFIXES + (".sequences",)
+
+
+def _refuse_existing_outputs(output_db: str, suffixes, sidecar_globs=()) -> None:
+    """Raise ``FileExistsError`` if any output of this build already exists. Read-only."""
+    # parse_db_path does not import FAISS: the build still loads it only after
+    # the ESM3 pass, as before.
+    db_folder, index_name, db_path = parse_db_path(output_db)
+    existing = [Path(f"{db_path}{suffix}") for suffix in suffixes]
+    existing = [path for path in existing if path.exists()]
+    for pattern in sidecar_globs:
+        existing.extend(sorted(db_folder.glob(f"{glob.escape(index_name)}{pattern}")))
+    if existing:
+        raise FileExistsError(
+            f"Database already exists at {db_path} "
+            f"(found: {', '.join(str(path) for path in existing)}). "
+            f"Choose a different --output-db, or delete the existing files first."
+        )
+
+
+def _fasta_preflight(fasta_file: Path, min_res_n: int, strict: bool = False, output_db: Optional[str] = None):
+    """Read-only checks every rank runs before ESM3 is loaded.
+
+    Every rank reaches the same verdict from the same files, so a refusal
+    stops all ranks together instead of one rank failing after the pass.
+    For a build (``output_db``), existing outputs are refused. The FASTA scan
+    (:func:`preflight_fasta`) counts the entries the pass must produce;
+    ``strict`` refuses duplicate ids, '<'/'>' and non-ASCII sequences, which
+    otherwise are logged as warnings and processed as before.
+    """
+    if output_db is not None:
+        _refuse_existing_outputs(output_db, _SEQUENCE_DB_SUFFIXES, sidecar_globs=(".rescodes.*",))
+    from foldmatch.utils.sequence import preflight_fasta
+    preflight = preflight_fasta(fasta_file, min_res_n)
+    preflight.check(strict=strict)
+    if output_db is not None and preflight.entries_kept == 0:
+        raise ValueError(
+            f"{fasta_file} has no sequence with at least {min_res_n} residues "
+            f"({preflight.entries} entries in all): there is nothing to build."
+        )
+    return preflight
+
+
+def _check_store_matches_preflight(store, preflight, output_db: str) -> None:
+    """The sequence store must hold exactly what the pre-flight counted.
+
+    A mismatch means the FASTA changed during the build. The database is
+    removed rather than left disagreeing with itself: the store and the index
+    files this build wrote (the pre-flight refused any that existed before), so
+    the same build can be run again.
+    """
+    meta = store.meta()
+    expected = {
+        "entry_count": preflight.unique_entries,
+        "total_residues": preflight.unique_residues,
+        "duplicates_ignored": preflight.duplicates,
+    }
+    if meta != expected:
+        removed = _remove_outputs(output_db, _SEQUENCE_DB_SUFFIXES)
+        raise ValueError(
+            f"Sequence store built from {preflight.path} ({meta}) does not match its "
+            f"pre-flight ({expected}); was the FASTA modified during the build? "
+            f"The database files it wrote were removed ({', '.join(path.name for path in removed)})."
+        )
+
+
+def _remove_outputs(output_db: str, suffixes) -> List[Path]:
+    """Delete this build's ``{output_db}{suffix}`` files; returns the ones removed."""
+    _, _, db_path = parse_db_path(output_db)
+    removed = []
+    for suffix in suffixes:
+        path = Path(f"{db_path}{suffix}")
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    return removed
+
+
+def _check_stage2_stores(subject_store, max_evalue: Optional[float], query_store=None) -> None:
+    """Read-only checks of the sequence stores Stage 2 will read, before ESM3 or the search.
+
+    Reading each store's totals refuses an incomplete store, and an E-value
+    filter needs a non-empty subject database (:func:`check_evalue_search_space`).
+    Both would otherwise only fail after the embedding pass.
+    """
+    from foldmatch.search.alignment import check_evalue_search_space
+    if query_store is not None:
+        query_store.meta()
+    check_evalue_search_space(max_evalue, subject_store.total_residues())
 
 
 def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missing_msg: str) -> bool:
