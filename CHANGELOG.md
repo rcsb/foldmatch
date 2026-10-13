@@ -34,6 +34,19 @@ While the major version is `0`, breaking changes are released in a minor bump.
   build sequences`: deletes the build's intermediate embedding shards from
   `--tmp-embedding-folder` once the database is built. Off by default, so the
   shards are kept as before.
+- **Groundwork for ESM3 residue-code scoring (not usable yet).** Two building
+  blocks of the coming opt-in Stage-2 scoring `esm-codes-v1`, an alternative
+  to BLOSUM62: the residue-code encoders
+  (`foldmatch.model.residue_code_encoder`), which turn ESM3 per-residue
+  embeddings into 8-byte residue codes and query encodings with the files of
+  the Hugging Face repo `rcsb/foldmatch-esm-codes`, and a native C
+  Smith-Waterman kernel with its Python wrapper (`foldmatch.search.swkern`).
+  No command or option uses them yet: the residue-code database build
+  (`fm-search build sequences --residue-codes`) and query scoring (`fm-search
+  query sequences --scoring esm-codes`) come in later changes, and existing
+  commands, BLOSUM62 scoring and its output are unchanged. `python -m
+  foldmatch.search.swkern` runs the kernel's self-test (reference hash and
+  the BLAS similarity path) and prints a JSON report.
 
 ### Changed
 
@@ -150,6 +163,27 @@ While the major version is `0`, breaking changes are released in a minor bump.
   the Python API, ESM3 calls on one model from several threads now run one at
   a time, so that no structure embedding runs while another thread has
   geometric attention switched off.
+- **Platform wheels; installing from source needs a C compiler.** FoldMatch now
+  contains a small compiled library (the Smith-Waterman kernel above), so the
+  release publishes platform wheels for Linux x86_64 and aarch64 (built in
+  manylinux_2_28 images) and macOS arm64 and x86_64 (macOS 11 or later), and
+  the classifiers name Linux and macOS instead of "OS Independent". Anything
+  that builds FoldMatch from source compiles the kernel and needs GCC 12 or
+  later, or Clang 14 or later: an install from the sdist (another platform, or
+  `pip install --no-binary foldmatch`), an editable install (`pip install -e
+  .`, `uv sync`) and `hatch test`. Without a usable compiler the install still
+  succeeds, with a warning, as a pure-Python package: everything works as
+  before except the coming residue-code scoring, which will refuse to run and
+  print the reinstall command, `pip install --no-cache-dir --force-reinstall
+  --no-binary foldmatch foldmatch` (pip caches the pure-Python wheel, hence
+  `--no-cache-dir`). Set `FOLDMATCH_REQUIRE_NATIVE=1` to make a failed compile
+  an error instead; CI, the release wheels and the Docker image do. In a
+  source checkout, rebuild the kernel after editing its C source with `python
+  -m foldmatch._native.build`; a library built from other source is refused.
+- **Docker image.** The image is built with a regular (non-editable) install
+  that must compile the kernel, runs the kernel self-test at build time and
+  again in the compiler-free runtime stage, and no longer copies the source
+  tree into `/app`.
 
 ### Fixed
 
