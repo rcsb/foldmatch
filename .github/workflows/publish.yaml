@@ -14,6 +14,10 @@ jobs:
     name: Test on Python ${{ matrix.python-version }}
     runs-on: ["self-hosted", "buildchain"]
     timeout-minutes: 120
+    env:
+      # The editable install compiles the native kernel in place (hatch_build.py); a failed compile is an error here,
+      # never a pure-Python install or skipped kernel tests.
+      FOLDMATCH_REQUIRE_NATIVE: "1"
     strategy:
       matrix:
         python-version: ["3.12"]
@@ -26,6 +30,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libzstd-dev
 
+      # fmsw.c needs GCC >= 12 or Clang >= 14 (older GCC stops at its #error). The self-hosted runner's gcc is not
+      # pinned, so an older one is replaced by gcc-12 for this job; CC reaches the editable install's build hook.
+      - name: C compiler for the native kernel (GCC >= 12)
+        run: |
+          cc_bin=gcc
+          if [ "$(gcc -dumpversion | cut -d. -f1)" -lt 12 ]; then
+            sudo apt-get install -y gcc-12
+            cc_bin=gcc-12
+          fi
+          "$cc_bin" --version
+          echo "CC=$cc_bin" >> "$GITHUB_ENV"
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v4
         with:
@@ -37,10 +53,137 @@ jobs:
       - name: Run tests
         run: hatch test
 
+  # Native Smith-Waterman kernel (PLAN section 7, P3.7) on every supported compiler and ISA. The DP golden hash (from
+  # q fp16 through the fixed-order reference similarity) must be identical in every job: tests/test_swkern.py checks
+  # it for every ISA library of the machine. The production BLAS path (OpenBLAS on Linux, Accelerate on macOS) must
+  # stay within the S16 tolerance of it: the test module checks the dispatched ISA, selftest() every other one.
+  kernel:
+    name: ${{ matrix.job }} (${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { job: kernel-x86, os: ubuntu-latest, cc: gcc, isas: "sse2 avx2 generic" }
+          - { job: kernel-x86, os: ubuntu-latest, cc: clang, isas: "sse2 avx2 generic" }
+          - { job: kernel-arm64-linux, os: ubuntu-24.04-arm, cc: gcc, isas: "neon generic" }
+          - { job: kernel-macos, os: macos-14, cc: cc, isas: "neon generic" }
+    env:
+      CC: ${{ matrix.cc }}
+      PYTHONPATH: src
+      FOLDMATCH_REQUIRE_NATIVE: "1"
+      FOLDMATCH_SLOW_TESTS: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl importlib-metadata==8.7.1
+
+      - name: Compiler version
+        run: $CC --version
+
+      - name: Require AVX2 on the x86 runner (the avx2 library must run, not be skipped)
+        if: matrix.job == 'kernel-x86'
+        run: grep -qw avx2 /proc/cpuinfo
+
+      - name: Build every ISA library of this machine
+        run: python -m foldmatch._native.build
+
+      - name: Kernel tests
+        run: python -m pytest tests/test_swkern.py -rs
+
+      - name: selftest() for each ISA
+        run: |
+          for isa in ${{ matrix.isas }}; do
+            FOLDMATCH_SW_ISA=$isa python -m foldmatch.search.swkern
+          done
+
+  # The kernel test module against ASan + UBSan builds of the sse2, avx2 and generic libraries (undersized workspaces
+  # and bad arguments included). The sanitizer runtime is preloaded because python itself is not instrumented.
+  kernel-sanitize:
+    name: kernel-sanitize (ASan + UBSan, gcc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: gcc
+      PYTHONPATH: src
+      FOLDMATCH_REQUIRE_NATIVE: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl importlib-metadata==8.7.1
+
+      - name: Build the libraries with ASan and UBSan
+        run: |
+          python - <<'EOF'
+          from foldmatch._native import build
+          build.build(extra_flags=["-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                                   "-fno-omit-frame-pointer", "-g"])
+          EOF
+
+      - name: Kernel tests under the sanitizers
+        run: |
+          export LD_PRELOAD="$(gcc -print-file-name=libasan.so)"
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          python -m pytest tests/test_swkern.py -rs
+
+  # Every PR: the sdist, a wheel built from it, the wheel and sdist content tests, selftest() from the wheel in a clean
+  # venv, and the build-hook tests (pure-wheel fallback, FOLDMATCH_REQUIRE_NATIVE, editable build, platform tag).
+  packaging:
+    name: packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      FOLDMATCH_REQUIRE_NATIVE: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build and test tools
+        run: >-
+          pip install build hatchling editables packaging "numpy>=2,<3" pytest==9.0.2
+          importlib-metadata==8.7.1
+
+      - name: Build the sdist, then the wheel from the sdist
+        run: python -m build --outdir dist .
+
+      - name: Packaging tests
+        env:
+          FOLDMATCH_DIST_DIR: dist
+          PYTHONPATH: src
+        run: python -m pytest tests/test_packaging.py -rs
+
   hatch-build:
-    name: Build to PyPI
+    name: Build the sdist
     needs:
       - hatch-test
+      - kernel
+      - kernel-sanitize
+      - packaging
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     steps:
@@ -55,8 +198,10 @@ jobs:
       - name: Install Hatch
         run: pip install hatch
 
+      # Wheels come from the cibuildwheel matrix below: a plain `hatch build` wheel would carry a linux_x86_64 tag,
+      # which PyPI refuses.
       - name: Build distribution
-        run: hatch build
+        run: hatch build -t sdist
 
       - name: Store the distribution packages
         uses: actions/upload-artifact@v4
@@ -64,9 +209,87 @@ jobs:
           name: python-package-distributions
           path: dist/
 
+  # Platform wheels (D19): Linux x86_64 and aarch64 in manylinux_2_28 images (auditwheel repairs and retags them),
+  # macOS arm64 and x86_64 (cross-built on the arm64 runner; delocate checks and retags them). The build hook tags the
+  # raw wheel py3-none-<platform>; no manylinux tag is hard-coded.
+  build-wheels:
+    name: Wheels (${{ matrix.name }})
+    needs:
+      - hatch-test
+      - kernel
+      - kernel-sanitize
+      - packaging
+    if: github.event_name == 'release'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, archs: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, archs: aarch64 }
+          - { name: macos, os: macos-14, archs: "arm64 x86_64" }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.1.4
+        env:
+          CIBW_BUILD: "cp312-*"
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT: FOLDMATCH_REQUIRE_NATIVE=1
+          # gcc = the image's gcc-toolset compiler (GCC >= 12), chosen explicitly over any system cc
+          CIBW_ENVIRONMENT_LINUX: FOLDMATCH_REQUIRE_NATIVE=1 CC=gcc
+          CIBW_ENVIRONMENT_MACOS: FOLDMATCH_REQUIRE_NATIVE=1 MACOSX_DEPLOYMENT_TARGET=11.0
+        with:
+          output-dir: wheelhouse
+
+      # The wheels are checked here, not by cibuildwheel's test step, which would install the full dependency set
+      # (torch, esm): the kernel check needs only numpy and importlib-metadata (imported by foldmatch/__init__), so the
+      # wheel goes into a clean venv with --no-deps that borrows those two.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wheel contents and selftest() in a clean venv
+        env:
+          FOLDMATCH_DIST_DIR: wheelhouse
+        run: |
+          pip install packaging "numpy>=2,<3" pytest==9.0.2 importlib-metadata==8.7.1
+          python -m pytest tests/test_packaging.py -rs -k "test_wheel_contents or test_wheel_selftest_in_clean_venv"
+
+      - name: Set up an x86_64 Python 3.12 (Rosetta)
+        if: runner.os == 'macOS'
+        id: python-x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: selftest() of the macOS x86_64 wheel under Rosetta
+        if: runner.os == 'macOS'
+        env:
+          FOLDMATCH_DIST_DIR: wheelhouse
+        run: |
+          PY="${{ steps.python-x64.outputs.python-path }}"
+          "$PY" -m pip install packaging "numpy>=2,<3" pytest==9.0.2 importlib-metadata==8.7.1
+          "$PY" -m pytest tests/test_packaging.py -rs -k "test_wheel_selftest_in_clean_venv"
+
+      - name: Store the wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
   push-image:
     needs:
       - hatch-build
+      - build-wheels
     name: Push image to harbor
     uses: ./.github/workflows/_workflow-docker.yaml
 
@@ -84,10 +307,16 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download all the dists
+      - name: Download the sdist
         uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
+          path: dist/
+      - name: Download the wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
           path: dist/
       - name: Publish distribution 📦 to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
