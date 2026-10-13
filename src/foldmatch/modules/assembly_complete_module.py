@@ -1,10 +1,10 @@
 import logging
 
-from esm.sdk.api import SamplingConfig
 from lightning import LightningModule
 from torch import cat
 
 from foldmatch.utils.data import collate_seq_embeddings
+from foldmatch.utils.esm.loaders import per_residue_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,7 @@ class AssemblyCompleteModule(LightningModule):
             prot_embeddings = []
             assembly_n_res = 0
             for esm_prot in esm_chains:
-                embeddings = self.esm3.forward_and_sample(
-                    self.esm3.encode(esm_prot), SamplingConfig(return_per_residue_embeddings=True)
-                ).per_residue_embedding
+                embeddings = per_residue_embedding(self.esm3, esm_prot)
                 prot_embeddings.append(embeddings)
                 assembly_n_res += embeddings.shape[0]
                 if 0 < self.max_res_n < assembly_n_res:

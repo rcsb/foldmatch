@@ -1,9 +1,10 @@
 import torch
 from biotite.structure import get_residues, chain_iter, filter_amino_acids
-from esm.sdk.api import ESMProtein, SamplingConfig
+from esm.sdk.api import ESMProtein
 from esm.utils.structure.protein_chain import ProteinChain
 
 from foldmatch.types.api_types import StreamSrc, StructureFormat
+from foldmatch.utils.esm.loaders import per_residue_embedding
 from foldmatch.utils.model import get_aggregator_model, get_residue_model
 from foldmatch.utils.sequence import normalize_sequence
 from foldmatch.utils.structure_parser import get_structure_from_src, filter_residues, rename_atom_attr
@@ -70,10 +71,7 @@ class FoldMatch:
                 continue
             protein_chain = ProteinChain.from_atomarray(atom_ch)
             protein = ESMProtein.from_protein_chain(protein_chain)
-            protein_tensor = self.__residue_embedding.encode(protein)
-            embedding_ch.append(self.__residue_embedding.forward_and_sample(
-                protein_tensor, SamplingConfig(return_per_residue_embeddings=True)
-            ).per_residue_embedding)
+            embedding_ch.append(per_residue_embedding(self.__residue_embedding, protein))
         return torch.cat(
             embedding_ch,
             dim=0
@@ -103,10 +101,7 @@ class FoldMatch:
             atom_ch = rename_atom_attr(atom_ch)
             protein_chain = ProteinChain.from_atomarray(atom_ch)
             protein = ESMProtein.from_protein_chain(protein_chain)
-            protein_tensor = self.__residue_embedding.encode(protein)
-            embedding_by_chain[chain_id_value] = self.__residue_embedding.forward_and_sample(
-                protein_tensor, SamplingConfig(return_per_residue_embeddings=True)
-            ).per_residue_embedding
+            embedding_by_chain[chain_id_value] = per_residue_embedding(self.__residue_embedding, protein)
         return embedding_by_chain
 
     def residue_embedding_by_assembly(
@@ -130,10 +125,7 @@ class FoldMatch:
             atom_ch = rename_atom_attr(atom_ch)
             protein_chain = ProteinChain.from_atomarray(atom_ch)
             protein = ESMProtein.from_protein_chain(protein_chain)
-            protein_tensor = self.__residue_embedding.encode(protein)
-            embedding_ch.append(self.__residue_embedding.forward_and_sample(
-                protein_tensor, SamplingConfig(return_per_residue_embeddings=True)
-            ).per_residue_embedding)
+            embedding_ch.append(per_residue_embedding(self.__residue_embedding, protein))
         assembly_id_value = assembly_id if assembly_id is not None else "0"
         return {assembly_id_value: torch.cat(embedding_ch, dim=0)}
 
@@ -156,14 +148,7 @@ class FoldMatch:
             raise ValueError(f"Sequence too long for embedding (max {self.max_res} residues)")
 
         protein = ESMProtein(sequence=sequence)
-        protein_tensor = self.__residue_embedding.encode(protein)
-
-        result = self.__residue_embedding.forward_and_sample(
-            protein_tensor,
-            SamplingConfig(return_per_residue_embeddings=True)
-        )
-
-        return result.per_residue_embedding
+        return per_residue_embedding(self.__residue_embedding, protein)
 
     def aggregator_embedding(
             self,

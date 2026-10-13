@@ -1,10 +1,14 @@
 import hashlib
 import os
 import re
+import threading
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 import torch
 
 from esm.models.esm3 import ESM3
+from esm.sdk.api import SamplingConfig
 from esm.models.vqvae import StructureTokenEncoder
 from esm.tokenization import TokenizerCollection, EsmSequenceTokenizer, StructureTokenizer, SecondaryStructureTokenizer, \
     SASADiscretizingTokenizer, InterProQuantizedTokenizer, ResidueAnnotationsTokenizer
@@ -151,3 +155,58 @@ def esm_open(device: torch.device | str = "cpu"):
     )
     model.load_state_dict(state_dict)
     return model
+
+
+# One re-entrant lock per ESM3 model. geometric_attention_off flips a flag on the model itself,
+# so a forward on the same model in another thread must not run while the flag is off.
+_MODEL_LOCKS = weakref.WeakKeyDictionary()
+_MODEL_LOCKS_GUARD = threading.Lock()
+_SHARED_LOCK = threading.RLock()  # for objects that cannot be weakly referenced
+
+
+def _model_lock(model):
+    with _MODEL_LOCKS_GUARD:
+        try:
+            lock = _MODEL_LOCKS.get(model)
+            if lock is None:
+                lock = _MODEL_LOCKS[model] = threading.RLock()
+        except TypeError:
+            lock = _SHARED_LOCK
+        return lock
+
+
+@contextmanager
+def geometric_attention_off(model, off=True):
+    """Switch off ESM3's geometric attention (block 0) for the duration of the block, then restore it.
+
+    Without coordinates every frame is masked, so geometric attention adds exactly zero to the
+    residue stream, but it still allocates an O(L^2) tensor per head: ESM3 ran out of memory at
+    2,750 aa on a 40 GB A100, and fits 16,000 aa in about 10 GiB with it off. The embeddings are
+    bit-identical (checked on GPU for 300-2,000 aa and on CPU for 300-1,000 aa).
+
+    The flag belongs to the model, which other threads may share, so the block holds the model's
+    lock (also with ``off=False``): a forward on the same model in another thread that goes
+    through :func:`per_residue_embedding` waits, instead of running without geometric attention.
+    """
+    with _model_lock(model):
+        blocks = [block for block in model.transformer.blocks if block.use_geom_attn] if off else []
+        for block in blocks:
+            block.use_geom_attn = False
+        try:
+            yield
+        finally:
+            for block in blocks:
+                block.use_geom_attn = True
+
+
+def per_residue_embedding(model, esm_prot):
+    """ESM3 per-residue embedding of one protein, (L + 2, 1536) with BOS and EOS.
+
+    Sequence-only proteins (no coordinates) run without geometric attention; proteins with
+    coordinates take ESM3's path unchanged. Every call holds the model's lock, so calls on one
+    model from several threads run one at a time (calls on different models do not wait).
+    """
+    with geometric_attention_off(model, off=esm_prot.coordinates is None):
+        return model.forward_and_sample(
+            model.encode(esm_prot), SamplingConfig(return_per_residue_embeddings=True)
+        ).per_residue_embedding
