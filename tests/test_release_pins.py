@@ -11,6 +11,7 @@ from unittest import mock
 import torch
 
 import foldmatch
+from foldmatch.utils import model
 from foldmatch.utils.data import load_residue_embedding
 from foldmatch.utils.esm import loaders
 
@@ -209,6 +210,126 @@ class TorchLoadWeightsOnlyTest(unittest.TestCase):
             torch.save({"embedding": _NotAWeight()}, path)
             with self.assertRaises(pickle.UnpicklingError):
                 load_residue_embedding(path)
+
+
+# Hugging Face calls that take a revision; esm's own from_pretrained fetches EvolutionaryScale
+# repositories at whatever revision main points to, so the package must not call it.
+_HF_FETCHES = {"snapshot_download", "hf_hub_download", "try_to_load_from_cache", "hf_hub_url"}
+_UNPINNED_FETCHES = {"from_pretrained"}
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+_UNRESOLVED = "<not a literal>"
+
+
+def _is_pinned(revision):
+    return isinstance(revision, str) and _COMMIT.fullmatch(revision) is not None
+
+
+def _resolve(node, scope, seen=()):
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in scope and node.id not in seen:
+        return _resolve(scope[node.id], scope, seen + (node.id,))
+    return _UNRESOLVED
+
+
+def _is_main_guard(node):
+    test = node.test if isinstance(node, ast.If) else None
+    return (
+        isinstance(test, ast.Compare) and isinstance(test.left, ast.Name) and test.left.id == "__name__"
+        and any(isinstance(c, ast.Constant) and c.value == "__main__" for c in test.comparators)
+    )
+
+
+def _revisions_in(tree, module):
+    """Every Hugging Face revision a module declares or passes, as (where, value).
+
+    A *REVISION* constant or a ``revision=`` argument resolves through literals, module
+    constants and parameter defaults; anything else, or a missing ``revision=``, is not a pin.
+    """
+    constants = {
+        target.id: node.value
+        for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name) and node.value is not None
+    }
+    found = [
+        (f"{module}:{name}", _resolve(value, constants))
+        for name, value in constants.items() if "REVISION" in name.upper()
+    ]
+
+    def visit(node, scope):
+        if _is_main_guard(node):
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            positional = args.posonlyargs + args.args
+            defaults = dict(zip([a.arg for a in positional[len(positional) - len(args.defaults):]], args.defaults))
+            defaults.update({a.arg: d for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None})
+            scope = {**scope, **{a.arg: defaults.get(a.arg, ast.Name(id="<parameter>")) for a in
+                                 positional + args.kwonlyargs}}
+        if isinstance(node, ast.Call):
+            name = (_call_name(node) or "").split(".")[-1]
+            where = f"{module}:{node.lineno} {name}()"
+            if name in _HF_FETCHES:
+                revision = [k.value for k in node.keywords if k.arg == "revision"]
+                found.append((where, _resolve(revision[0], scope) if revision else None))
+            elif name in _UNPINNED_FETCHES:
+                found.append((where, None))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, constants)
+    return found
+
+
+class ReleasePinTest(unittest.TestCase):
+    """G11: every Hugging Face revision in the package is a 40-hex commit; None (unpinned) is refused."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.revisions = [found for module, tree in _package_modules() for found in _revisions_in(tree, module)]
+
+    def test_every_revision_is_a_commit(self):
+        unpinned = [(where, value) for where, value in self.revisions if not _is_pinned(value)]
+        self.assertEqual(unpinned, [])
+
+    def test_known_pins_are_found(self):
+        found = dict(self.revisions)
+        self.assertEqual(found["foldmatch/utils/esm/loaders.py:ESM_REVISION"], loaders.ESM_REVISION)
+        self.assertEqual(found["foldmatch/utils/model.py:REVISION"], model.REVISION)
+        calls = [where.split()[-1] for where, _ in self.revisions if where.endswith("()")]
+        for fetch in ("snapshot_download()", "hf_hub_download()", "try_to_load_from_cache()"):
+            self.assertIn(fetch, calls)
+
+    def test_runtime_pins(self):
+        for revision in (loaders.ESM_REVISION, model.REVISION):
+            self.assertTrue(_is_pinned(revision), revision)
+
+    def test_unpinned_revisions_are_refused(self):
+        sha = "636acb420daf674df37ab0220f56061a5de2f169"
+        cases = {
+            f'REVISION = "{sha}"': sha,
+            "REVISION = None": None,
+            'REVISION = "main"': "main",
+            f'REVISION = "{sha[:12]}"': sha[:12],
+            f'REVISION = "{sha.upper()}"': sha.upper(),
+            'snapshot_download(repo_id="r")': None,
+            'hf_hub_download(repo_id="r", filename="f", revision=None)': None,
+            'hf_hub_download(repo_id="r", filename="f", revision=REV)': _UNRESOLVED,
+            f'R = "{sha}"\nsnapshot_download(repo_id="r", revision=R)': sha,
+            'def get(revision=None):\n    return hf_hub_download(repo_id="r", filename="f", revision=revision)': None,
+            f'def get(revision="{sha}"):\n    return hf_hub_download(repo_id="r", filename="f", revision=revision)': sha,
+            'def get(revision):\n    return hf_hub_download(repo_id="r", filename="f", revision=revision)': _UNRESOLVED,
+            'ESM3.from_pretrained("esm3_sm_open_v1")': None,
+            'if __name__ == "__main__":\n    ESM3.from_pretrained("esm3_sm_open_v1")': "<none>",
+        }
+        for source, expected in cases.items():
+            values = [value for _where, value in _revisions_in(ast.parse(source), "m.py")]
+            if expected == "<none>":
+                self.assertEqual(values, [], source)
+                continue
+            self.assertEqual(values[-1], expected, source)
+            self.assertEqual(_is_pinned(values[-1]), expected == sha, source)
 
 
 if __name__ == "__main__":
