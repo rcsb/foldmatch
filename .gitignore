@@ -4,4 +4,6 @@
 /.pypi.rc
 __pycache__
 /tests/resources/tmp
-/.claude
+/.claude# native kernel libraries built in place (python -m foldmatch._native.build)
+/src/foldmatch/_native/_fmsw_*
+/src/foldmatch/_native/._fmsw_*
