@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 # parse_fasta from this module. The canonical implementations now live in the
 # dependency-light foldmatch.utils.fasta.
 from foldmatch.utils.fasta import iter_fasta, iter_fasta_offsets, parse_fasta, read_record_at
+from foldmatch.utils.sequence import normalize_sequence, scan_fasta
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,10 @@ class EsmProtFromFasta(Dataset):
     to the offset and reads that single record on demand, so peak memory is
     ~8 bytes per record regardless of sequence length — letting the inference
     pipeline handle FASTA files with hundreds of millions of sequences.
+
+    Sequences are normalised (:func:`normalize_sequence`: ASCII whitespace
+    removed, ASCII letters uppercased) before ESM3 sees them, and
+    ``min_res_n`` applies to the normalised length, as in the sequence store.
     """
 
     def __init__(
@@ -37,7 +42,7 @@ class EsmProtFromFasta(Dataset):
         self._offsets = np.fromiter(
             (
                 offset
-                for offset, _name, length in iter_fasta_offsets(self.fasta_file)
+                for offset, _name, length in scan_fasta(self.fasta_file)
                 if min_res_n <= 0 or length >= min_res_n
             ),
             dtype=np.int64,
@@ -65,7 +70,8 @@ class EsmProtFromFasta(Dataset):
     def __getitem__(self, idx):
         offset = int(self._offsets[idx])
         name, sequence = read_record_at(self._handle(), offset)
-        return ESMProtein(sequence=sequence), name
+        # Non-ASCII characters are kept one for one, as before (ESM3 reads them as <unk>).
+        return ESMProtein(sequence=normalize_sequence(sequence, allow_non_ascii=True)), name
 
     def __getstate__(self):
         # Drop the open file handle so the dataset pickles cleanly to workers.

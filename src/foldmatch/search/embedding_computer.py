@@ -16,7 +16,7 @@ from foldmatch.types.api_types import (
     Granularity, SrcEsmFrom, Devices, Strategy,
 )
 from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, run_id
-from foldmatch.utils.fasta import iter_fasta_offsets
+from foldmatch.utils.sequence import scan_fasta
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class EmbeddingComputer:
         # One embedding per entry that passes min_res_n, the same filter the
         # dataset applies; rank 0 checks the shards against it after the pass.
         self.expected_count = sum(
-            1 for _offset, _name, length in iter_fasta_offsets(fasta_file)
+            1 for _offset, _name, length in scan_fasta(fasta_file)
             if min_res_n <= 0 or length >= min_res_n
         )
         self.refuse_existing_shards()

@@ -5,6 +5,7 @@ from esm.utils.structure.protein_chain import ProteinChain
 
 from foldmatch.types.api_types import StreamSrc, StructureFormat
 from foldmatch.utils.model import get_aggregator_model, get_residue_model
+from foldmatch.utils.sequence import normalize_sequence
 from foldmatch.utils.structure_parser import get_structure_from_src, filter_residues, rename_atom_attr
 
 
@@ -144,6 +145,9 @@ class FoldMatch:
 
         if sequence.startswith(">"):
             sequence = "".join(line.strip() for line in sequence.splitlines() if not line.startswith(">"))
+        # The string the FASTA paths embed (S15): lowercase letters and whitespace
+        # would otherwise reach ESM3 as unknown residues.
+        sequence = normalize_sequence(sequence, allow_non_ascii=True)
 
         if len(sequence) < self.min_res:
             raise ValueError(f"Sequence too short for embedding (min {self.min_res} residues)")

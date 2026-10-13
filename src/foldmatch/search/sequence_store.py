@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from foldmatch.utils.fasta import iter_fasta
+from foldmatch.utils.sequence import normalize_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,9 @@ class SequenceStore:
 
         The FASTA is read one record at a time and inserted in batches, so peak
         RAM is independent of corpus size (scales to hundreds of millions of
-        sequences). Applies the same ``min_res_n`` filter used when building the
-        index so store and index stay in lock-step. Duplicate headers keep the
+        sequences). Sequences are normalised (:func:`normalize_sequence`) and the
+        same ``min_res_n`` filter used when building the index is applied to the
+        normalised length, so store and index stay in lock-step. Duplicate headers keep the
         first occurrence — deduplication is delegated to the table's primary key
         via ``INSERT OR IGNORE`` (no in-RAM ``seen`` set).
 
@@ -91,7 +93,9 @@ class SequenceStore:
             seen_input = 0
             batch: list = []
             for name, sequence in iter_fasta(fasta_file):
-                sequence = sequence.strip().upper()
+                # The same string ESM3 embedded (EsmProtFromFasta normalises too),
+                # so stored residues line up with the embedding's.
+                sequence = normalize_sequence(sequence, allow_non_ascii=True)
                 if min_res_n > 0 and len(sequence) < min_res_n:
                     continue
                 batch.append((name, sequence, len(sequence)))

@@ -718,7 +718,12 @@ def query_database_from_fasta(
 
     if run_stage2:
         from foldmatch.utils.fasta import iter_fasta
-        query_sequences = dict(iter_fasta(fasta_file))
+        from foldmatch.utils.sequence import normalize_sequence
+        # Align the sequences ESM3 embedded, normalised like the stored subjects.
+        query_sequences = {
+            name: normalize_sequence(sequence, allow_non_ascii=True)
+            for name, sequence in iter_fasta(fasta_file)
+        }
         _stage2_align_and_report(
             embedding_db=embedding_db,
             prefilter_results=results,
