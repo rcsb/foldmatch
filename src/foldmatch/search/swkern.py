@@ -168,7 +168,7 @@ def _open(isa: str, search_dirs: Optional[Tuple[Path, ...]], check_source: bool)
     if path is None:
         where = ", ".join(str(d) for d in (search_dirs or (_native.NATIVE_DIR,)))
         raise KernelError(f"native kernel library {_native.library_filename(isa)} not found in {where}; "
-                          f"{_native.rebuild_hint()}")
+                          f"{_native.rebuild_hint(missing=True)}")
     kernel = Kernel(path, isa)
     if check_source:
         tree = _native.source_sha256()
@@ -915,3 +915,26 @@ def selftest(kernel: Optional[Kernel] = None, *, count: int = 1000) -> Dict[str,
                   seconds=round(time.perf_counter() - t0, 3))
     logger.info("fmsw selftest passed: %s", report)
     return report
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """``python -m foldmatch.search.swkern``: load the kernel (dispatch, or ``$FOLDMATCH_SW_ISA``), run
+    :func:`selftest` and print its report as JSON. Exit status 1 when the kernel is unusable or the selftest fails.
+    Used after installs (Docker, CI, wheels) to check that the packaged libraries work on this machine."""
+    import argparse
+    import json
+    import sys
+    ap = argparse.ArgumentParser(prog="python -m foldmatch.search.swkern",
+                                 description="Run the native kernel selftest and print its report as JSON.")
+    ap.parse_args(argv)
+    try:
+        report = selftest()
+    except KernelError as e:
+        print(f"fmsw selftest failed: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=1, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

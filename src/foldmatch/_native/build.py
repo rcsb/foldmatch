@@ -12,7 +12,8 @@ plus the ISA flag (``-mavx2`` for avx2, ``-DFMSW_GENERIC`` for generic) and the 
 ``-march=native`` and never ``-mfma``. Every x86_64 library is compiled for the plain x86-64 baseline
 (``-march=x86-64 -mtune=generic`` before the ISA flag), whatever ``-march`` the compiler or a wrapper defaults to
 (e.g. ``x86-64-v3`` distribution compilers, ``-march=znver3`` from the Cray ``cc`` wrapper): the sse2 and generic
-libraries must not contain AVX2 code, and avx2 adds exactly ``-mavx2``.
+libraries must not contain AVX2 code, and avx2 adds exactly ``-mavx2``. On macOS the install name is set to
+``@rpath/<library file name>`` (a linker flag only).
 
 :func:`compile_library` is the single compile step, also used by the packaging build hook. This module uses the
 standard library only and can be loaded by file path (without importing the foldmatch package).
@@ -31,12 +32,14 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 try:  # imported as foldmatch._native.build
-    from . import ISAS, NATIVE_DIR, SOURCE_DIR, library_filename, machine_isas, normalized_machine, source_sha256
+    from . import (ISAS, NATIVE_DIR, REINSTALL_COMMAND, SOURCE_DIR, library_filename, machine_isas,
+                   normalized_machine, source_sha256)
 except ImportError:  # loaded by file path (packaging build hook): load the sibling __init__.py the same way
     _spec = importlib.util.spec_from_file_location("_foldmatch_native_init", Path(__file__).with_name("__init__.py"))
     _init = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_init)
     ISAS, NATIVE_DIR, SOURCE_DIR = _init.ISAS, _init.NATIVE_DIR, _init.SOURCE_DIR
+    REINSTALL_COMMAND = _init.REINSTALL_COMMAND
     library_filename, machine_isas, source_sha256 = _init.library_filename, _init.machine_isas, _init.source_sha256
     normalized_machine = _init.normalized_machine
 
@@ -82,8 +85,17 @@ def compile_command(isa: str, output: Path, *, cc: Optional[str] = None, source_
     sha = source_sha256(src_dir)
     if sha is None:
         raise NativeBuildError(f"kernel source not found in {src_dir}")
-    return [*shlex.split(find_compiler(cc)), *BASE_FLAGS, *machine_flags(isa, machine), *ISA_FLAGS[isa], *extra_flags,
+    return [*shlex.split(find_compiler(cc)), *BASE_FLAGS, *machine_flags(isa, machine), *ISA_FLAGS[isa],
+            *extra_flags, *link_flags(isa),
             f'-DFMSW_SOURCE_SHA256="{sha}"', "-o", str(output), str(src_dir / "fmsw.c"), "-lm"]
+
+
+def link_flags(isa: str) -> List[str]:
+    """Linker-only flags. On macOS the library's install name is ``@rpath/<library file name>`` rather than the
+    temporary output path, so the binary never records a build directory (reproducible builds; delocate)."""
+    if sys.platform == "darwin":
+        return [f"-Wl,-install_name,@rpath/{library_filename(isa)}"]
+    return []
 
 
 def compile_library(isa: str, out_dir: Path, *, cc: Optional[str] = None, source_dir: Optional[Path] = None,

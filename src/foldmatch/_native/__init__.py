@@ -93,8 +93,21 @@ def source_sha256(source_dir: Optional[Path] = None) -> Optional[str]:
     return h.hexdigest()
 
 
-def rebuild_hint() -> str:
-    """How to get working libraries, for refusal messages."""
-    return (f"rebuild the native kernel: in a source checkout or editable install run `{REBUILD_COMMAND}` "
-            f"(needs a C compiler); for a pip install from an sdist, reinstall with a C compiler available: "
-            f"`{REINSTALL_COMMAND}`")
+def in_source_tree(native_dir: Optional[Path] = None) -> bool:
+    """True for a source checkout or an editable install (``<root>/src/foldmatch/_native`` next to
+    ``<root>/pyproject.toml``), False for an installed wheel."""
+    src = Path(native_dir if native_dir is not None else NATIVE_DIR).parent.parent
+    return src.name == "src" and (src.parent / "pyproject.toml").is_file()
+
+
+def rebuild_hint(missing: bool = False, native_dir: Optional[Path] = None) -> str:
+    """How to get working libraries, for refusal messages. ``missing``: no library at all was found (for an installed
+    package that means a pure-Python wheel, built from the sdist without a C compiler)."""
+    if in_source_tree(native_dir):
+        return (f"build the native kernel with `{REBUILD_COMMAND}` (needs a C compiler); for a pip install from an "
+                f"sdist, reinstall with a C compiler available: `{REINSTALL_COMMAND}`")
+    if missing:
+        return ("this FoldMatch was installed without its native kernel: a pure-Python wheel, built from the sdist "
+                "where no C compiler was available (pip caches and reuses that wheel). Install a C compiler (gcc or "
+                f"clang) and reinstall: `{REINSTALL_COMMAND}`")
+    return f"reinstall FoldMatch with a C compiler available: `{REINSTALL_COMMAND}`"

@@ -9,7 +9,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
 ]
 license = {file = "LICENSE.md"}
 
@@ -42,6 +43,19 @@ requires = [
     "hatchling >= 1.14.1"
 ]
 build-backend = "hatchling.build"
+
+[tool.hatch.build]
+# Native kernel libraries built in place (developer build, editable installs) never ship: wheels get libraries
+# freshly compiled by the build hook, and the sdist carries only the C source.
+exclude = [
+    "/src/foldmatch/_native/_fmsw_*",
+    "/src/foldmatch/_native/._fmsw_*",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+# hatch_build.py compiles the fmsw Smith-Waterman kernel (one library per ISA) and tags the wheel
+# py3-none-<platform>; FOLDMATCH_REQUIRE_NATIVE=1 makes a compile failure fatal (otherwise: pure wheel + warning).
+path = "hatch_build.py"
 
 [project.scripts]
 inference = "foldmatch.cli.inference:main"
