@@ -1,16 +1,37 @@
+import ast
 import hashlib
 import os
+import pickle
 import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
+import foldmatch
+from foldmatch.utils.data import load_residue_embedding
 from foldmatch.utils.esm import loaders
+
+_PACKAGE = Path(foldmatch.__file__).parent
 
 
 def _listing(root):
     return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*"))
+
+
+def _package_modules():
+    for path in sorted(_PACKAGE.rglob("*.py")):
+        yield path.relative_to(_PACKAGE.parent), ast.parse(path.read_text(), filename=str(path))
+
+
+def _call_name(call):
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        prefix = func.value.id + "." if isinstance(func.value, ast.Name) else ""
+        return prefix + func.attr
+    return func.id if isinstance(func, ast.Name) else None
 
 
 class EsmWeightsPinTest(unittest.TestCase):
@@ -158,6 +179,36 @@ class EsmWeightsPinTest(unittest.TestCase):
             self.skipTest("the local Hugging Face cache does not use blob symlinks")
         with mock.patch.object(loaders, "_file_sha256", side_effect=AssertionError("hashed")):
             self.assertEqual(loaders.verify_esm_weights(cached), "blob-name")
+
+
+class _NotAWeight:
+    pass
+
+
+class TorchLoadWeightsOnlyTest(unittest.TestCase):
+    """G5: every torch.load in the package refuses pickled code (weights_only=True)."""
+
+    def test_every_torch_load_passes_weights_only(self):
+        calls = []
+        for module, tree in _package_modules():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _call_name(node) == "torch.load":
+                    weights_only = [k.value for k in node.keywords if k.arg == "weights_only"]
+                    calls.append((f"{module}:{node.lineno}", weights_only))
+        self.assertGreaterEqual(len(calls), 4)
+        for where, weights_only in calls:
+            self.assertEqual(len(weights_only), 1, where)
+            self.assertIsInstance(weights_only[0], ast.Constant, where)
+            self.assertIs(weights_only[0].value, True, where)
+
+    def test_residue_embedding_loader_refuses_pickled_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.pt"
+            torch.save(torch.arange(6.0).reshape(2, 3), path)
+            self.assertTrue(torch.equal(load_residue_embedding(path), torch.arange(6.0).reshape(2, 3)))
+            torch.save({"embedding": _NotAWeight()}, path)
+            with self.assertRaises(pickle.UnpicklingError):
+                load_residue_embedding(path)
 
 
 if __name__ == "__main__":

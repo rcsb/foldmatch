@@ -25,7 +25,7 @@ def load_residue_embedding(
     if res_embedding_format == ResEmbeddingFormat.csv:
         values = pd.read_csv(file_path, header=None, index_col=None).values
         return torch.from_numpy(values).float()
-    return torch.load(file_path, map_location=torch.device('cpu'))
+    return torch.load(file_path, map_location=torch.device('cpu'), weights_only=True)
 
 def collate_seq_embeddings(
         batch_list: List[torch.Tensor]

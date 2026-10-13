@@ -107,7 +107,7 @@ def structure_encoder(device: torch.device | str = "cpu"):
             d_model=1024, n_heads=1, v_heads=128, n_layers=2, d_out=128, n_codes=4096
         ).eval()
     state_dict = torch.load(
-        data_root() / "data/weights/esm3_structure_encoder_v0.pth", map_location=device
+        data_root() / "data/weights/esm3_structure_encoder_v0.pth", map_location=device, weights_only=True
     )
     model.load_state_dict(state_dict)
     return model
@@ -147,7 +147,7 @@ def esm_open(device: torch.device | str = "cpu"):
             tokenizers=get_model_tokenizers(),
         ).eval()
     state_dict = torch.load(
-        data_root() / ESM_WEIGHTS_FILE, map_location=device
+        data_root() / ESM_WEIGHTS_FILE, map_location=device, weights_only=True
     )
     model.load_state_dict(state_dict)
     return model
