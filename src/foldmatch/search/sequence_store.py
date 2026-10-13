@@ -1,7 +1,7 @@
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 from foldmatch.utils.fasta import iter_fasta
 
@@ -19,6 +19,11 @@ _SQLITE_VAR_CHUNK = 900
 # RAM and journal size during bulk load so the store scales to corpora of
 # hundreds of millions of sequences without materializing the FASTA in memory.
 _INSERT_BATCH = 50_000
+
+# Keys of the ``meta`` table, written once when the store is built so readers
+# get the corpus totals (e.g. the E-value search space) without scanning every
+# row. Stores built before the table existed have none of them.
+META_KEYS = ("entry_count", "total_residues", "duplicates_ignored")
 
 
 class SequenceStore:
@@ -54,6 +59,9 @@ class SequenceStore:
         first occurrence — deduplication is delegated to the table's primary key
         via ``INSERT OR IGNORE`` (no in-RAM ``seen`` set).
 
+        The totals (``entry_count``, ``total_residues``, ``duplicates_ignored``)
+        are recorded in the ``meta`` table; see :meth:`meta`.
+
         Returns the number of sequences stored.
         """
         if self.path.exists():
@@ -77,6 +85,7 @@ class SequenceStore:
                 "CREATE TABLE sequences ("
                 "id TEXT PRIMARY KEY, sequence TEXT NOT NULL, length INTEGER NOT NULL)"
             )
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value)")
 
             insert_sql = "INSERT OR IGNORE INTO sequences (id, sequence, length) VALUES (?, ?, ?)"
             seen_input = 0
@@ -95,11 +104,20 @@ class SequenceStore:
                 conn.executemany(insert_sql, batch)
                 conn.commit()
 
-            stored = conn.execute("SELECT COUNT(*) FROM sequences").fetchone()[0]
+            # Totals over what was actually stored (first occurrence of each id),
+            # computed once here so readers never need to scan the table.
+            stored, total_residues = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM sequences"
+            ).fetchone()
+            duplicates = seen_input - stored
+            conn.executemany(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                zip(META_KEYS, (stored, total_residues, duplicates)),
+            )
+            conn.commit()
         finally:
             conn.close()
 
-        duplicates = seen_input - stored
         if duplicates > 0:
             logger.warning(
                 f"{duplicates} duplicate FASTA id(s) in sequence store; kept first occurrence of each"
@@ -136,22 +154,49 @@ class SequenceStore:
         finally:
             conn.close()
 
-    def count(self) -> int:
-        """Number of sequences in the store."""
+    def meta(self) -> Dict[str, Optional[int]]:
+        """Corpus totals: ``entry_count``, ``total_residues``, ``duplicates_ignored``.
+
+        Read from the ``meta`` table written at build time. A store built
+        before that table existed falls back to ``COUNT(*)`` and
+        ``SUM(length)`` over the rows; its ``duplicates_ignored`` cannot be
+        recovered and is ``None``.
+
+        :meth:`create` fills the ``meta`` table last, so a store that has the
+        table but not its totals was interrupted while being built: it holds
+        only part of the FASTA, and this raises ``ValueError`` instead of
+        reporting that part as the database.
+        """
         if not self.path.exists():
             raise FileNotFoundError(f"Sequence store not found at {self.path}")
         conn = sqlite3.connect(str(self.path))
         try:
-            return conn.execute("SELECT COUNT(*) FROM sequences").fetchone()[0]
+            has_meta = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+            ).fetchone() is not None
+            meta: Dict[str, Optional[int]] = dict.fromkeys(META_KEYS)
+            if has_meta:
+                meta.update(conn.execute("SELECT key, value FROM meta").fetchall())
+                if meta["entry_count"] is None:
+                    raise ValueError(
+                        f"Sequence store {self.path} is incomplete: its build stopped before "
+                        f"it recorded its totals. Delete the database's files and rebuild it "
+                        f"with 'fm-search build sequences'."
+                    )
+            if meta["entry_count"] is None:
+                meta["entry_count"] = conn.execute("SELECT COUNT(*) FROM sequences").fetchone()[0]
+            if meta["total_residues"] is None:
+                meta["total_residues"] = conn.execute(
+                    "SELECT COALESCE(SUM(length), 0) FROM sequences"
+                ).fetchone()[0]
+            return {key: meta[key] for key in META_KEYS}
         finally:
             conn.close()
 
+    def count(self) -> int:
+        """Number of sequences in the store."""
+        return self.meta()["entry_count"]
+
     def total_residues(self) -> int:
         """Sum of all sequence lengths — the search space for database E-values."""
-        if not self.path.exists():
-            raise FileNotFoundError(f"Sequence store not found at {self.path}")
-        conn = sqlite3.connect(str(self.path))
-        try:
-            return conn.execute("SELECT COALESCE(SUM(length), 0) FROM sequences").fetchone()[0]
-        finally:
-            conn.close()
+        return self.meta()["total_residues"]
