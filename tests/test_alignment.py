@@ -668,6 +668,142 @@ class TestCompBiasMatchesMmseqs(unittest.TestCase):
         )
 
 
+class IdentityVectorisedTest(unittest.TestCase):
+    """``identity_aln``/``identity_shorter`` come from the column tally (G3).
+
+    They used to come from biotite's ``get_sequence_identity``, which loops over
+    every alignment column in Python. ``_derive_alignment_extras`` already counts
+    the same matches with numpy, so the two must give the same floats, not merely
+    close ones. Checked against biotite and against a naive per-column loop on the
+    mmseqs fixture pairs (with and without the compositional bias correction, whose
+    positional query takes the other ``_align`` branch) and on 1,000 random
+    alignments.
+    """
+
+    ALL_NEEDS = alignment._FieldNeeds(True, True, True, True, True)
+
+    @staticmethod
+    def _naive_identity(trace, query, subject):
+        matches = 0
+        for i, j in trace.tolist():
+            if i != -1 and j != -1 and query[i] == subject[j]:
+                matches += 1
+        return matches / len(trace), matches / min(len(query), len(subject))
+
+    def _check(self, query, subject, comp_bias_scale=None):
+        """Align one pair through ``_align`` and directly with biotite, and compare.
+
+        Returns the metrics, or ``None`` for an empty alignment.
+        """
+        import biotite.sequence.align as align
+        alignment._worker_init(11, 1, None, None, None, needs=self.ALL_NEEDS,
+                               comp_bias_scale=comp_bias_scale)
+        q_protein, q_clean, q_len = alignment._to_protein(query)
+        s_protein, s_clean, s_len = alignment._to_protein(subject)
+        scoring = None
+        if comp_bias_scale is not None:
+            scoring = alignment._positional_query(
+                q_protein, alignment.local_composition_bias(query, comp_bias_scale))
+        metrics = alignment._align(q_protein, q_clean, q_len, s_protein, s_clean, s_len,
+                                   scoring=scoring)
+
+        # The same alignment, built directly with biotite as _align builds it.
+        if scoring is None:
+            aln = align.align_optimal(q_protein, s_protein, alignment._MATRIX,
+                                      gap_penalty=alignment._GAP, local=True, max_number=1)[0]
+        else:
+            aln = align.align_optimal(scoring[0], s_protein, scoring[1],
+                                      gap_penalty=alignment._GAP, local=True, max_number=1)[0]
+            aln = align.Alignment([q_protein, s_protein], aln.trace, aln.score)
+        trace = aln.trace
+        self.assertEqual(metrics.score, int(aln.score))
+        self.assertEqual(metrics.aln_len, len(trace))
+        if len(trace) == 0:
+            self.assertEqual((metrics.identity_aln, metrics.identity_shorter), (0.0, 0.0))
+            return None
+        # Same trace, column for column.
+        self.assertEqual(metrics.q_aln, "".join(q_clean[i] if i != -1 else "-" for i in trace[:, 0]))
+        self.assertEqual(metrics.t_aln, "".join(s_clean[j] if j != -1 else "-" for j in trace[:, 1]))
+
+        expected = (align.get_sequence_identity(aln, mode="all"),
+                    align.get_sequence_identity(aln, mode="shortest"))
+        got = (metrics.identity_aln, metrics.identity_shorter)
+        # Exact float equality on purpose: the output must not move by one ulp.
+        self.assertEqual(got, expected)
+        self.assertEqual(got, self._naive_identity(trace, q_clean, s_clean))
+        return metrics
+
+    def test_mmseqs_pairs(self):
+        with open(_RESOURCES / "alignment" / "mmseqs_comp_bias_pairs.tsv") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        for scale in (None, 1.0, 0.5):
+            for r in rows:
+                with self.subTest(query=r["query"], target=r["target"], comp_bias_scale=scale):
+                    self.assertIsNotNone(self._check(r["query_sequence"], r["target_sequence"], scale))
+
+    def test_random_alignments(self):
+        rng = np.random.default_rng(20261012)
+        standard = list("ACDEFGHIKLMNPQRSTVWY")
+        alphabets = (
+            standard,
+            standard + list("BZX*"),            # the rest of biotite's protein alphabet
+            standard + list("UOJBZX*-.0acdy"),  # letters sanitize_sequence uppercases or maps to X
+        )
+        found = []
+        for case in range(1000):
+            alphabet = alphabets[case % 3]
+            query = "".join(rng.choice(alphabet, int(rng.integers(1, 150))))
+            if case % 3 == 2:
+                subject = "".join(rng.choice(alphabet, int(rng.integers(1, 150))))
+            else:
+                # A mutated copy: substitutions at a random rate, then a few indels.
+                rate = rng.random()
+                chars = [str(rng.choice(alphabet)) if rng.random() < rate else c for c in query]
+                for _ in range(int(rng.integers(0, 5))):
+                    p = int(rng.integers(0, len(chars) + 1))
+                    if rng.random() < 0.5:
+                        del chars[p:p + int(rng.integers(1, 6))]
+                    else:
+                        chars[p:p] = list(rng.choice(alphabet, int(rng.integers(1, 6))))
+                subject = "".join(chars) or "A"
+            with self.subTest(case=case):
+                metrics = self._check(query, subject, (None, None, None, 1.0)[case % 4])
+                if metrics is not None:
+                    found.append(metrics)
+        # The set has to exercise the computation, not just empty alignments.
+        self.assertGreater(len(found), 800)
+        self.assertTrue(any(m.identity_aln == 1.0 for m in found))
+        self.assertTrue(any(m.identity_aln < 0.3 for m in found))
+        self.assertTrue(any(m.gap_open > 0 for m in found))
+        self.assertTrue(any(m.identity_shorter != m.identity_aln for m in found))
+
+    def test_align_never_calls_biotite_identity(self):
+        """The vectorised tally replaces get_sequence_identity, it does not sit beside it.
+
+        The equality tests above would also pass with the per-column loop
+        restored, so this one fails if ``_align`` calls it at all.
+        """
+        from unittest import mock
+
+        import biotite.sequence.align as align
+        with open(_RESOURCES / "alignment" / "mmseqs_comp_bias_pairs.tsv") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))[:10]
+        with mock.patch.object(align, "get_sequence_identity",
+                               side_effect=AssertionError("_align called get_sequence_identity")):
+            for scale in (None, 1.0):
+                alignment._worker_init(11, 1, None, None, None, needs=self.ALL_NEEDS,
+                                       comp_bias_scale=scale)
+                for r in rows:
+                    with self.subTest(query=r["query"], target=r["target"], comp_bias_scale=scale):
+                        q_protein, q_clean, q_len = alignment._to_protein(r["query_sequence"])
+                        s_protein, s_clean, s_len = alignment._to_protein(r["target_sequence"])
+                        scoring = None if scale is None else alignment._positional_query(
+                            q_protein, alignment.local_composition_bias(r["query_sequence"], scale))
+                        metrics = alignment._align(q_protein, q_clean, q_len, s_protein, s_clean, s_len,
+                                                   scoring=scoring)
+                        self.assertGreater(metrics.identity_aln, 0.0)
+
+
 class TestWriteAlignedResults(unittest.TestCase):
     def test_tsv_no_header(self):
         fields = ["query", "target", "fident", "alnlen", "cigar"]

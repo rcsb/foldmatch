@@ -357,7 +357,8 @@ def _derive_alignment_extras(trace, query_str: str, subject_str: str, needs: "_F
     """Compute the mmseqs column values that need the alignment trace.
 
     Returns ``(n_ident, mismatch, gap_open, q_start, q_end, t_start, t_end,
-    cigar, q_aln, t_aln)``. The trace must be non-empty; column ``(-1, -1)`` never
+    cigar, q_aln, t_aln)``; ``n_ident`` is also what the identity columns are
+    computed from. The trace must be non-empty; column ``(-1, -1)`` never
     occurs (biotite emits no double-gap columns), so the three masks partition
     the columns exactly.
     """
@@ -529,12 +530,18 @@ def _align(query_protein, query_str: str, query_len: int,
             t_aln=("" if needs.taln else None),
             q_seq=q_seq, t_seq=t_seq,
         )
-    identity_aln = float(align.get_sequence_identity(aln, mode="all"))
-    identity_shorter = float(align.get_sequence_identity(aln, mode="shortest"))
     q_aligned = int((trace[:, 0] != -1).sum())
     s_aligned = int((trace[:, 1] != -1).sum())
     (n_ident, mismatch, gap_open, q_start, q_end, t_start, t_end,
      cigar, q_aln, t_aln) = _derive_alignment_extras(trace, query_str, subject_str, needs)
+    # Identity from the vectorised column tally rather than biotite's
+    # get_sequence_identity, which loops over every column in Python. n_ident
+    # counts exactly the columns it counts as matches (both residues present and
+    # equal; the sanitized strings map 1:1 onto the protein codes), and both
+    # divide Python ints, so the values are the same floats: 'all' divides by the
+    # alignment length, 'shortest' by the shorter full sequence.
+    identity_aln = n_ident / aln_len
+    identity_shorter = n_ident / min(query_len, subject_len)
 
     pvalue = evalue = None
     if _ALP is not None:
