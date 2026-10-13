@@ -28,3 +28,10 @@ def get_residue_model(device=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return esm_open(device)
 
+
+def release_mps_cache(device):
+    """On the Apple GPU (MPS), wait for the batch's kernels and return the allocator's cached
+    memory to the system. Without it an ESM3 pass grew to 83 GB and slowed to 41 residues/s."""
+    if torch.device(device).type == "mps":
+        torch.mps.synchronize()
+        torch.mps.empty_cache()

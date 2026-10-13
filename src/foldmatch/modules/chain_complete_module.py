@@ -4,6 +4,7 @@ from lightning import LightningModule
 
 from foldmatch.utils.data import collate_seq_embeddings
 from foldmatch.utils.esm.loaders import per_residue_embedding
+from foldmatch.utils.model import release_mps_cache
 
 logger = logging.getLogger(__name__)
 
@@ -29,4 +30,6 @@ class ChainCompleteModule(LightningModule):
             prot_embeddings.append(embeddings)
             prot_names.append(name)
         res_batch_embedding, res_batch_mask = collate_seq_embeddings(prot_embeddings)
-        return self.aggregator(res_batch_embedding, res_batch_mask), tuple(prot_names)
+        chain_embeddings = self.aggregator(res_batch_embedding, res_batch_mask)
+        release_mps_cache(self.device)
+        return chain_embeddings, tuple(prot_names)

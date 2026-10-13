@@ -5,6 +5,7 @@ from torch import cat
 
 from foldmatch.utils.data import collate_seq_embeddings
 from foldmatch.utils.esm.loaders import per_residue_embedding
+from foldmatch.utils.model import release_mps_cache
 
 logger = logging.getLogger(__name__)
 
@@ -39,5 +40,6 @@ class AssemblyCompleteModule(LightningModule):
             assembly_embeddings.append(cat(prot_embeddings, dim=0))
             assembly_names.append(name)
         res_batch_embedding, res_batch_mask = collate_seq_embeddings(assembly_embeddings)
-
-        return self.aggregator(res_batch_embedding, res_batch_mask), tuple(assembly_names)
+        assembly_batch_embedding = self.aggregator(res_batch_embedding, res_batch_mask)
+        release_mps_cache(self.device)
+        return assembly_batch_embedding, tuple(assembly_names)
