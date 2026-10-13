@@ -394,6 +394,75 @@ class TestMaxEvalueFilter(unittest.TestCase):
             )
 
 
+class EmptyDatabaseTest(unittest.TestCase):
+    """An empty or unbuilt sequence store must say so, not raise a TypeError.
+
+    ``SequenceStore.total_residues()`` is ``COALESCE(SUM(length), 0)``, so an empty
+    store arrives here as ``0`` rather than ``None``. That slipped past the ``is None``
+    guard, left the database E-value unset, and surfaced as ``'<=' not supported
+    between instances of 'NoneType' and 'float'`` from inside the result loop.
+    """
+
+    COMMON = dict(
+        query_sequences={"q1": _STORE["s1"]},
+        prefilter_results={"q1": (["s1"], [0.9])},
+        fetch_subject_sequences=_fetch,
+        num_workers=1,
+    )
+
+    def test_empty_database_with_evalue_filter_is_explained(self):
+        for size in (0, -1):
+            with self.subTest(size=size):
+                with self.assertRaises(ValueError) as caught:
+                    alignment.align_candidates(max_evalue=1e-3, subject_db_size=size, **self.COMMON)
+                message = str(caught.exception)
+                self.assertIn("non-empty database", message)
+                self.assertIn(f"subject_db_size is {size}", message)
+                self.assertIn("max_evalue=None", message)
+                self.assertIn("--max-evalue inf", message)
+                # A build refuses an existing database, so the advice says to delete it first.
+                self.assertIn("Delete the database's files and rebuild it", message)
+
+    def test_refused_before_any_work(self):
+        """The check runs up front, before the subject sequences are even fetched."""
+        def fetch(ids):
+            raise AssertionError("subject sequences fetched before the size check")
+        common = dict(self.COMMON, fetch_subject_sequences=fetch)
+        with self.assertRaisesRegex(ValueError, "non-empty database"):
+            alignment.align_candidates(max_evalue=1e-3, subject_db_size=0, **common)
+
+    def test_missing_database_size_still_explained(self):
+        with self.assertRaisesRegex(ValueError, "requires subject_db_size"):
+            alignment.align_candidates(max_evalue=1e-3, subject_db_size=None, **self.COMMON)
+
+    def test_empty_database_without_evalue_filter_still_works(self):
+        """Ranking without E-values is legitimate on an empty search space."""
+        hits = alignment.align_candidates(max_evalue=None, subject_db_size=0,
+                                          compute_significance=True, **self.COMMON)["q1"]
+        self.assertEqual(len(hits), 1)
+        self.assertIsNone(hits[0].metrics.evalue)
+        self.assertIsNotNone(hits[0].metrics.bit_score)
+
+    def test_check_evalue_search_space(self):
+        """The check align_candidates runs, callable on its own (the CLI runs it before ESM3)."""
+        check = alignment.check_evalue_search_space
+        for no_filter in (None, float("inf"), float("nan")):
+            with self.subTest(max_evalue=no_filter):
+                self.assertIsNone(check(no_filter, 0))
+                self.assertIsNone(check(no_filter, None))
+        self.assertEqual(check(1e-3, 10), 1e-3)
+        with self.assertRaisesRegex(ValueError, "non-empty database"):
+            check(1e-3, 0)
+        with self.assertRaisesRegex(ValueError, "requires subject_db_size"):
+            check(1e-3, None)
+
+    def test_normal_database_size_is_unaffected(self):
+        hits = alignment.align_candidates(max_evalue=1e-3, subject_db_size=len(_STORE["s1"]),
+                                          **self.COMMON)["q1"]
+        self.assertEqual(len(hits), 1)
+        self.assertIsNotNone(hits[0].metrics.evalue)
+
+
 class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
     """The library's Stage-2 thresholds are the CLI's documented defaults.
 

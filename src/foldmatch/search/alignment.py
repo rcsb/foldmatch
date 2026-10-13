@@ -645,6 +645,39 @@ def _chunk_candidate_tasks(tasks, worker_budget: int, tasks_per_worker: int = 4)
     return chunked
 
 
+def check_evalue_search_space(max_evalue: Optional[float], subject_db_size: Optional[int]) -> Optional[float]:
+    """The E-value threshold :func:`align_candidates` filters on, or ``None`` for no filter.
+
+    ``None`` and non-finite values ('inf', the documented way to switch the
+    filter off) mean no filter. A finite threshold needs a positive
+    ``subject_db_size`` (the database search space); otherwise this raises a
+    ``ValueError`` that names the cause and the ways out. Cheap, so callers
+    can run it before any expensive work (the CLI does, before ESM3).
+    """
+    if max_evalue is None or not math.isfinite(max_evalue):
+        return None
+    if subject_db_size is None:
+        raise ValueError(
+            "max_evalue filtering requires subject_db_size (the database "
+            "search space); pass it or set max_evalue=None."
+        )
+    if subject_db_size <= 0:
+        # An empty store reaches here as 0, not None: SequenceStore.total_residues()
+        # is COALESCE(SUM(length), 0). Without this check no database E-value is
+        # computed and the filter compares None with a float, a TypeError from
+        # deep inside the result loop, long after the cause.
+        raise ValueError(
+            f"max_evalue filtering needs a non-empty database, but subject_db_size "
+            f"is {subject_db_size}: the search space is empty, so no E-value is "
+            f"defined. This usually means the sequence store is empty or was never "
+            f"built for this database. Delete the database's files and rebuild it "
+            f"with 'fm-search build sequences' (a build does not overwrite an "
+            f"existing database), or pass max_evalue=None (--max-evalue inf) to "
+            f"rank hits without E-value filtering."
+        )
+    return max_evalue
+
+
 def align_candidates(
         query_sequences: Dict[str, str],
         prefilter_results: Dict[str, Tuple[List[str], List[float]]],
@@ -704,8 +737,10 @@ def align_candidates(
             N workers (also widening affinity so they can spread). Capped at the
             number of queries.
         subject_db_size: total residue count of the subject database, used as the
-            search space for the database E-value. If ``None``, no E-value is
-            reported (the pairwise p-value is still computed).
+            search space for the database E-value. If ``None`` (or ``0``, which is
+            what an empty store reports), no E-value is reported (the pairwise
+            p-value is still computed), and combining that with a ``max_evalue``
+            raises a ``ValueError`` up front.
         compute_significance: when ``True``, annotate each hit with a bit score,
             a pairwise p-value and (if ``subject_db_size`` is given) a database
             E-value.
@@ -739,16 +774,9 @@ def align_candidates(
     start_time = time.perf_counter()
     # An E-value threshold only means something once the significance pass has
     # run against a known search space, so turn it on rather than silently
-    # dropping every hit (evalue stays None when it is off). A non-finite
-    # threshold ('inf') is the documented way to switch the filter off.
-    if max_evalue is not None and not math.isfinite(max_evalue):
-        max_evalue = None
+    # dropping every hit (evalue stays None when it is off).
+    max_evalue = check_evalue_search_space(max_evalue, subject_db_size)
     if max_evalue is not None:
-        if subject_db_size is None:
-            raise ValueError(
-                "max_evalue filtering requires subject_db_size (the database "
-                "search space); pass it or set max_evalue=None."
-            )
         compute_significance = True
     if not 0.0 <= comp_bias_corr_scale <= 1.0:
         raise ValueError(
