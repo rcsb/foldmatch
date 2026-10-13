@@ -32,7 +32,10 @@ class CoreBatchWriter(BasePredictionWriter):
     ):
         if prediction is None:
             return
-        embeddings, dom_ids = prediction
+        # A prediction is (embeddings, ids) optionally followed by per-item
+        # payloads (3- and 4-tuples). These writers store the embedding only,
+        # so any extra elements are dropped.
+        embeddings, dom_ids = prediction[0], prediction[1]
         deque(map(
             self._write_embedding,
             embeddings,
@@ -172,7 +175,9 @@ class ParquetBatchWriter(BasePredictionWriter):
     ):
         if prediction is None:
             return
-        embeddings, dom_ids = prediction
+        # Extra tuple elements beyond (embeddings, ids) are dropped: this
+        # writer's schema is fixed at construction to id + embedding.
+        embeddings, dom_ids = prediction[0], prediction[1]
         self._id_buffer.extend(dom_ids)
         # Keep flattened float32 arrays (not Python lists) in the buffer — far
         # cheaper in memory until we flush. .flatten() copies, so the buffer
