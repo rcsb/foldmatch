@@ -1,7 +1,6 @@
 import logging
-import os
+import re
 from pathlib import Path
-from secrets import token_hex
 from typing import Iterator, Optional
 
 import numpy as np
@@ -16,16 +15,22 @@ from foldmatch.types.api_types import (
     Accelerator,
     Granularity, SrcEsmFrom, Devices, Strategy,
 )
+from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, run_id
+from foldmatch.utils.fasta import iter_fasta_offsets
 
 logger = logging.getLogger(__name__)
 
 class EmbeddingComputer:
     """Compute chain or assembly embeddings via a residue->chain inference pipeline.
 
-    Owns the per-run scratch directories and the multi-GPU bookkeeping: each
-    rank's __init__ creates its own per-rank scratch dir, then after residue
-    inference all ranks consolidate onto rank 0's directory so chain/assembly
-    inference and tensor loading see a single shared location.
+    Owns the per-run shard naming and the multi-GPU bookkeeping. Every rank
+    writes its embeddings to ``{embedding_folder}/emb_{run_id}-{rank}.parquet``
+    under one run id shared by all ranks (:mod:`foldmatch.utils.dist`), and
+    rank 0 reads back exactly that run's shards. Before a pass every rank
+    refuses to start if shards with this run id already exist, and after a
+    FASTA pass rank 0 checks that the shards hold one embedding per input
+    entry, so a lost rank or a shard of an earlier run with the same id fails
+    loudly instead of being overwritten or merged.
     """
 
     def __init__(
@@ -33,7 +38,11 @@ class EmbeddingComputer:
             embedding_folder: Path,
     ):
         self.embedding_folder = embedding_folder
-        self.out_name = f"emb_{_consolidate_id()}"
+        # Raises on a rank > 0 that was given no id to share, before any model loads.
+        self.run_id = run_id()
+        self.out_name = f"emb_{self.run_id}"
+        # Number of embeddings rank 0 must find in the shards; known for FASTA input.
+        self.expected_count: Optional[int] = None
 
     def compute_from_structures(
             self,
@@ -56,6 +65,7 @@ class EmbeddingComputer:
         structure_folder = Path(structure_folder)
         if not structure_folder.exists():
             raise ValueError(f"Structure directory does not exist: {structure_folder}")
+        self.refuse_existing_shards()
 
         logging.info(f"Listing structure files from: {structure_folder}")
         structure_files = tuple(structure_folder.glob(f"*{file_extension}"))
@@ -64,46 +74,48 @@ class EmbeddingComputer:
                 f"No structure files found with extension {file_extension} in {structure_folder}"
             )
 
-        if granularity == 'chain':
-            chain_predict(
-                src_stream=[
-                    (str_file.stem, str_file, str_file.stem)
-                    for str_file in structure_files
-                ],
-                src_location=SrcLocation.stream,
-                structure_format=structure_format,
-                min_res_n=min_res,
-                out_folder=self.embedding_folder,
-                out_name=self.out_name,
-                accelerator=accelerator,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                num_nodes=num_nodes,
-                devices=devices,
-                strategy=strategy,
-                out_format=OutFormat.parquet,
-                return_predictions=False,
-            )
-        else:
-            assembly_predict(
-                src_stream=[
-                    (str_file.stem, str_file, str_file.stem)
-                    for str_file in structure_files
-                ],
-                src_location=SrcLocation.stream,
-                structure_format=structure_format,
-                min_res_n=min_res,
-                out_folder=self.embedding_folder,
-                out_name=self.out_name,
-                accelerator=accelerator,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                num_nodes=num_nodes,
-                devices=devices,
-                strategy=strategy,
-                out_format=OutFormat.parquet,
-                return_predictions=False,
-            )
+        # The other ranks Lightning launches inherit the exported run id.
+        with exported_run_id(self.run_id):
+            if granularity == 'chain':
+                chain_predict(
+                    src_stream=[
+                        (str_file.stem, str_file, str_file.stem)
+                        for str_file in structure_files
+                    ],
+                    src_location=SrcLocation.stream,
+                    structure_format=structure_format,
+                    min_res_n=min_res,
+                    out_folder=self.embedding_folder,
+                    out_name=self.out_name,
+                    accelerator=accelerator,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    num_nodes=num_nodes,
+                    devices=devices,
+                    strategy=strategy,
+                    out_format=OutFormat.parquet,
+                    return_predictions=False,
+                )
+            else:
+                assembly_predict(
+                    src_stream=[
+                        (str_file.stem, str_file, str_file.stem)
+                        for str_file in structure_files
+                    ],
+                    src_location=SrcLocation.stream,
+                    structure_format=structure_format,
+                    min_res_n=min_res,
+                    out_folder=self.embedding_folder,
+                    out_name=self.out_name,
+                    accelerator=accelerator,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    num_nodes=num_nodes,
+                    devices=devices,
+                    strategy=strategy,
+                    out_format=OutFormat.parquet,
+                    return_predictions=False,
+                )
 
     def compute_from_fasta(
             self,
@@ -118,26 +130,99 @@ class EmbeddingComputer:
     ):
         """Compute chain embeddings from protein sequences in a FASTA file."""
 
-        chain_predict(
-            src_stream=fasta_file,
-            src_from=SrcEsmFrom.fasta,
-            min_res_n=min_res_n,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            num_nodes=num_nodes,
-            accelerator=accelerator,
-            devices=devices,
-            out_format=OutFormat.parquet,
-            out_folder=self.embedding_folder,
-            out_name=self.out_name,
-            strategy=strategy,
-            return_predictions=False,
+        # One embedding per entry that passes min_res_n, the same filter the
+        # dataset applies; rank 0 checks the shards against it after the pass.
+        self.expected_count = sum(
+            1 for _offset, _name, length in iter_fasta_offsets(fasta_file)
+            if min_res_n <= 0 or length >= min_res_n
+        )
+        self.refuse_existing_shards()
+        # The other ranks Lightning launches inherit the exported run id.
+        with exported_run_id(self.run_id):
+            chain_predict(
+                src_stream=fasta_file,
+                src_from=SrcEsmFrom.fasta,
+                min_res_n=min_res_n,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                num_nodes=num_nodes,
+                accelerator=accelerator,
+                devices=devices,
+                out_format=OutFormat.parquet,
+                out_folder=self.embedding_folder,
+                out_name=self.out_name,
+                strategy=strategy,
+                return_predictions=False,
+            )
+
+    def shard_files(self) -> list[Path]:
+        """This run's per-rank Parquet shards, ``emb_{run_id}-{rank}.parquet``.
+
+        The glob is narrowed by an exact match, so a run whose id merely starts
+        with this one (``abc`` vs ``abc-1``) is never picked up.
+        """
+        shard_name = re.compile(rf"{re.escape(self.out_name)}-\d+\.parquet")
+        return sorted(
+            path for path in Path(self.embedding_folder).glob(f"{self.out_name}-*.parquet")
+            if shard_name.fullmatch(path.name)
         )
 
-    def get_embedding_batches(self, load_batch_size: int = 32768) -> Iterator[tuple[list[str], np.ndarray]]:
-        """Stream (ids, [B, D] float32) batches from all per-rank Parquet shards. Rank-0 only."""
+    def refuse_existing_shards(self) -> None:
+        """Raise ``FileExistsError`` if shards with this run id already exist. Read-only.
 
-        parquet_files = sorted(Path(self.embedding_folder).glob(f"{self.out_name}-*.parquet"))
+        Every rank runs it before the pass, so before ESM3 loads and before any
+        rank writes (the ranks only write after they have all joined the process
+        group). Shards with this id can only come from an earlier run with the
+        same id, e.g. the same command run twice in one srun step, or a reused
+        ``FOLDMATCH_RUN_ID``: this run would overwrite them, or rank 0 would
+        mix them into its own.
+        """
+        existing = self.shard_files()
+        if existing:
+            raise FileExistsError(
+                f"{len(existing)} embedding shard(s) of an earlier run with the same run id "
+                f"({self.run_id}) are in {self.embedding_folder} ({existing[0].name}, ...). "
+                f"This run would overwrite them or mix them into its own: remove them, use "
+                f"another --tmp-embedding-folder, or set a different {RUN_ID_ENV}."
+            )
+
+    def count_embeddings(self) -> int:
+        """Rows over this run's shards, from the Parquet footers (no data read)."""
+        return sum(pq.ParquetFile(path).metadata.num_rows for path in self.shard_files())
+
+    def check_embedding_count(self) -> None:
+        """Raise unless the shards hold exactly :attr:`expected_count` embeddings. Rank-0 only.
+
+        A shortfall means a rank's shard is missing; an excess means shards of
+        an earlier run with the same id (e.g. the same SLURM step) are mixed in.
+        A no-op when the expected count is unknown (structure input).
+        """
+        if self.expected_count is None:
+            return
+        found = self.count_embeddings()
+        if found != self.expected_count:
+            raise ValueError(
+                f"Found {found} embeddings in {len(self.shard_files())} shard(s) "
+                f"{self.embedding_folder}/{self.out_name}-*.parquet, but the input has "
+                f"{self.expected_count} entries. Either a rank's shard is missing, or "
+                f"shards of an earlier run with the same run id ({self.run_id}) are mixed "
+                f"in: remove them or use another --tmp-embedding-folder."
+            )
+
+    def remove_shards(self) -> None:
+        """Delete this run's shards. Rank-0 only, once every rank has finished writing."""
+        for path in self.shard_files():
+            path.unlink(missing_ok=True)
+
+    def get_embedding_batches(self, load_batch_size: int = 32768) -> Iterator[tuple[list[str], np.ndarray]]:
+        """Stream (ids, [B, D] float32) batches from all per-rank Parquet shards. Rank-0 only.
+
+        Checks the embedding count first (:meth:`check_embedding_count`), so a
+        mismatch fails before anything is built from the batches.
+        """
+
+        self.check_embedding_count()
+        parquet_files = self.shard_files()
         logging.info(f"Streaming embeddings from {len(parquet_files)} Parquet shard(s) in {self.embedding_folder}/{self.out_name}-*.parquet")
         for parquet_file in parquet_files:
             logging.info(f"   Parquet file {parquet_file}")
@@ -229,6 +314,3 @@ def compute_from_structure_file(
         return
     arr = np.ascontiguousarray(np.stack(embeddings).astype(np.float32, copy=False))
     yield ids, arr
-
-def _consolidate_id():
-    return os.environ.get('SLURM_JOB_ID', token_hex(16))

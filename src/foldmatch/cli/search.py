@@ -65,6 +65,12 @@ _FORMAT_OUTPUT_HELP = (
     f"Available fields: {', '.join(SUPPORTED_OUTPUT_FIELDS)}."
 )
 
+_CLEANUP_EMBEDDINGS_HELP = (
+    "Delete this build's intermediate embedding shards "
+    "(emb_<run id>-<rank>.parquet) from --tmp-embedding-folder once the "
+    "database is built. By default they are kept."
+)
+
 
 @build_db_app.command(
     name="structures",
@@ -135,6 +141,9 @@ def build_database_from_structures(
                  'batches (e.g. 65536+) better saturate many-core nodes during '
                  'IVF-PQ build; smaller batches use less memory.'
         )] = 32768,
+        cleanup_embeddings: Annotated[bool, typer.Option(
+            help=_CLEANUP_EMBEDDINGS_HELP
+        )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Number of nodes to use for inference of embeddings.'
         )] = LogLevel.info
@@ -190,6 +199,8 @@ def build_database_from_structures(
         index_type=index_type,
         index_config=IndexConfig(nlist=ivf_nlist, nprobe=ivf_nprobe),
     )
+    if cleanup_embeddings:
+        embedding_computer.remove_shards()
 
 
 @build_db_app.command(
@@ -312,6 +323,9 @@ def build_database_from_fasta(
                  'batches (e.g. 65536+) better saturate many-core nodes during '
                  'IVF-PQ build; smaller batches use less memory.'
         )] = 32768,
+        cleanup_embeddings: Annotated[bool, typer.Option(
+            help=_CLEANUP_EMBEDDINGS_HELP
+        )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging level.'
         )] = LogLevel.info
@@ -358,6 +372,8 @@ def build_database_from_fasta(
         fasta_file=fasta_file,
         min_res_n=min_res_n,
     )
+    if cleanup_embeddings:
+        embedding_computer.remove_shards()
 
 
 @query_db_app.command(
@@ -686,6 +702,8 @@ def query_database_from_fasta(
         embedding_batches=embedding_computer.get_embedding_batches(),
         top_k=top_k
     )
+    # The query embeddings are only needed for this search.
+    embedding_computer.remove_shards()
     logging.info(f"Searched {len(results)} sequence(s)")
     results = _filter_results_by_threshold(results, threshold)
 
