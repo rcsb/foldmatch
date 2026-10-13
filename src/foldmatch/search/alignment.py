@@ -720,7 +720,8 @@ def align_candidates(
             :meth:`SequenceStore.fetch`), used once to gather all candidate
             subject sequences across queries.
         min_seq_identity: drop hits whose ``identity_aln`` is below this.
-        min_coverage: drop hits whose query *and* subject coverage are below this.
+        min_coverage: drop hits whose query or subject coverage is below this
+            (a hit is kept only if ``min(qcov, tcov) >= min_coverage``).
         max_evalue: drop hits whose database E-value is above this. ``None``
             or a non-finite value disables the filter. Because the E-value is a
             significance quantity, setting it forces ``compute_significance=True``

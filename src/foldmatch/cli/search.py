@@ -67,6 +67,13 @@ _FORMAT_OUTPUT_HELP = (
     f"Available fields: {', '.join(SUPPORTED_OUTPUT_FIELDS)}."
 )
 
+# Stage 2 keeps a hit only if min(qcov, tcov) >= --min-coverage.
+_MIN_COVERAGE_HELP = (
+    "When --seq-identity is set, keep only hits whose query coverage and "
+    "subject coverage both reach this fraction (0-1); a hit is dropped when "
+    "either side is below it."
+)
+
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
     "(emb_<run id>-<rank>.parquet) from --tmp-embedding-folder once the "
@@ -627,8 +634,7 @@ def query_database_from_fasta(
                  'is below this fraction (0-1).'
         )] = 0.3,
         min_coverage: Annotated[float, typer.Option(
-            help='When --seq-identity is set, drop hits whose query AND subject '
-                 'coverage are below this fraction (0-1).'
+            help=_MIN_COVERAGE_HELP
         )] = 0.8,
         max_evalue: Annotated[float, typer.Option(
             help='When --seq-identity is set, drop hits whose database E-value is '
@@ -803,8 +809,7 @@ def query_database_from_database(
                  'is below this fraction (0-1).'
         )] = 0.3,
         min_coverage: Annotated[float, typer.Option(
-            help='When --seq-identity is set, drop hits whose query AND subject '
-                 'coverage are below this fraction (0-1).'
+            help=_MIN_COVERAGE_HELP
         )] = 0.8,
         max_evalue: Annotated[float, typer.Option(
             help='When --seq-identity is set, drop hits whose database E-value is '
