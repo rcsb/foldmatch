@@ -75,7 +75,7 @@ def predict(
     if out_folder is not None:
         if out_format == OutFormat.parquet:
             inference_writer = ParquetBatchWriter(out_folder, out_name) if residue_output is None else \
-                ParquetBatchWriter(out_folder, out_name, residue_output=residue_output, system=prepared.system)
+                residue_shard_writer(out_folder, out_name, residue_output, prepared.system, min_res_n=min_res_n)
         elif out_format == OutFormat.json:
             inference_writer = JsonStorage(out_folder, out_name)
         elif out_format == OutFormat.pt:
@@ -141,6 +141,16 @@ def predict(
     )
 
     return prediction
+
+
+def residue_shard_writer(out_folder, out_name: str, residue_output: str, system, *,
+                         min_res_n: int) -> ParquetBatchWriter:
+    """The Parquet shard writer of a residue pass (:class:`ParquetBatchWriter` with the residue columns). Its pass
+    record (schema metadata ``foldmatch.pass``) holds ``min_res_n`` and the ESM3 revision the pass loads, the pinned
+    one (``load_head`` has checked it is the system's ESM3); the writer adds the device and the ranks."""
+    from foldmatch.utils.esm.loaders import ESM_REVISION
+    return ParquetBatchWriter(out_folder, out_name, residue_output=residue_output, system=system,
+                              min_res_n=min_res_n, esm_revision=ESM_REVISION)
 
 
 # =====================================================================================================================

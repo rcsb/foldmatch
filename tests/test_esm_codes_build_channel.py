@@ -477,5 +477,340 @@ class InferencePlumbingTest(_FakeEsm3Pass):
                     q = np.frombuffer(data, dtype="<f2").reshape(-1, 64)
                     self.assertLessEqual(_row_ulps(q, q_ref), 1.0)
 
+
+# =====================================================================================================================
+# P5.3 writer
+# =====================================================================================================================
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
+from lightning.pytorch.callbacks import BasePredictionWriter  # noqa: E402
+
+from foldmatch.writer import batch_writer  # noqa: E402
+from foldmatch.writer.batch_writer import ParquetBatchWriter  # noqa: E402
+
+
+class _LegacyParquetBatchWriter(BasePredictionWriter):
+    """writer/batch_writer.py ParquetBatchWriter at e8b389c (before P5.3), verbatim."""
+
+    def __init__(self, output_path, df_id, write_interval="batch", buffer_size=16384):
+        super().__init__(write_interval)
+        self.out_path = output_path
+        self.df_id = df_id
+        self.buffer_size = buffer_size
+        self._writer = None
+        self._id_buffer = []
+        self._emb_buffer = []
+        self._schema = pa.schema([
+            ('id', pa.string()),
+            ('embedding', pa.list_(pa.float32()))
+        ])
+
+    def _get_writer(self, rank):
+        if self._writer is None:
+            path = f"{self.out_path}/{self.df_id}-{rank}.parquet"
+            self._writer = pq.ParquetWriter(path, self._schema, compression='snappy')
+        return self._writer
+
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
+        if prediction is None:
+            return
+        embeddings, dom_ids = prediction[0], prediction[1]
+        self._id_buffer.extend(dom_ids)
+        self._emb_buffer.extend(
+            emb.detach().to('cpu', torch.float32).numpy().flatten()
+            for emb in embeddings
+        )
+        if len(self._id_buffer) >= self.buffer_size:
+            self._flush(trainer.global_rank)
+
+    def _flush(self, rank):
+        if not self._id_buffer:
+            return
+        table = pa.table(
+            {
+                'id': self._id_buffer,
+                'embedding': pa.array(self._emb_buffer, type=pa.list_(pa.float32())),
+            },
+            schema=self._schema,
+        )
+        self._get_writer(rank).write_table(table)
+        self._id_buffer.clear()
+        self._emb_buffer.clear()
+
+    def on_predict_end(self, trainer, pl_module):
+        self._flush(trainer.global_rank)
+        if self._writer is not None:
+            self._writer.close()
+
+
+def _rows(n, seed=0, residues=(3, 0, 5), dim=4):
+    """``n`` synthetic rows: ``(id, embedding, codes payload, query payload, seq_sha1)``; the second has an empty
+    payload (a length mismatch)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in range(n):
+        length = residues[k % len(residues)]
+        emb = torch.from_numpy(rng.normal(size=dim).astype(np.float32))
+        codes = rng.integers(0, 256, size=(length, 8), dtype=np.uint8).tobytes()
+        q = rng.normal(size=(length, 64)).astype("<f2").tobytes()
+        out.append((f"s{seed}_{k}", emb, codes, q, hashlib.sha1(f"{seed}/{k}".encode()).digest()))
+    return out
+
+
+def _prediction(rows, residue_output=None):
+    ids = tuple(r[0] for r in rows)
+    embeddings = torch.stack([r[1] for r in rows])
+    if residue_output is None:
+        return embeddings, ids
+    payloads = tuple(r[2] if residue_output == rs.RESIDUE_CODES else r[3] for r in rows)
+    return embeddings, ids, payloads, tuple(r[4] for r in rows)
+
+
+def _write_shard(folder, name, rows, residue_output=None, system=SYSTEM, rank=0, batch=2, **writer_kwargs):
+    writer = ParquetBatchWriter(folder, name, residue_output=residue_output,
+                                system=system if residue_output else None, **writer_kwargs)
+    trainer = SimpleNamespace(global_rank=rank)
+    module = SimpleNamespace(residue_output=residue_output)
+    writer.on_predict_start(trainer, module)
+    for start in range(0, len(rows), batch):
+        writer.write_on_batch_end(trainer, module, _prediction(rows[start:start + batch], residue_output),
+                                  None, None, 0, 0)
+    writer.on_predict_end(trainer, module)
+    return Path(folder) / f"{name}-{rank}.parquet"
+
+
+def _sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _pass_record(path):
+    """The ``foldmatch.pass`` record in a shard's footer."""
+    return json.loads(pq.read_schema(path).metadata[rs.META_PASS])
+
+
+class WriterTest(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_plain_writer_keeps_the_legacy_schema_and_bytes(self):
+        writer = ParquetBatchWriter(self.tmp, "x")
+        self.assertEqual(writer.schema, pa.schema([("id", pa.string()), ("embedding", pa.list_(pa.float32()))]))
+        self.assertIsNone(writer.schema.metadata)
+        self.assertIsNone(writer.byte_budget)
+        rows = _rows(7)
+        for buffer_size in (16384, 3):
+            for size in (2, 4):
+                with self.subTest(buffer_size=buffer_size, tuple_size=size):
+                    legacy = _LegacyParquetBatchWriter(self.tmp, f"legacy{buffer_size}", buffer_size=buffer_size)
+                    for start in range(0, 7, 2):
+                        legacy.write_on_batch_end(_TRAINER, None, _prediction(rows[start:start + 2]), None, None, 0, 0)
+                    legacy.on_predict_end(_TRAINER, None)
+                    new = ParquetBatchWriter(self.tmp, f"new{buffer_size}_{size}", buffer_size=buffer_size)
+                    for start in range(0, 7, 2):
+                        prediction = _prediction(rows[start:start + 2], rs.RESIDUE_CODES if size == 4 else None)
+                        new.write_on_batch_end(_TRAINER, None, prediction, None, None, 0, 0)
+                    new.on_predict_end(_TRAINER, None)
+                    self.assertEqual(_sha256(self.tmp / f"new{buffer_size}_{size}-0.parquet"),
+                                     _sha256(self.tmp / f"legacy{buffer_size}-0.parquet"))
+
+    def test_the_schema_is_fixed_at_construction(self):
+        for residue_output in rs.RESIDUE_OUTPUTS:
+            with self.subTest(residue_output=residue_output):
+                schema = ParquetBatchWriter(self.tmp, "x", residue_output=residue_output, system=SYSTEM).schema
+                self.assertEqual([(f.name, f.type) for f in schema], [
+                    ("id", pa.string()), ("embedding", pa.list_(pa.float32())),
+                    (residue_output, pa.large_binary()), ("seq_sha1", pa.binary(20))])
+                metadata = dict(schema.metadata)
+                record = json.loads(metadata.pop(b"foldmatch.pass"))
+                self.assertEqual(metadata, {
+                    b"foldmatch.residue_output": residue_output.encode(),
+                    b"foldmatch.system": b"esm-codes-v1",
+                    b"foldmatch.encoding_digest": SYSTEM.encoding_digest().encode(),
+                    b"foldmatch.system_digest": SYSTEM.digest().encode(),
+                })
+                self.assertEqual(tuple(sorted(record)), tuple(sorted(rs.PASS_KEYS)))
+                self.assertEqual({k: record[k] for k in ("min_res_n", "accelerator", "world_size", "esm_precision",
+                                                         "esm_revision")}, dict.fromkeys(
+                    ("min_res_n", "accelerator", "world_size", "esm_precision", "esm_revision")))  # not known yet
+                self.assertEqual((record["encoder_precision"], record["foldmatch_version"]),
+                                 ("fp32-no-tf32", foldmatch.__version__))
+        self.assertEqual(SYSTEM.encoding_digest(), "92220d870638cb57")  # the P4 golden
+
+    def test_the_pass_is_recorded(self):
+        """foldmatch.pass: min_res_n and the ESM3 revision from the constructor, the device type (and so the ESM3
+        precision) and the number of ranks from the start of the pass, in every shard's footer."""
+        rows = _rows(3)
+        for device, precision in (("cuda", "bf16-autocast"), ("cpu", "fp32"), ("mps", "fp32")):
+            with self.subTest(device=device):
+                writer = ParquetBatchWriter(self.tmp, device, residue_output=rs.RESIDUE_CODES, system=SYSTEM,
+                                            min_res_n=7, esm_revision="r" * 40)
+                trainer = SimpleNamespace(global_rank=1, world_size=4)
+                module = SimpleNamespace(residue_output=rs.RESIDUE_CODES, device=torch.device(device))
+                writer.on_predict_start(trainer, module)
+                writer.write_on_batch_end(trainer, module, _prediction(rows, rs.RESIDUE_CODES), None, None, 0, 0)
+                writer.on_predict_end(trainer, module)
+                record = _pass_record(self.tmp / f"{device}-1.parquet")
+                self.assertEqual(record, rs.pass_record(min_res_n=7, esm_revision="r" * 40, accelerator=device,
+                                                        world_size=4))
+                self.assertEqual((record["esm_precision"], record["encoder_precision"]), (precision, "fp32-no-tf32"))
+                self.assertEqual(record["foldmatch_version"], foldmatch.__version__)
+                self.assertTrue(record["torch"] and record["esm"] and record["platform"])
+        self.assertEqual([rs.esm_precision(d) for d in ("cuda", "cpu", "mps", None)],
+                         ["bf16-autocast", "fp32", "fp32", None])
+
+    def test_round_trip(self):
+        rows = _rows(7)
+        for residue_output in rs.RESIDUE_OUTPUTS:
+            with self.subTest(residue_output=residue_output):
+                path = _write_shard(self.tmp, residue_output, rows, residue_output)
+                table = pq.read_table(path)
+                self.assertEqual(table.schema, rs.shard_schema(residue_output, SYSTEM))
+                self.assertEqual(table.column("id").to_pylist(), [r[0] for r in rows])
+                payloads = [r[2] if residue_output == rs.RESIDUE_CODES else r[3] for r in rows]
+                self.assertEqual(table.column(residue_output).to_pylist(), payloads)
+                self.assertEqual(b"", payloads[1])
+                self.assertEqual(table.column("seq_sha1").to_pylist(), [r[4] for r in rows])
+                np.testing.assert_array_equal(np.stack(table.column("embedding").to_numpy(zero_copy_only=False)),
+                                              np.stack([r[1].numpy() for r in rows]))
+
+    def test_byte_budget_and_row_count_flushes(self):
+        self.assertEqual(ParquetBatchWriter(self.tmp, "d", residue_output=rs.RESIDUE_CODES, system=SYSTEM).byte_budget,
+                         256 * 1024 * 1024)
+        self.assertEqual(batch_writer.DEFAULT_BYTE_BUDGET, 256 * 1024 * 1024)
+        rows = []
+        for k in range(7):
+            rows.append((f"{k}", torch.zeros(4), b"\x01" * 1000, b"", b"\x02" * 20))
+        # Each row buffers 16 (embedding) + 1 (id) + 1000 (payload) + 20 (seq_sha1) = 1037 bytes: a 2,500-byte budget
+        # is crossed by every third row.
+        path = _write_shard(self.tmp, "budget", rows, rs.RESIDUE_CODES, batch=1, byte_budget=2500)
+        meta = pq.ParquetFile(path).metadata
+        self.assertEqual([meta.row_group(i).num_rows for i in range(meta.num_row_groups)], [3, 3, 1])
+        path = _write_shard(self.tmp, "count", rows, rs.RESIDUE_CODES, batch=1, buffer_size=2)
+        meta = pq.ParquetFile(path).metadata
+        self.assertEqual([meta.row_group(i).num_rows for i in range(meta.num_row_groups)], [2, 2, 2, 1])
+        self.assertEqual(pq.read_table(path).column("residue_codes").to_pylist(), [r[2] for r in rows])
+        # A plain writer may be given a budget too.
+        path = _write_shard(self.tmp, "plain", rows, None, batch=1, byte_budget=40)
+        meta = pq.ParquetFile(path).metadata
+        self.assertEqual([meta.row_group(i).num_rows for i in range(meta.num_row_groups)], [3, 3, 1])
+
+    def test_a_payload_chunk_over_2_gib_mocked(self):
+        """large_binary has 64-bit offsets: one row group may hold more than 2 GiB of payloads. Mocked: the 17 payloads
+        of 128 MiB are one lazily zeroed object, the concatenated buffer a lazily zeroed array, and the Parquet writer
+        only receives the table, so no memory is touched."""
+        size, n = 1 << 27, 17
+        payload = bytes(size)
+        captured = []
+
+        class FakeWriter:
+            def __init__(self, path, schema, compression=None):
+                self.schema = schema
+
+            def write_table(self, table):
+                captured.append(table)
+
+            def close(self):
+                pass
+
+        rows = [(f"r{k}", torch.zeros(4), payload, b"", bytes(20)) for k in range(n)]
+        with mock.patch.object(rs, "_concat_payloads", side_effect=lambda payloads, total: np.zeros(total, np.uint8)), \
+                mock.patch.object(batch_writer.pq, "ParquetWriter", FakeWriter):
+            _write_shard(self.tmp, "big", rows, rs.RESIDUE_CODES, batch=1, byte_budget=1 << 34)
+        table, = captured
+        column = table.column("residue_codes")
+        self.assertEqual(column.num_chunks, 1)
+        chunk = column.chunk(0)
+        self.assertEqual(chunk.type, pa.large_binary())
+        offsets = np.frombuffer(chunk.buffers()[1], dtype=np.int64)
+        self.assertEqual(int(offsets[-1]), n * size)
+        self.assertGreater(int(offsets[-1]), 2 ** 31)
+        self.assertTrue(np.array_equal(np.diff(offsets), np.full(n, size)))
+        chunk.validate(full=True)
+        self.assertEqual(table.num_rows, n)
+        with self.assertRaises((pa.ArrowCapacityError, pa.ArrowInvalid, OverflowError)):
+            pa.BinaryArray.from_buffers(pa.binary(), n, [None, pa.py_buffer(offsets.astype(np.int32)),
+                                                         chunk.buffers()[2]]).validate(full=True)
+
+    def test_a_writer_with_a_column_refuses_predictions_without_it(self):
+        rows = _rows(2)
+        writer = ParquetBatchWriter(self.tmp, "x", residue_output=rs.RESIDUE_CODES, system=SYSTEM)
+        for prediction in (_prediction(rows), _prediction(rows, rs.RESIDUE_CODES)[:3]):
+            with self.subTest(size=len(prediction)), self.assertRaises(ValueError):
+                writer.write_on_batch_end(_TRAINER, None, prediction, None, None, 0, 0)
+        embeddings, ids, payloads, digests = _prediction(rows, rs.RESIDUE_CODES)
+        for bad in ((embeddings, ids, payloads[:1], digests), (embeddings, ids, payloads, (b"x",) * 2)):
+            with self.assertRaises(ValueError):
+                writer.write_on_batch_end(_TRAINER, None, bad, None, None, 0, 0)
+        # ... and, at the start of the pass, a module that does not produce it
+        for produced in (None, rs.QUERY_ENCODING):
+            with self.subTest(produced=produced), self.assertRaises(ValueError):
+                writer.on_predict_start(_TRAINER, SimpleNamespace(residue_output=produced))
+        with self.assertRaises(ValueError):
+            writer.on_predict_start(_TRAINER, object())
+        writer.on_predict_start(_TRAINER, SimpleNamespace(residue_output=rs.RESIDUE_CODES))
+        # a plain writer takes any module
+        ParquetBatchWriter(self.tmp, "y").on_predict_start(_TRAINER, SimpleNamespace(residue_output=rs.RESIDUE_CODES))
+        writer.on_predict_end(_TRAINER, None)
+        self.assertFalse((self.tmp / "x-0.parquet").exists())
+
+    def test_a_plain_writer_drops_extra_tuple_elements(self):
+        rows = _rows(5)
+        plain = _write_shard(self.tmp, "two", rows)
+        writer = ParquetBatchWriter(self.tmp, "four")
+        writer.write_on_batch_end(_TRAINER, None, _prediction(rows, rs.QUERY_ENCODING), None, None, 0, 0)
+        writer.on_predict_end(_TRAINER, None)
+        self.assertTrue(pq.read_table(self.tmp / "four-0.parquet").equals(pq.read_table(plain)))
+
+    def test_constructor_refusals(self):
+        with self.assertRaises(ValueError):
+            ParquetBatchWriter(self.tmp, "x", residue_output=rs.RESIDUE_CODES)
+        with self.assertRaises(ValueError):
+            ParquetBatchWriter(self.tmp, "x", system=SYSTEM)
+        for kwargs in ({"min_res_n": 0}, {"esm_revision": "r"}):  # a plain shard keeps its legacy bytes
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ParquetBatchWriter(self.tmp, "x", **kwargs)
+        with self.assertRaises(ValueError):
+            ParquetBatchWriter(self.tmp, "x", residue_output="codes", system=SYSTEM)
+        with self.assertRaises(ValueError):
+            ParquetBatchWriter(self.tmp, "x", residue_output=rs.RESIDUE_CODES, system=SYSTEM, byte_budget=0)
+
+
+class InferenceShardsTest(_FakeEsm3Pass):
+    """predict() with a Parquet output: plain shards as before, residue shards with the columns."""
+
+    def test_shards(self):
+        items, codes_ref, q_ref, offsets = _f2c()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.predict(batch_size=2, out_format=OutFormat.parquet, out_folder=tmp, out_name="plain",
+                         return_predictions=False)
+            plain = pq.read_table(Path(tmp) / "plain-0.parquet")
+            self.assertEqual(plain.schema, rs.shard_schema(None))
+            for residue_output in rs.RESIDUE_OUTPUTS:
+                with self.subTest(residue_output=residue_output):
+                    self.predict(batch_size=2, out_format=OutFormat.parquet, out_folder=tmp, out_name=residue_output,
+                                 residue_output=residue_output, scoring_system=SYSTEM, return_predictions=False)
+                    table = pq.read_table(Path(tmp) / f"{residue_output}-0.parquet")
+                    self.assertEqual(table.schema, rs.shard_schema(residue_output, SYSTEM))
+                    self.assertTrue(table.select(["id", "embedding"]).equals(plain))
+                    # Lightning's start of the pass told the writer the device and the ranks.
+                    from foldmatch.utils.esm.loaders import ESM_REVISION
+                    record = _pass_record(Path(tmp) / f"{residue_output}-0.parquet")
+                    self.assertEqual({k: record[k] for k in ("min_res_n", "accelerator", "world_size",
+                                                             "esm_precision", "esm_revision")},
+                                     {"min_res_n": 0, "accelerator": "cpu", "world_size": 1, "esm_precision": "fp32",
+                                      "esm_revision": ESM_REVISION})
+                    data = b"".join(table.column(residue_output).to_pylist())
+                    if residue_output == rs.RESIDUE_CODES:
+                        self.assertEqual(data, codes_ref.tobytes())
+                    else:
+                        q = np.frombuffer(data, dtype="<f2").reshape(-1, 64)
+                        self.assertLessEqual(_row_ulps(q, q_ref), 1.0)
+                    self.assertEqual(table.column("seq_sha1").to_pylist(), [_sha1(s) for _, s, _ in items])
+
 if __name__ == "__main__":
     unittest.main()
