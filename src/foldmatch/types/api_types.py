@@ -95,6 +95,16 @@ class FormatMode(str, Enum):
     tsv = "tsv"                    # tab-separated with a header row
 
 
+class ScoringChoice(str, Enum):
+    """Stage-2 scoring of ``fm-search query sequences``: one scoring per query run, never both (D7, user
+    2026-10-13). ``blosum62`` is the default for now; which one becomes the default is decided before the release."""
+    blosum62 = "blosum62"    # biotite BLOSUM62 Smith-Waterman, BLAST-style statistics (the existing path)
+    esm_codes = "esm-codes"  # ESM3 residue codes, the system named in the database manifest (S1-S16)
+
+
+DEFAULT_SCORING = ScoringChoice.blosum62
+
+
 class SignificanceMode(str, Enum):
     """Scale used for Stage-2 bit scores, p-values and E-values."""
     default = "default"  # calibrated constants + finite-size correction; needs gaps 11/1
