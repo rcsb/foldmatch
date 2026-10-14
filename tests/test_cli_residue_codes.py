@@ -1,4 +1,4 @@
-"""P5.6: ``fm-search build sequences --residue-codes``.
+"""P5.6-P5.7: ``fm-search build sequences --residue-codes`` and ``fm-search build residue-codes --from-shards``.
 
 Most tests replace the ESM3 pass by a fake that writes the shard the real pass writes (same dataset, same writer)
 with the F2c reference codes for the fixture FASTA, so the command-line orchestration, the refusals and the code
@@ -6,12 +6,14 @@ store run without ESM3. ``RealEsm3CliTest`` runs the real CPU pass through the c
 with F2c (gate A4-xcpu). The bundle comes from the scoring-system registry (``esm_codes_bundle``: skipped only when
 offline and not cached).
 """
+import dataclasses
 import gc
 import hashlib
 import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,6 +43,8 @@ _LAUNCH_ENV = ("FOLDMATCH_RUN_ID", "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_RESTA
                "SLURM_NTASKS", "SLURM_STEP_NUM_TASKS", "RANK", "LOCAL_RANK", "NODE_RANK", "WORLD_SIZE")
 
 SYSTEM = ss.get(ss.DEFAULT_ESM_CODES)
+# Another encoding (a different target encoder): the shards of another system.
+OTHER_ENCODING = dataclasses.replace(SYSTEM, name="esm-codes-test-other", target_encoder_sha256="0" * 64)
 
 #: Plan section 8, P5.6: the help text of --residue-codes, verbatim.
 PLAN_HELP = ("Also compute 8-byte per-residue ESM3 codes in the same pass, enabling `query sequences --scoring "
@@ -481,11 +485,335 @@ class BuildTest(_WithBundle):
 
 
 # =====================================================================================================================
+# P5.7: build residue-codes --from-shards (fake ESM3 pass, real bundle)
+# =====================================================================================================================
+def _store_files(db_folder: Path, name: str = "db") -> dict:
+    return {p.name: _sha256(p) for p in sorted(db_folder.glob(f"{name}.rescodes.*"))}
+
+
+class FromShardsTest(_WithBundle):
+
+    def setUp(self):
+        super().setUp()
+        self.db = self.tmp / "db1"
+        result = self.build(self.db / "db", run_id="p57")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.manifest = ResidueCodeStore(self.db, "db").manifest()
+
+    def build(self, db, *extra, run_id, fasta=_FASTA, shards=None, **fake):
+        with launch_env(FOLDMATCH_RUN_ID=run_id), \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict", fake_chain_predict(**fake)):
+            return invoke(*_build_args(fasta, db, shards or self.shards, "--residue-codes", *extra))
+
+    def copy_database(self, name="db2") -> Path:
+        """The database of ``self.db`` without its code store, in a new folder."""
+        folder = self.tmp / name
+        folder.mkdir()
+        for suffix in _DB_SUFFIXES:
+            shutil.copyfile(self.db / f"db{suffix}", folder / f"db{suffix}")
+        return folder
+
+    def from_shards(self, folder, *extra, shards=None, name="db"):
+        with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")):
+            result = invoke("build", "residue-codes", folder, name, "--from-shards", shards or self.shards, *extra)
+        esm3.assert_not_called()
+        return result
+
+    def test_reproduces_the_direct_build(self):
+        folder = self.copy_database()
+        result = self.from_shards(folder)
+        self.assertEqual(result.exit_code, 0, result.output)
+        store = ResidueCodeStore(folder, "db")
+        manifest = store.check_compatible()
+        for key in ("bin_sha256", "entries_digest", "entries", "total_residues", "system_digest", "encoding_digest",
+                    "esm", "bundle", "nonstandard_entries"):
+            with self.subTest(key=key):
+                self.assertEqual(manifest[key], self.manifest[key])
+        self.assertEqual(store.bin_path.read_bytes(), ResidueCodeStore(self.db, "db").bin_path.read_bytes())
+        self.assertEqual(manifest["build"]["run_id"], "p57")
+        self.assertEqual((manifest["cross_checks"]["preflight_entries"], manifest["cross_checks"]["faiss_entries"]),
+                         (None, 2))
+        self.assertEqual([p.name for p in self.shards.iterdir()], ["emb_p57-0.parquet"])  # read, never changed
+        # The manifest describes the pass that computed the codes, as the direct build's does.
+        self.assertEqual(manifest["min_res_n"], self.manifest["min_res_n"])
+        self.assertEqual((manifest["build"]["from_shards"], self.manifest["build"]["from_shards"]), (True, False))
+        for key in set(manifest["build"]) - {"from_shards", "created_utc"}:
+            self.assertEqual(manifest["build"][key], self.manifest["build"][key], key)
+        self.assertEqual(manifest["build"]["accelerator"], "cpu")
+
+    def test_the_pass_is_described_whatever_rebuilds_the_store(self):
+        """The manifest's min_res_n and build block come from the shards: a store rebuilt from the shards of a
+        two-rank CUDA build with --min-res-n 100 says so (there is no --min-res-n to get wrong), not what the
+        rebuilding process runs on."""
+        shards = self.tmp / "cuda"
+        shards.mkdir()
+        db = self.tmp / "cuda_db"
+        result = self.build(db / "db", "--min-res-n", "100", run_id="gpu", shards=shards, ranks=2, device="cuda")
+        self.assertEqual(result.exit_code, 0, result.output)
+        direct = ResidueCodeStore(db, "db").manifest()
+        ResidueCodeStore(db, "db").remove()
+        with mock.patch("foldmatch.search.residue_shards._dist_version", return_value="9.9.9"), \
+                mock.patch("foldmatch.search.residue_code_store._dist_version", return_value="9.9.9"), \
+                mock.patch("platform.machine", return_value="other-machine"):
+            result = self.from_shards(db, shards=shards)
+        self.assertEqual(result.exit_code, 0, result.output)
+        rebuilt = ResidueCodeStore(db, "db").check_compatible()
+        self.assertEqual((rebuilt["min_res_n"], rebuilt["entries"]), (100, 1))
+        self.assertEqual((rebuilt["build"]["accelerator"], rebuilt["build"]["devices"],
+                          rebuilt["build"]["esm_precision"]), ("cuda", 2, "bf16-autocast"))
+        for key in set(rebuilt["build"]) - {"from_shards", "created_utc"}:
+            self.assertEqual(rebuilt["build"][key], direct["build"][key], key)
+        self.assertNotEqual(rebuilt["build"]["torch"], "9.9.9")
+        self.assertEqual((rebuilt["esm"], rebuilt["bin_sha256"]), (direct["esm"], direct["bin_sha256"]))
+
+    def test_shards_that_do_not_record_their_pass(self):
+        """Shards without a pass record (an earlier development build of the writer) are refused, not given a
+        guessed --min-res-n."""
+        import pyarrow.parquet as pq
+        from foldmatch.search.residue_shards import META_PASS
+        folder = self.copy_database()
+        old = self.tmp / "old"
+        old.mkdir()
+        table = pq.read_table(self.shards / "emb_p57-0.parquet")
+        meta = {k: v for k, v in table.schema.metadata.items() if k != META_PASS}
+        pq.write_table(table.replace_schema_metadata(meta), old / "emb_old-0.parquet")
+        message = self.refused(self.from_shards(folder, shards=old))
+        self.assertIn("do not record the --min-res-n", message)
+        self.assertEqual(_store_files(folder), {})
+
+    def test_a_complete_store_is_refused_unless_force(self):
+        before = _store_files(self.db)
+        self.assertIn("--force", self.refused(self.from_shards(self.db)))
+        self.assertEqual(_store_files(self.db), before)
+        result = self.from_shards(self.db, "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        manifest = ResidueCodeStore(self.db, "db").check_compatible()
+        self.assertEqual((manifest["bin_sha256"], manifest["entries_digest"]),
+                         (self.manifest["bin_sha256"], self.manifest["entries_digest"]))
+        self.assertEqual(sorted(_store_files(self.db)), ["db.rescodes.bin", "db.rescodes.idx", "db.rescodes.json"])
+
+    def test_force_keeps_the_store_when_the_new_codes_fail_validation(self):
+        """--force with shards that pass the footer and count checks but are not this database's (other ids, a
+        payload that is not whole codes, an empty payload): refused, and the valid store is untouched (review
+        finding: it used to be deleted before validation)."""
+        def short(name, sequence):
+            return _fake_codes(name, sequence).tobytes()[:-1] if name == "2uzi_A" else _fake_codes(name, sequence)
+
+        def empty(name, sequence):
+            return np.empty((0, 8), np.uint8) if name == "2uzi_A" else _fake_codes(name, sequence)
+
+        foreign = _write(self.tmp / "foreign.fasta", ">x\nACDEFGHIK\n>y\nLMNPQRST\n")  # 2 entries, other ids
+        cases = {
+            "other ids": ({"fasta": foreign}, "(a) 2 sequence-store entr(ies) have no residue codes"),
+            "a payload of 463 bytes": ({"payload": short}, "not a multiple of 8 bytes"),
+            "an empty payload": ({"payload": empty}, "(c) 1 entr(ies) have codes of another length"),
+        }
+        before = _store_files(self.db)
+        for k, (case, (fake, text)) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                shards = self.tmp / f"bad{k}"
+                shards.mkdir()
+                self.build(self.tmp / f"other{k}" / "db", run_id=f"bad{k}", shards=shards, **fake)
+                message = self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=shards), text)
+                self.assertEqual(_store_files(self.db), before)
+                if case != "a payload of 463 bytes":
+                    self.assertIn("existing residue-code store", message)
+
+    def test_the_faiss_count_is_checked_before_anything_is_written(self):
+        """A FAISS index with one entry less than the sequence store and the shards: refused by the count check
+        before create() runs, with --force too."""
+        import pickle
+        from foldmatch.search.residue_code_store import ResidueCodeStore as Store
+        folder = self.tmp / "dbf"
+        shutil.copytree(self.db, folder)
+        with open(folder / "db.metadata", "rb") as f:
+            meta = pickle.load(f)
+        meta["embedding_ids"] = meta["embedding_ids"][:-1]
+        with open(folder / "db.metadata", "wb") as f:
+            pickle.dump(meta, f)
+        before = _store_files(folder)
+        with mock.patch.object(Store, "create", side_effect=AssertionError("create() ran")) as create:
+            message = self.refused(self.from_shards(folder, "--force"))
+        create.assert_not_called()
+        self.assertIn("1 in its FAISS index", message)
+        self.assertIn("Nothing was changed", message)
+        self.assertEqual(_store_files(folder), before)
+
+    def test_unreadable_database_files_are_named(self):
+        folder = self.copy_database()
+        data = (folder / "db.metadata").read_bytes()
+        (folder / "db.metadata").write_bytes(data[: len(data) // 2])
+        message = self.refused(self.from_shards(folder), ValueError)
+        self.assertIn(f"{folder / 'db.metadata'} is not readable FAISS database metadata", message)
+        folder = self.copy_database("db3")
+        (folder / "db.sequences").write_bytes(b"not a database" * 100)
+        message = self.refused(self.from_shards(folder))
+        self.assertIn(f"{folder / 'db.sequences'} is not a readable sequence store", message)
+        self.assertEqual(_store_files(folder), {})
+
+    def test_an_io_error_is_a_refusal(self):
+        """A full disk while the new codes are written: one 'Error:' line (exit 1, D20) naming the cause, and the old
+        store untouched (--force)."""
+        import errno
+        full = OSError(errno.ENOSPC, "No space left on device", str(self.db / "db.rescodes.bin.tmp"))
+        with mock.patch("foldmatch.search.residue_code_store.ResidueCodeStore.create", side_effect=full):
+            message = self.assert_refused_and_unchanged(self.from_shards(self.db, "--force"), "No space left",
+                                                        cause=OSError)
+        self.assertIn("db.rescodes.bin.tmp", message)
+
+    def test_stray_files_in_the_shard_folder(self):
+        """A copy named emb_copy[1]-0.parquet is no shard of any run (its name is no run id) and is ignored; an
+        unreadable shard of another run is refused naming the file, and --run-id gets past it."""
+        shutil.copyfile(self.shards / "emb_p57-0.parquet", self.shards / "emb_copy[1]-0.parquet")
+        folder = self.copy_database()
+        result = self.from_shards(folder)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(ResidueCodeStore(folder, "db").manifest()["bin_sha256"], self.manifest["bin_sha256"])
+        (self.shards / "emb_zzz-0.parquet").write_bytes(b"")
+        folder = self.copy_database("db3")
+        message = self.refused(self.from_shards(folder))
+        self.assertIn(f"{(self.shards / 'emb_zzz-0.parquet').resolve()}: not a readable Parquet embedding shard",
+                      message)
+        self.assertIn("--run-id", message)
+        result = self.from_shards(folder, "--run-id", "p57")
+        self.assertEqual(result.exit_code, 0, result.output)
+
+    def test_a_partial_store_is_replaced(self):
+        folder = self.copy_database()
+        (folder / "db.rescodes.bin").write_bytes(b"stale")
+        result = self.from_shards(folder)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(ResidueCodeStore(folder, "db").manifest()["bin_sha256"], self.manifest["bin_sha256"])
+
+    def assert_refused_and_unchanged(self, result, *texts, cause=None):
+        """Refused before anything was written: with --force too, the existing store is untouched."""
+        message = self.refused(result, cause)
+        for text in texts:
+            self.assertIn(text, message)
+        self.assertEqual(ResidueCodeStore(self.db, "db").manifest(), self.manifest)
+        return message
+
+    def test_shards_of_another_encoding(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        self.assertEqual(self.build(self.tmp / "x" / "db", run_id="other", shards=other,
+                                    system=OTHER_ENCODING).exit_code, 1)  # the build itself refuses them
+        from foldmatch.search.residue_shards import ResidueShardError
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=other), "stale",
+                                          "encoding_digest", cause=ResidueShardError)
+
+    def test_counts_must_agree(self):
+        other = self.tmp / "other"
+        other.mkdir()
+        self.assertEqual(self.build(self.tmp / "x" / "db", "--min-res-n", "100", run_id="short",
+                                    shards=other).exit_code, 0)
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=other),
+                                          "hold 1 entries", "2 in its sequence store", "2 in its FAISS index",
+                                          "Nothing was changed")
+
+    def test_a_missing_rank(self):
+        """A rank's shard is missing: the shards hold fewer entries than the database."""
+        shards = self.tmp / "two"
+        shards.mkdir()
+        fasta = _write(self.tmp / "three.fasta", ">x\nACDEFGHIK\n>y\nLMNPQRST\n>z\nVWYACDEF\n")
+        result = self.build(self.tmp / "three" / "db", fasta=fasta, run_id="two", shards=shards, ranks=2)
+        self.assertEqual(result.exit_code, 0, result.output)
+        manifest = ResidueCodeStore(self.tmp / "three", "db").manifest()
+        self.assertEqual((manifest["entries"], manifest["build"]["devices"]), (3, 2))
+        (shards / "emb_two-1.parquet").unlink()
+        message = self.refused(self.from_shards(self.tmp / "three", "--force", shards=shards))
+        self.assertIn("1 shard(s) of run two", message)
+        self.assertIn("hold 2 entries", message)
+        self.assertIn("a rank's shard is missing", message)
+        self.assertEqual(ResidueCodeStore(self.tmp / "three", "db").manifest(), manifest)
+
+    def test_an_extra_shard(self):
+        """A shard of another run with the same id mixed in: more entries than the database."""
+        other = self.tmp / "other"
+        other.mkdir()
+        fasta = _write(self.tmp / "one.fasta", ">x\nACDEFGHIK\n")
+        self.assertEqual(self.build(self.tmp / "y" / "db", fasta=fasta, run_id="p57", shards=other).exit_code, 0)
+        shutil.copyfile(self.shards / "emb_p57-0.parquet", other / "emb_p57-1.parquet")
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=other),
+                                          "2 shard(s) of run p57", "hold 3 entries")
+
+    def test_shards_without_codes(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        with launch_env(FOLDMATCH_RUN_ID="plain"), \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict", fake_chain_predict()):
+            self.assertEqual(invoke(*_build_args(_FASTA, self.tmp / "p" / "db", plain)).exit_code, 0)
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=plain),
+                                          "hold residue codes", "plain")
+        from foldmatch.search.residue_shards import ResidueShardError
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", "--run-id", "plain", shards=plain),
+                                          "without --residue-codes", cause=ResidueShardError)
+
+    def test_no_shards(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", shards=empty), "No embedding shards",
+                                          "--cleanup-embeddings")
+
+    def test_several_runs_need_a_run_id(self):
+        self.assertEqual(self.build(self.tmp / "z" / "db", run_id="p57-1").exit_code, 0)
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force"), "2 runs", "p57 (1 shard(s))",
+                                          "p57-1 (1 shard(s))", "--run-id")
+        for run_id in ("p57", "p57-1"):
+            with self.subTest(run_id=run_id):
+                folder = self.copy_database(f"db_{run_id}")
+                result = self.from_shards(folder, "--run-id", run_id)
+                self.assertEqual(result.exit_code, 0, result.output)
+                manifest = ResidueCodeStore(folder, "db").manifest()
+                self.assertEqual(manifest["build"]["run_id"], run_id)
+                self.assertEqual(manifest["bin_sha256"], self.manifest["bin_sha256"])
+        self.assert_refused_and_unchanged(self.from_shards(self.db, "--force", "--run-id", "p5"),
+                                          "No embedding shards of run p5", "p57, p57-1")
+
+    def test_the_database_must_be_a_sequence_database(self):
+        folder = self.copy_database()
+        (folder / "db.sequences").unlink()
+        self.assertIn("no sequence store", self.refused(self.from_shards(folder)))
+        folder = self.copy_database("db3")
+        (folder / "db.index").unlink()
+        self.assertIn("Database files not found", self.refused(self.from_shards(folder), ValueError))
+        self.assertEqual(_store_files(folder), {})
+
+    def test_flag_refusals_exit_2(self):
+        self.usage_error(self.from_shards(self.db, name="a/db"), "not a database name")
+        self.usage_error(self.from_shards(self.db, "--run-id", "a b"), "is not a run id")
+        self.usage_error(self.from_shards(self.db, "--min-res-n", "0"), "No such option")  # it comes from the shards
+        self.usage_error(invoke("build", "residue-codes", self.db, "db"), "--from-shards")
+        self.usage_error(invoke("build", "residue-codes", self.tmp / "nope", "db", "--from-shards", self.shards),
+                         "does not exist")
+        self.assertEqual(ResidueCodeStore(self.db, "db").manifest(), self.manifest)
+
+    def test_shard_order_is_the_builds(self):
+        """--from-shards reads a run's shards in the order the build does (sorted by path, so rank 10 before 2)."""
+        from foldmatch.search.embedding_computer import EmbeddingComputer, run_shard_files, shard_run_ids
+        folder = self.tmp / "many"
+        folder.mkdir()
+        for rank in range(12):
+            (folder / f"emb_r-1-{rank}.parquet").touch()
+        (folder / "emb_r-0.parquet").touch()
+        (folder / "emb_r-1-x.parquet").touch()
+        (folder / "emb_r[1]-0.parquet").touch()  # not a run id: no run's shard
+        with launch_env(FOLDMATCH_RUN_ID="r-1"):
+            self.assertEqual(EmbeddingComputer(folder).shard_files(), run_shard_files(folder, "r-1"))
+        self.assertEqual([p.name for p in run_shard_files(folder, "r-1")][:4],
+                         ["emb_r-1-0.parquet", "emb_r-1-1.parquet", "emb_r-1-10.parquet", "emb_r-1-11.parquet"])
+        self.assertEqual(len(run_shard_files(folder, "r-1")), 12)
+        self.assertEqual([p.name for p in run_shard_files(folder, "r")], ["emb_r-0.parquet"])
+        self.assertEqual(shard_run_ids(folder), ["r", "r-1"])
+        self.assertEqual([p.name for p in run_shard_files(folder, "r[1]")], ["emb_r[1]-0.parquet"])  # escaped glob
+
+
+# =====================================================================================================================
 # real ESM3 through the command line (CPU)
 # =====================================================================================================================
 class RealEsm3CliTest(unittest.TestCase):
     """``fm-search build sequences --residue-codes`` on ``test_sequences.fasta`` with the real CPU pass: the manifest,
-    the codes against F2c (A4-xcpu), and the plain build's files."""
+    the codes against F2c (A4-xcpu), the plain build's files, and --from-shards."""
 
     @classmethod
     def setUpClass(cls):
@@ -534,6 +862,20 @@ class RealEsm3CliTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.tmp / "plain").iterdir()),
                          ["db.index", "db.metadata", "db.sequences"])
 
+    def test_from_shards_reproduces_the_direct_build(self):
+        folder = self.tmp / "rebuilt"
+        folder.mkdir()
+        for suffix in _DB_SUFFIXES:
+            shutil.copyfile(self.tmp / "codes" / f"db{suffix}", folder / f"db{suffix}")
+        with _esm3_spy() as esm3:
+            result = invoke("build", "residue-codes", folder, "db", "--from-shards", self.shards)
+        self.assertEqual(result.exit_code, 0, result.output)
+        esm3.assert_not_called()
+        direct = ResidueCodeStore(self.tmp / "codes", "db").manifest()
+        rebuilt = ResidueCodeStore(folder, "db").check_compatible()
+        self.assertEqual((rebuilt["bin_sha256"], rebuilt["entries_digest"]),
+                         (direct["bin_sha256"], direct["entries_digest"]))
+        self.assertEqual(rebuilt["build"]["run_id"], "real-codes")
 
 
 _TWO_RANK_CHILD_ENV = "FOLDMATCH_TEST_PREPARE_LOG"

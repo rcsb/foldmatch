@@ -42,6 +42,11 @@ _SLURM_MAX_NORMAL_STEP_ID = 0xFFFFFFF0
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
+def is_run_id(value) -> bool:
+    """Whether ``value`` is a well-formed run id (what :func:`run_id` accepts in ``FOLDMATCH_RUN_ID``)."""
+    return isinstance(value, str) and _RUN_ID_RE.fullmatch(value) is not None
+
+
 def _env_int(name: str) -> Optional[int]:
     value = os.environ.get(name, "").strip()
     return int(value) if value else None

@@ -91,6 +91,12 @@ _RESIDUE_CODES_HELP = (
     "Sequence (FASTA) databases only."
 )
 
+_FROM_SHARDS_HELP = (
+    "Folder holding the embedding shards that this database's 'build sequences "
+    "--residue-codes' run kept (its --tmp-embedding-folder; a build keeps them "
+    "unless --cleanup-embeddings)."
+)
+
 
 @build_db_app.command(
     name="structures",
@@ -432,6 +438,80 @@ def build_database_from_fasta(
         )
     if cleanup_embeddings:
         embedding_computer.remove_shards()
+
+
+@build_db_app.command(
+    name="residue-codes",
+    help="Build the residue-code store of a sequence database from the embedding "
+         "shards its 'build sequences --residue-codes' run kept, without running "
+         "ESM3 again, and validate it against the database. DB_FOLDER and "
+         "INDEX_NAME name the database (its --output-db was DB_FOLDER/INDEX_NAME)."
+)
+def build_residue_codes(
+        db_folder: Annotated[Path, typer.Argument(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help='Folder of the database.'
+        )],
+        index_name: Annotated[str, typer.Argument(
+            help='Name of the database in DB_FOLDER: its files are '
+                 'INDEX_NAME.index, INDEX_NAME.sequences, ...'
+        )],
+        from_shards: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_FROM_SHARDS_HELP
+        )],
+        run_id: Annotated[Optional[str], typer.Option(
+            help='Run id of the build whose shards to use '
+                 '(emb_<run id>-<rank>.parquet). Needed only when the folder '
+                 'holds the residue-code shards of more than one run.'
+        )] = None,
+        force: Annotated[bool, typer.Option(
+            "--force/--no-force",
+            help='Replace the residue-code store if the database already has '
+                 'one. The new codes are written aside and replace the old '
+                 'store only once they have passed validation, so a refused '
+                 'rebuild leaves it as it was (the rebuild needs room for both '
+                 'meanwhile).'
+        )] = False,
+        load_batch_size: Annotated[int, typer.Option(
+            min=1,
+            help='Number of entries read from the shards per batch.'
+        )] = 32768,
+        log_level: Annotated[LogLevel, typer.Option(
+            help='Logging level.'
+        )] = LogLevel.info
+):
+    """Build a sequence database's residue-code store from kept build shards (no ESM3)."""
+
+    set_log_level(log_level)
+    # Flag refusals (D20: exit 2), before anything is read.
+    if not index_name or index_name in (".", "..") or Path(index_name).name != index_name:
+        raise typer.BadParameter(
+            f"{index_name!r} is not a database name: INDEX_NAME is the name of the "
+            f"database's files in DB_FOLDER, without a folder.", param_hint="INDEX_NAME"
+        )
+    from foldmatch.utils.dist import is_run_id
+    if run_id is not None and not is_run_id(run_id):
+        raise typer.BadParameter(
+            f"{run_id!r} is not a run id: letters, digits, '.', '_' and '-' only, "
+            f"starting with a letter or digit.", param_hint="--run-id"
+        )
+    with _refusals():
+        manifest = _residue_codes_from_shards(
+            db_folder, index_name, from_shards, run_id=run_id, force=force,
+            load_batch_size=load_batch_size,
+        )
+    logging.info(
+        f"Residue-code store of {db_folder / index_name} built from the shards of run "
+        f"{manifest['build']['run_id']}: {manifest['entries']} entries, "
+        f"{manifest['total_residues']} residues."
+    )
 
 
 @query_db_app.command(
@@ -1356,6 +1436,122 @@ def _build_residue_code_store(embedding_computer, embedding_db, sequence_store, 
         f"{manifest['total_residues']} residues, system {manifest['system_name']})"
     )
     return manifest
+
+
+def _residue_codes_from_shards(db_folder: Path, index_name: str, shards_folder: Path, *, run_id: Optional[str],
+                               force: bool, load_batch_size: int):
+    """``build residue-codes --from-shards``: the residue-code store of a database from a run's kept shards.
+
+    Refused before anything is written: a database without a sequence store or
+    FAISS files, or whose files cannot be read; a complete code store unless
+    ``force``; no shards, or the shards of several runs without ``run_id``;
+    shards without residue codes, mixed shards or another encoding than the
+    default system's (:func:`~foldmatch.search.residue_shards.check_shards`);
+    shards that do not record their pass's ``--min-res-n``; an entry count
+    that differs between the shards, the sequence store and the FAISS index.
+    Then ``create`` and ``validate`` without a pre-flight; an old store (with
+    ``force``) is replaced only once the new codes have passed validation. The
+    manifest's ``min_res_n`` and ``build`` block come from the shards' pass
+    record, so they describe the ESM3 pass that computed the codes. Returns
+    the manifest.
+    """
+    import pyarrow.parquet as pq
+    from foldmatch.search import scoring_system
+    from foldmatch.search.faiss_database import FaissEmbeddingDatabase
+    from foldmatch.search.residue_code_store import ResidueCodeStore
+    from foldmatch.search.residue_shards import RESIDUE_CODES, check_shards, iter_residue_codes
+    from foldmatch.search.sequence_store import SequenceStore
+
+    database = db_folder / index_name
+    sequence_store = SequenceStore(db_folder, index_name)
+    if not sequence_store.exists():
+        raise RefusalError(
+            f"{database} has no sequence store ({sequence_store.path}): residue codes are "
+            f"only built for sequence databases ('fm-search build sequences')."
+        )
+    try:
+        entry_count = sequence_store.meta()["entry_count"]
+    except sqlite3.DatabaseError as exc:
+        raise RefusalError(f"{sequence_store.path} is not a readable sequence store ({exc}).") from exc
+    faiss_entries = FaissEmbeddingDatabase(db_folder, index_name).saved_entry_count()
+    code_store = ResidueCodeStore(db_folder, index_name)
+    if code_store.exists() and not force:
+        raise RefusalError(
+            f"{database} already has a residue-code store ({code_store.manifest_path}). "
+            f"Pass --force to replace it."
+        )
+    system = scoring_system.get(scoring_system.DEFAULT_ESM_CODES)
+    run_id, shards = _residue_code_shards(shards_folder, run_id)
+    # Every shard's footer is checked here, before any data and before anything is written.
+    infos = check_shards(shards, RESIDUE_CODES, system)
+    rows = sum(pq.read_metadata(path).num_rows for path in shards)
+    if not rows == entry_count == faiss_entries:
+        raise RefusalError(
+            f"The {len(shards)} shard(s) of run {run_id} in {shards_folder} hold {rows} entries, "
+            f"but {database} has {entry_count} in its sequence store and {faiss_entries} in its "
+            f"FAISS index: they are not this database's build shards, or a rank's shard is "
+            f"missing. Nothing was changed."
+        )
+    record, build = _code_store_build(run_id, infos, from_shards=True)
+    if not isinstance(record["min_res_n"], int):
+        raise RefusalError(
+            f"The shards of run {run_id} in {shards_folder} do not record the --min-res-n of the "
+            f"build that wrote them (written by an earlier FoldMatch). Rebuild the database with "
+            f"'fm-search build sequences --residue-codes'. Nothing was changed."
+        )
+    logging.info(f"Building the residue-code store of {database} from {len(shards)} shard(s) of run {run_id}")
+    code_store.create(iter_residue_codes(shards, system, load_batch_size), system, force=force,
+                      min_res_n=record["min_res_n"], build=build, esm_revision=record["esm_revision"])
+    return code_store.validate(sequence_store, faiss_entries, preflight=None)
+
+
+def _residue_code_shards(folder: Path, run_id: Optional[str]):
+    """``(run id, shard paths)`` of the residue-code shards in ``folder`` (paths in the order a build reads them).
+
+    With ``run_id``, that run's shards. Without, the only run whose shards
+    hold residue codes; none, or several, are refused.
+    """
+    from foldmatch.search.embedding_computer import run_shard_files, shard_run_ids
+    from foldmatch.search.residue_shards import RESIDUE_CODES, read_shard_info
+    if run_id is not None:
+        shards = run_shard_files(folder, run_id)
+        if not shards:
+            runs = shard_run_ids(folder)
+            raise RefusalError(
+                f"No embedding shards of run {run_id} (emb_{run_id}-<rank>.parquet) in {folder}; "
+                f"it holds shards of the run(s): {', '.join(runs) if runs else 'none'}."
+            )
+        return run_id, shards
+    runs = {rid: run_shard_files(folder, rid) for rid in shard_run_ids(folder)}
+    if not runs:
+        raise RefusalError(
+            f"No embedding shards (emb_<run id>-<rank>.parquet) in {folder}. A build keeps "
+            f"them in its --tmp-embedding-folder unless --cleanup-embeddings."
+        )
+    with_codes = {}
+    for rid, paths in runs.items():
+        try:
+            info = read_shard_info(paths[0])
+        except ValueError as exc:
+            raise RefusalError(
+                f"{exc}. Pass --run-id to choose the run that built this database, or remove "
+                f"the file if it is not a shard."
+            ) from exc
+        if info.residue_output == RESIDUE_CODES:
+            with_codes[rid] = paths
+    if not with_codes:
+        raise RefusalError(
+            f"None of the embedding shards in {folder} hold residue codes (run(s) "
+            f"{', '.join(runs)}): they come from a build without --residue-codes. Rebuild the "
+            f"database with 'fm-search build sequences --residue-codes'."
+        )
+    if len(with_codes) > 1:
+        listed = ", ".join(f"{rid} ({len(paths)} shard(s))" for rid, paths in with_codes.items())
+        raise RefusalError(
+            f"{folder} holds the residue-code shards of {len(with_codes)} runs: {listed}. "
+            f"Pass --run-id to choose the run that built this database."
+        )
+    return next(iter(with_codes.items()))
 
 
 def _check_stage2_stores(subject_store, max_evalue: Optional[float], query_store=None) -> None:

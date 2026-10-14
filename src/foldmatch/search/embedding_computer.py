@@ -1,3 +1,4 @@
+import glob
 import logging
 import re
 from pathlib import Path
@@ -17,10 +18,43 @@ from foldmatch.types.api_types import (
 )
 from foldmatch.search.query_encodings import QueryEncodingIndex
 from foldmatch.search.residue_shards import ResidueCodeBatch, check_residue_output, iter_residue_codes
-from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, run_id
+from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, is_run_id, run_id
 from foldmatch.utils.sequence import FastaPreflight, preflight_fasta
 
 logger = logging.getLogger(__name__)
+
+# A run's shards are {embedding folder}/emb_{run id}-{rank}.parquet. Run ids may contain '-' (utils.dist), so the
+# rank is the last '-'-separated field.
+_SHARD_PREFIX = "emb_"
+_ANY_SHARD = re.compile(rf"{_SHARD_PREFIX}(?P<run_id>.+)-\d+\.parquet")
+
+
+def run_shard_files(folder: Path, run_id: str) -> list[Path]:
+    """The shards of run ``run_id`` in ``folder``, in the order rank 0 reads them (sorted by path).
+
+    The glob is narrowed by an exact match, so a run whose id merely starts
+    with this one (``abc`` vs ``abc-1``) is never picked up. The id is
+    escaped in the glob: run ids hold no glob metacharacters
+    (:func:`foldmatch.utils.dist.run_id`), but a name found in a folder may.
+    """
+    out_name = f"{_SHARD_PREFIX}{run_id}"
+    shard_name = re.compile(rf"{re.escape(out_name)}-\d+\.parquet")
+    return sorted(
+        path for path in Path(folder).glob(f"{glob.escape(out_name)}-*.parquet")
+        if shard_name.fullmatch(path.name)
+    )
+
+
+def shard_run_ids(folder: Path) -> list[str]:
+    """The run ids of every shard in ``folder``, sorted. Read-only, file names only.
+
+    Only well-formed run ids (:func:`foldmatch.utils.dist.is_run_id`) count:
+    a file such as ``emb_copy[1]-0.parquet`` is not a shard of any run.
+    """
+    names = (path.name for path in Path(folder).glob(f"{_SHARD_PREFIX}*.parquet"))
+    return sorted({match["run_id"] for match in map(_ANY_SHARD.fullmatch, names)
+                   if match and is_run_id(match["run_id"])})
+
 
 class EmbeddingComputer:
     """Compute chain or assembly embeddings via a residue->chain inference pipeline.
@@ -42,7 +76,7 @@ class EmbeddingComputer:
         self.embedding_folder = embedding_folder
         # Raises on a rank > 0 that was given no id to share, before any model loads.
         self.run_id = run_id()
-        self.out_name = f"emb_{self.run_id}"
+        self.out_name = f"{_SHARD_PREFIX}{self.run_id}"
         # Number of embeddings rank 0 must find in the shards; known for FASTA input.
         self.expected_count: Optional[int] = None
 
@@ -189,16 +223,8 @@ class EmbeddingComputer:
         _wait_for_every_rank()
 
     def shard_files(self) -> list[Path]:
-        """This run's per-rank Parquet shards, ``emb_{run_id}-{rank}.parquet``.
-
-        The glob is narrowed by an exact match, so a run whose id merely starts
-        with this one (``abc`` vs ``abc-1``) is never picked up.
-        """
-        shard_name = re.compile(rf"{re.escape(self.out_name)}-\d+\.parquet")
-        return sorted(
-            path for path in Path(self.embedding_folder).glob(f"{self.out_name}-*.parquet")
-            if shard_name.fullmatch(path.name)
-        )
+        """This run's per-rank Parquet shards, ``emb_{run_id}-{rank}.parquet`` (:func:`run_shard_files`)."""
+        return run_shard_files(self.embedding_folder, self.run_id)
 
     def refuse_existing_shards(self) -> None:
         """Raise ``FileExistsError`` if shards with this run id already exist. Read-only.

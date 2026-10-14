@@ -292,6 +292,24 @@ class FaissEmbeddingDatabase:
         if use_gpu:
             self.move_to_gpu()
 
+    def saved_entry_count(self) -> int:
+        """Number of embeddings in the database on disk, from its metadata file; the index itself is not read.
+
+        Raises ``ValueError`` if the database files do not exist, as :meth:`load_database` does, or if the
+        metadata file is not readable FAISS metadata (truncated, or another file), naming it.
+        """
+        index_file = self.db_folder / f"{self.index_name}.index"
+        metadata_file = self.db_folder / f"{self.index_name}.metadata"
+        if not index_file.exists() or not metadata_file.exists():
+            raise ValueError(f"Database files not found in: {self.db_folder}")
+        try:
+            with open(metadata_file, 'rb') as f:
+                return len(pickle.load(f)['embedding_ids'])
+        except Exception as e:  # unpickling a damaged file can raise almost anything
+            raise ValueError(
+                f"{metadata_file} is not readable FAISS database metadata ({type(e).__name__}: {e})"
+            ) from e
+
     def set_nprobe(self, nprobe: int) -> None:
         """Override the search-time ``nprobe`` for IVF-family indexes.
 
