@@ -34,19 +34,24 @@ While the major version is `0`, breaking changes are released in a minor bump.
   build sequences`: deletes the build's intermediate embedding shards from
   `--tmp-embedding-folder` once the database is built. Off by default, so the
   shards are kept as before.
-- **Groundwork for ESM3 residue-code scoring (not usable yet).** Two building
+- **Groundwork for ESM3 residue-code scoring (not usable yet).** Building
   blocks of the coming opt-in Stage-2 scoring `esm-codes-v1`, an alternative
   to BLOSUM62: the residue-code encoders
   (`foldmatch.model.residue_code_encoder`), which turn ESM3 per-residue
   embeddings into 8-byte residue codes and query encodings with the files of
-  the Hugging Face repo `rcsb/foldmatch-esm-codes`, and a native C
-  Smith-Waterman kernel with its Python wrapper (`foldmatch.search.swkern`).
-  No command or option uses them yet: the residue-code database build
-  (`fm-search build sequences --residue-codes`) and query scoring (`fm-search
-  query sequences --scoring esm-codes`) come in later changes, and existing
-  commands, BLOSUM62 scoring and its output are unchanged. `python -m
-  foldmatch.search.swkern` runs the kernel's self-test (reference hash and
-  the BLAS similarity path) and prints a JSON report.
+  the Hugging Face repo `rcsb/foldmatch-esm-codes`; a native C
+  Smith-Waterman kernel with its Python wrapper (`foldmatch.search.swkern`);
+  and the versioned scoring system (`foldmatch.search.scoring_system`), a
+  frozen registry entry `esm-codes-v1` that names every number and
+  convention behind the scores, including the bundle's repo, pinned revision
+  and file sha256s (about 26 MB), with its E-value statistics
+  (`foldmatch.search.code_statistics`). A changed value will always be a new
+  system name. No command or option uses them yet: the residue-code database
+  build (`fm-search build sequences --residue-codes`) and query scoring
+  (`fm-search query sequences --scoring esm-codes`) come in later changes,
+  and existing commands, BLOSUM62 scoring and its output are unchanged.
+  `python -m foldmatch.search.swkern` runs the kernel's self-test (reference
+  hash and the BLAS similarity path) and prints a JSON report.
 
 ### Changed
 
@@ -180,6 +185,16 @@ While the major version is `0`, breaking changes are released in a minor bump.
   an error instead; CI, the release wheels and the Docker image do. In a
   source checkout, rebuild the kernel after editing its C source with `python
   -m foldmatch._native.build`; a library built from other source is refused.
+- **`download-models` also fetches the esm-codes scoring bundle.** `fm-embedding
+  download-models` and `inference download-models` now download, besides ESM3
+  and the aggregator, the bundle of every registered esm-codes scoring system
+  (one, about 26 MB, from `rcsb/foldmatch-esm-codes` at the revision pinned in
+  FoldMatch) and check the sha256 of every file. `--system NAME` (repeatable)
+  limits this to the named systems; an unknown name is refused before any
+  download. A cached bundle file whose sha256 differs (a truncated or
+  corrupted download) is downloaded again. The files go into the Hugging Face
+  cache like the models, so later runs work with `HF_HUB_OFFLINE=1` and from
+  a read-only cache; nothing else is written there.
 - **Docker image.** The image is built with a regular (non-editable) install
   that must compile the kernel, runs the kernel self-test at build time and
   again in the compiler-free runtime stage, and no longer copies the source
