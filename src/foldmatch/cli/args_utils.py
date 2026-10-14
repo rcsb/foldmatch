@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+from pathlib import Path
 
 from foldmatch.types.api_types import LogLevel
 
@@ -53,3 +54,30 @@ def set_log_level(level: LogLevel):
             '> %(asctime)s - [proc-%(rank)s] - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
         ))
         logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
+
+
+DOWNLOAD_MODELS_SYSTEM_HELP = (
+    "Fetch only this esm-codes scoring system's bundle (repeatable). Default: the bundles of every registered "
+    "system. ESM3 and the aggregator are always fetched.")
+
+
+def download_models_command(systems=None):
+    """The ``download-models`` commands: ESM3, the aggregator and the esm-codes bundles of every registered system
+    (or of ``systems``), into the Hugging Face cache, sha256-verified, so later runs work with ``HF_HUB_OFFLINE=1``.
+    Unknown system names are refused before anything is downloaded."""
+    import typer
+    from foldmatch.search import scoring_system
+    from foldmatch.utils import model
+    known = scoring_system.known_names()
+    names = list(dict.fromkeys(systems)) if systems else list(known)
+    for name in names:
+        if name not in known:
+            raise typer.BadParameter(f"unknown esm-codes scoring system {name!r}; this FoldMatch knows: "
+                                     f"{', '.join(known) or 'none'}", param_hint="--system")
+    model.get_residue_model()
+    model.get_aggregator_model()
+    for name, files in model.download_esm_codes_bundles(names).items():
+        s = scoring_system.get(name)
+        folder = Path(files[scoring_system.BUNDLE_JSON]).parent
+        typer.echo(f"esm-codes bundle {name}: {s.bundle_repo}@{s.bundle_revision}, {len(files)} files, sha256 "
+                   f"verified, in {folder}")

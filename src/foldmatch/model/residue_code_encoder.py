@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import os
 from typing import Optional
 
@@ -34,8 +33,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from foldmatch.utils import tensor_digest as _digest
+from foldmatch.utils.tensor_digest import DIGEST_METHOD  # noqa: F401  (public: bundle.json content_digests.method)
+
 ENCODERS_FORMAT = "foldmatch-esm-codes-encoders/1"
-DIGEST_METHOD = "foldmatch-tensor-digest/1"
 CODE_BITS = 64
 CODE_BYTES = CODE_BITS // 8
 STATE_KEYS = ("lin.weight", "lin.bias", "fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias")
@@ -268,23 +269,12 @@ class ResidueCodeHead(nn.Module):
 # Loading
 # =====================================================================================================================
 def tensor_digest(named) -> str:
-    """``foldmatch-tensor-digest/1``: sha256 over the ASCII tag and a newline, then, for every name in sorted order, an
-    8-byte little-endian length and the compact sorted-key JSON ``{"dtype", "name", "shape"}`` (numpy dtype string,
+    """``foldmatch-tensor-digest/1`` (:func:`foldmatch.utils.tensor_digest.tensor_digest`) of torch tensors and / or
+    numpy arrays: sha256 over the ASCII tag and a newline, then, for every name in sorted order, an 8-byte
+    little-endian length and the compact sorted-key JSON ``{"dtype", "name", "shape"}`` (numpy dtype string,
     little-endian), and an 8-byte little-endian length and the raw C-order little-endian bytes."""
-    h = hashlib.sha256(DIGEST_METHOD.encode() + b"\n")
-    for name in sorted(named):
-        value = named[name]
-        a = value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
-        a = np.ascontiguousarray(a)
-        a = a.astype(a.dtype.newbyteorder("<"), copy=False)
-        head = json.dumps({"dtype": a.dtype.str, "name": name, "shape": list(a.shape)}, sort_keys=True,
-                          separators=(",", ":")).encode()
-        raw = a.tobytes(order="C")
-        h.update(len(head).to_bytes(8, "little"))
-        h.update(head)
-        h.update(len(raw).to_bytes(8, "little"))
-        h.update(raw)
-    return h.hexdigest()
+    return _digest.tensor_digest({name: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value
+                                  for name, value in named.items()})
 
 
 def _sha256_file(path) -> str:

@@ -5,6 +5,11 @@ embedding tap, the encoders and transform (by content digest), the code layout, 
 the E-value table and its rules, the calibrated domain, and the Hugging Face bundle (repo, revision and file sha256s)
 that holds the weights, the panel and the table. It is pure metadata: no torch, no numpy and no I/O.
 
+:func:`prepare` turns a system into a :class:`PreparedSystem`: it fetches the bundle from the registry pin
+(:func:`foldmatch.utils.model.get_esm_codes_bundle`, sha256-verified) and refuses it unless ``bundle.json`` and the
+scoring npz agree with the system exactly. :meth:`PreparedSystem.for_worker` gives Stage-2 workers a picklable
+:class:`WorkerSpec` (paths and scalars). Importing this module loads neither torch nor numpy.
+
 Principles (plan section 1):
 
 * **Versioned.** Registry entries are immutable. Any change, even a statistics-only one, is a new system name (D17);
@@ -27,6 +32,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Tuple
 
@@ -48,6 +54,20 @@ TABLE_SIZE = 6
 
 class UnknownScoringSystemError(ValueError):
     """No registry entry has this name (for a database: it was built by a newer FoldMatch)."""
+
+
+class BundleUnavailableError(ValueError):
+    """A bundle file is neither in the Hugging Face cache nor downloadable (offline mode, Hub unreachable)."""
+
+
+class BundleMismatchError(ValueError):
+    """The bundle does not match its registry entry: a file sha256, a ``bundle.json`` / ``meta_json`` field, the
+    panel or the table differs, or a file is missing at the pinned revision. Never worked around."""
+
+
+def is_commit(revision) -> bool:
+    """A full 40-hex lowercase commit hash (what every bundle revision must be)."""
+    return isinstance(revision, str) and _COMMIT_HEX.fullmatch(revision) is not None
 
 
 # =====================================================================================================================
@@ -425,3 +445,411 @@ def get(name: str) -> EsmCodesSystem:
             f"unknown esm-codes scoring system {name!r}; this FoldMatch knows: {known}. A database built by a newer "
             "FoldMatch needs a FoldMatch upgrade.")
     return system
+
+
+def registered(system: EsmCodesSystem) -> EsmCodesSystem:
+    """``system``, refused unless it is exactly this FoldMatch's registry entry of its name.
+
+    A system that comes from elsewhere (parsed from a database manifest, say) and differs from the entry of its name
+    in any value, the bundle repo, revision and file sha256s included, is not that system: nothing is fetched or run
+    for it. :class:`UnknownScoringSystemError` names the differing fields (or lists the known names)."""
+    if not isinstance(system, EsmCodesSystem):
+        raise TypeError(f"expected an EsmCodesSystem, got {type(system).__name__}")
+    entry = get(system.name)
+    if entry != system:
+        diff = [f.name for f in dataclasses.fields(EsmCodesSystem) if getattr(entry, f.name) != getattr(system, f.name)]
+        raise UnknownScoringSystemError(
+            f"this {system.name} differs from this FoldMatch's registry entry {system.name} in {diff}: only the "
+            "registered system is used, exactly as registered (any change is a new system name)")
+    return system
+
+
+# =====================================================================================================================
+# what this FoldMatch implements
+# =====================================================================================================================
+class UnsupportedSystemError(ValueError):
+    """The system names a method this FoldMatch does not implement (a newer DP, rule or encoding)."""
+
+
+BUNDLE_FORMAT = "foldmatch-esm-codes-bundle/1"
+ENCODERS_FORMAT = "foldmatch-esm-codes-encoders/1"      # = foldmatch.model.residue_code_encoder.ENCODERS_FORMAT
+SCORING_FORMAT = "foldmatch-esm-codes-scoring/1"
+
+#: Method values hard-coded by this FoldMatch's encoder module, kernel (fmsw/1) and statistics. A system naming
+#: anything else is refused by :func:`check_implemented`, never run with this code's arithmetic.
+IMPLEMENTED = MappingProxyType({
+    "embedding_tap": "per_residue_embedding",
+    "input_normalisation": "ascii_upper_nows_v1",
+    "input_cast": "float16",
+    "transform_output_cast": "float16",
+    "code_bits": 64,
+    "code_bytes": 8,
+    "bitorder": "big",
+    "sign_rule": "bit_k = (h_k >= 0)",
+    "encoder_architecture": "esm-codes-mlp-v1",     # = a residue_code_encoder.ARCHITECTURES key
+    "encoder_dtype": "float32",                     # = residue_code_encoder.IMPLEMENTED_CONVENTIONS encoder.dtype
+    "query_dtype": "float16",
+    "query_prep": "fp64_seq_k_asc",
+    "query_prep_eps": 1e-12,
+    "similarity": "pm1_fp32_blas_gemm_per_pair",
+    "determinism": "tolerance_s16_v1",
+    "normalisation": Normalisation(name="rowcol_z", std="population", eps=1e-08, degenerate_std_lt=1e-06),
+    "score_form": "fwd_minus_rev_view",
+    "score_diff": "float64",
+    "quantile_method": "linear",
+    "degenerate_query_rule": "no_hits",
+})
+
+
+def check_implemented(system: EsmCodesSystem) -> None:
+    """Refuse (:class:`UnsupportedSystemError`) a system this FoldMatch cannot run exactly: its DP must be the
+    kernel's (``swkern.DP_ID``, ``fmsw/1``) with setting D (``swkern.SETTING_D``), its m rules ones that
+    :mod:`code_statistics` implements, and every value in ``IMPLEMENTED`` must match."""
+    from foldmatch.search import code_statistics, swkern       # numpy + ctypes only; loads no library
+    bad = []
+    if system.dp != swkern.DP_ID:
+        bad.append(f"dp={system.dp!r} (this kernel is {swkern.DP_ID!r})")
+    setting = (system.offset, system.gap_open, system.gap_extend)
+    kernel_setting = (swkern.SETTING_D.offset, swkern.SETTING_D.gap_open, swkern.SETTING_D.gap_extend)
+    if setting != kernel_setting:
+        bad.append(f"(offset, gap_open, gap_extend)={setting} (fmsw/1 setting D is {kernel_setting})")
+    for rule in ("low_m_rule", "high_m_rule"):
+        if getattr(system, rule) not in code_statistics.IMPLEMENTED_M_RULES:
+            bad.append(f"{rule}={getattr(system, rule)!r} (implemented: {code_statistics.IMPLEMENTED_M_RULES})")
+    if (system.code_bits, system.code_bytes) != (swkern.DIM, swkern.CODE_BYTES):
+        bad.append(f"code layout {system.code_bits} bits / {system.code_bytes} bytes (the kernel reads "
+                   f"{swkern.DIM} / {swkern.CODE_BYTES})")
+    for name, value in IMPLEMENTED.items():
+        got = getattr(system, name)
+        if got != value or type(got) is not type(value):
+            bad.append(f"{name}={got!r} (implemented: {value!r})")
+    if bad:
+        raise UnsupportedSystemError(f"{system.name}: this FoldMatch does not implement " + "; ".join(bad))
+
+
+# =====================================================================================================================
+# prepare(): the verified bundle of a system
+# =====================================================================================================================
+def _both(field_path, doc_path):
+    return field_path, doc_path, doc_path
+
+
+#: (system field path, bundle.json path, scoring npz meta_json path or None): every system value that the bundle
+#: also states. prepare() requires each pair to be equal exactly (numbers as float64, strings as text).
+DOCUMENT_FIELDS = (
+    _both(("name",), ("system",)),
+    _both(("calibration_version",), ("calibration_version",)),
+    _both(("esm_repo",), ("esm3", "repo")),
+    _both(("esm_weights_sha256",), ("esm3", "weights_sha256")),
+    _both(("embedding_tap",), ("esm3", "embedding_tap")),
+    _both(("input_normalisation",), ("esm3", "input_normalisation")),
+    (("input_cast",), ("encoding", "input_cast"), None),
+    (("transform_sha256",), ("content_digests", "transform_sha256"), None),
+    (("transform_output_cast",), ("encoding", "transform_output_cast"), None),
+    (("target_encoder_sha256",), ("content_digests", "target_encoder_sha256"), None),
+    (("encoder_architecture",), ("encoding", "architecture", "name"), None),
+    (("encoder_dtype",), ("encoding", "encoder", "dtype"), None),
+    (("code_bits",), ("encoding", "code_bits"), ("code", "bits")),
+    (("code_bytes",), ("encoding", "code_bytes"), ("code", "bytes")),
+    (("bitorder",), ("encoding", "bitorder"), ("code", "bitorder")),
+    (("sign_rule",), ("encoding", "sign_rule"), ("code", "sign_rule")),
+    (("query_encoder_sha256",), ("content_digests", "query_encoder_sha256"), None),
+    (("query_dtype",), ("encoding", "query_dtype"), None),
+    _both(("query_prep",), ("scoring", "query_prep")),
+    _both(("query_prep_eps",), ("scoring", "query_prep_eps")),
+    _both(("similarity",), ("scoring", "similarity")),
+    _both(("determinism",), ("scoring", "determinism")),
+    *(_both(("normalisation", k), ("scoring", "normalisation", k)) for k in ("name", "std", "eps",
+                                                                           "degenerate_std_lt")),
+    *(_both((k,), ("scoring", k)) for k in ("offset", "gap_open", "gap_extend", "dp", "score_form", "score_diff")),
+    _both(("panel_sha256",), ("panel", "panel_sha256")),
+    (("panel_sha256",), ("content_digests", "panel_sha256"), None),
+    _both(("panel_size",), ("panel", "size")),
+    _both(("panel_residues",), ("panel", "residues")),
+    _both(("panel_quantile",), ("panel", "quantile")),
+    _both(("quantile_method",), ("panel", "quantile_method")),
+    *(_both((k,), ("statistics", k)) for k in ("bin_centres", "lam", "lnK", "low_m_rule", "high_m_rule")),
+    *(_both(("calibrated_domain", k), ("calibrated_domain", k)) for k in (
+        "query_min_length", "query_max_length", "target_max_length", "max_nonstandard_fraction",
+        "target_min_distinct_codes")),
+    _both(("degenerate_query_rule",), ("degenerate_query_rule",)),
+    (("bundle_repo",), ("hf_repo",), None),
+)
+_MISSING = object()
+
+
+def _lookup(obj, path):
+    for key in path:
+        if dataclasses.is_dataclass(obj):
+            obj = getattr(obj, key)
+        elif isinstance(obj, Mapping) and key in obj:
+            obj = obj[key]
+        else:
+            return _MISSING
+    return obj
+
+
+def _same(want, got) -> bool:
+    """Exact equality: strings as text, integers as integers, floats as float64 (an integral JSON number equals the
+    same float), sequences element by element. bool never equals a number."""
+    if isinstance(want, bool) or isinstance(got, bool):
+        return type(want) is type(got) and want == got
+    if isinstance(want, str):
+        return isinstance(got, str) and got == want
+    if isinstance(want, int):
+        return isinstance(got, int) and got == want
+    if isinstance(want, float):
+        return isinstance(got, (int, float)) and float(got) == want
+    if isinstance(want, tuple):
+        return isinstance(got, (list, tuple)) and len(got) == len(want) and all(map(_same, want, got))
+    return want == got
+
+
+def _compare(system: EsmCodesSystem, doc, column: int, what: str, problems: list):
+    for entry in DOCUMENT_FIELDS:
+        doc_path = entry[column]
+        if doc_path is None:
+            continue
+        want, got = _lookup(system, entry[0]), _lookup(doc, doc_path)
+        if got is _MISSING:
+            problems.append(f"{what} has no {'.'.join(doc_path)}")
+        elif not _same(want, got):
+            problems.append(f"{what} {'.'.join(doc_path)} = {got!r}, the system has {'.'.join(entry[0])} = "
+                            f"{want!r}")
+
+
+def _table_digest(system: EsmCodesSystem) -> str:
+    import numpy as np
+    from foldmatch.utils.tensor_digest import tensor_digest
+    return tensor_digest({k: np.array(getattr(system, k), np.float64) for k in ("bin_centres", "lam", "lnK")})
+
+
+def _panel_digest(codes, offsets) -> str:
+    from foldmatch.utils.tensor_digest import tensor_digest
+    return tensor_digest({"codes": codes, "offsets": offsets})
+
+
+def _bundle_roles(system: EsmCodesSystem, bundle: Mapping, problems: list) -> Dict[str, str]:
+    """bundle.json ``files``: each listed file pinned with the same sha256 in the system; the encoders and scoring
+    files identified by their format tags."""
+    files = bundle.get("files")
+    roles: Dict[str, str] = {}
+    if not isinstance(files, Mapping) or not files:
+        problems.append("bundle.json has no files")
+        return roles
+    pinned = dict(system.bundle_files)
+    for name, info in files.items():
+        sha = info.get("sha256") if isinstance(info, Mapping) else None
+        if name not in pinned:
+            problems.append(f"bundle.json lists {name}, which the system does not pin")
+        elif sha != pinned[name]:
+            problems.append(f"bundle.json gives {name} sha256 {sha}, the system pins {pinned[name]}")
+        fmt = info.get("format") if isinstance(info, Mapping) else None
+        if fmt in (ENCODERS_FORMAT, SCORING_FORMAT):
+            if fmt in roles:
+                problems.append(f"bundle.json lists two {fmt} files")
+            roles[fmt] = name
+    for fmt in (ENCODERS_FORMAT, SCORING_FORMAT):
+        if fmt not in roles:
+            problems.append(f"bundle.json lists no {fmt} file")
+    return roles
+
+
+def _load_scoring_npz(path) -> Dict[str, Any]:
+    import numpy as np
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def _check_scoring(system: EsmCodesSystem, arrays: Mapping[str, Any], problems: list):
+    import numpy as np
+    meta_raw = arrays.get("meta_json")
+    try:
+        meta = json.loads(str(meta_raw)) if meta_raw is not None else None
+    except ValueError:
+        meta = None
+    if not isinstance(meta, Mapping):
+        problems.append("the scoring npz has no readable meta_json")
+    else:
+        if meta.get("format") != SCORING_FORMAT:
+            problems.append(f"the scoring npz format is {meta.get('format')!r}, expected {SCORING_FORMAT!r}")
+        _compare(system, meta, 2, "meta_json", problems)
+    for k in ("bin_centres", "lam", "lnK"):
+        a = arrays.get(k)
+        want = np.array(getattr(system, k), np.float64)
+        if a is None or a.dtype != np.float64 or a.shape != want.shape:
+            problems.append(f"the scoring npz {k} is not float64 {list(want.shape)}")
+        elif not np.array_equal(a.view(np.uint64), want.view(np.uint64)):
+            first = int(np.flatnonzero(a.view(np.uint64) != want.view(np.uint64))[0])
+            problems.append(f"the scoring npz {k} = {a.tolist()} differs from the system's {want.tolist()} at index "
+                            f"{first} (exact float64 comparison)")
+    codes, offsets, lengths = (arrays.get(k) for k in ("panel_codes", "panel_offsets", "panel_lengths"))
+    shape_ok = (codes is not None and codes.dtype == np.uint8 and codes.shape == (system.panel_residues,
+                                                                                  system.code_bytes)
+                and offsets is not None and offsets.dtype == np.int64 and offsets.shape == (system.panel_size + 1,))
+    if not shape_ok:
+        problems.append(f"the scoring npz panel is not uint8 [{system.panel_residues}, {system.code_bytes}] codes "
+                        f"with int64 [{system.panel_size + 1}] offsets")
+        return
+    if offsets[0] != 0 or offsets[-1] != system.panel_residues or np.any(np.diff(offsets) < 1):
+        problems.append("the scoring npz panel offsets are not 0 .. panel_residues with every member non-empty")
+    if lengths is None or lengths.shape != (system.panel_size,) or not np.array_equal(lengths, np.diff(offsets)):
+        problems.append("the scoring npz panel_lengths do not equal diff(panel_offsets)")
+    got = _panel_digest(codes, offsets)
+    if got != system.panel_sha256:
+        problems.append(f"the panel content digest is {got}, the system has panel_sha256 {system.panel_sha256}")
+
+
+def _raise_problems(system: EsmCodesSystem, problems: list):
+    if problems:
+        shown = problems[:10] + ([f"... and {len(problems) - 10} more"] if len(problems) > 10 else [])
+        raise BundleMismatchError(f"{system.name}: the bundle {system.bundle_repo}@{system.bundle_revision} does "
+                                  "not match the registry entry: " + "; ".join(shown))
+
+
+@dataclass(frozen=True)
+class WorkerSpec:
+    """What a Stage-2 worker needs, as picklable paths and scalars (no arrays, no torch): the scoring npz (sha256
+    re-checked by :meth:`load_panel`), the DP setting, the panel quantile and the E-value table with its rules (so a
+    WorkerSpec is also a ``table`` for :mod:`code_statistics`)."""
+    system_name: str
+    system_digest: str
+    scoring_npz: str
+    scoring_sha256: str
+    dp: str
+    offset: float
+    gap_open: float
+    gap_extend: float
+    panel_size: int
+    panel_residues: int
+    panel_quantile: float
+    quantile_method: str
+    bin_centres: Tuple[float, ...]
+    lam: Tuple[float, ...]
+    lnK: Tuple[float, ...]
+    low_m_rule: str
+    high_m_rule: str
+    calibrated_domain: CalibratedDomain
+    degenerate_query_rule: str
+
+    def dp_params(self):
+        from foldmatch.search import swkern
+        return swkern.DPParams(offset=self.offset, gap_open=self.gap_open, gap_extend=self.gap_extend)
+
+    def load_panel(self):
+        """``(codes uint8 [panel_residues, 8], offsets int64 [panel_size + 1])`` from the scoring npz, after checking
+        its sha256 again (the file may have changed since prepare())."""
+        from foldmatch.utils.model import _file_sha256
+        got = _file_sha256(self.scoring_npz)
+        if got != self.scoring_sha256:
+            raise BundleMismatchError(f"{self.scoring_npz} has sha256 {got}, expected {self.scoring_sha256} "
+                                      f"({self.system_name})")
+        a = _load_scoring_npz(self.scoring_npz)
+        codes, offsets = a["panel_codes"], a["panel_offsets"]
+        if codes.shape[0] != self.panel_residues or len(offsets) != self.panel_size + 1:
+            raise BundleMismatchError(f"{self.scoring_npz}: panel shape differs from {self.system_name}")
+        return codes, offsets
+
+
+@dataclass(frozen=True, eq=False)
+class PreparedSystem:
+    """A system whose bundle has been fetched and checked against it (:func:`prepare`)."""
+    system: EsmCodesSystem
+    files: Mapping[str, Any]                 # file name -> local path (sha256-verified)
+    bundle: Mapping[str, Any]                # parsed bundle.json
+    encoders_file: str
+    scoring_file: str
+
+    @property
+    def encoders_path(self):
+        return self.files[self.encoders_file]
+
+    @property
+    def scoring_path(self):
+        return self.files[self.scoring_file]
+
+    def for_worker(self) -> WorkerSpec:
+        s = self.system
+        return WorkerSpec(
+            system_name=s.name, system_digest=s.digest(), scoring_npz=str(self.scoring_path),
+            scoring_sha256=s.bundle_sha256(self.scoring_file), dp=s.dp, offset=s.offset, gap_open=s.gap_open,
+            gap_extend=s.gap_extend, panel_size=s.panel_size, panel_residues=s.panel_residues,
+            panel_quantile=s.panel_quantile, quantile_method=s.quantile_method, bin_centres=s.bin_centres,
+            lam=s.lam, lnK=s.lnK, low_m_rule=s.low_m_rule, high_m_rule=s.high_m_rule,
+            calibrated_domain=s.calibrated_domain, degenerate_query_rule=s.degenerate_query_rule)
+
+    def load_head(self, device="cpu"):
+        """The residue-code head (torch) from the encoders file, refused unless its content digests, architecture,
+        encoder dtype and system name equal the system's and the system's ESM3 weights are the ones this FoldMatch
+        loads."""
+        from foldmatch.model.residue_code_encoder import load_esm_codes_encoders
+        from foldmatch.utils.esm import loaders
+        s = self.system
+        if (s.esm_repo, s.esm_weights_sha256) != (loaders.ESM_REPO_ID, loaders.ESM_WEIGHTS_SHA256):
+            raise UnsupportedSystemError(
+                f"{s.name} needs ESM3 weights {s.esm_weights_sha256} from {s.esm_repo}; this FoldMatch loads "
+                f"{loaders.ESM_WEIGHTS_SHA256} from {loaders.ESM_REPO_ID}")
+        head = load_esm_codes_encoders(self.encoders_path, sha256=s.bundle_sha256(self.encoders_file), device=device)
+        got = head.content_digests()
+        want = {k: getattr(s, k) for k in ("transform_sha256", "query_encoder_sha256", "target_encoder_sha256")}
+        problems = [f"{k} = {got.get(k)}, the system has {v}" for k, v in want.items() if got.get(k) != v]
+        arch = head.meta.get("architecture") if isinstance(head.meta.get("architecture"), Mapping) else {}
+        if arch.get("name") != s.encoder_architecture:
+            problems.append(f"the encoders file architecture is {arch.get('name')!r}, the system has "
+                            f"encoder_architecture {s.encoder_architecture!r}")
+        conventions = head.meta.get("conventions") if isinstance(head.meta.get("conventions"), Mapping) else {}
+        encoder = conventions.get("encoder") if isinstance(conventions.get("encoder"), Mapping) else {}
+        if encoder.get("dtype") != s.encoder_dtype:
+            problems.append(f"the encoders file encoder dtype is {encoder.get('dtype')!r}, the system has "
+                            f"encoder_dtype {s.encoder_dtype!r}")
+        if head.meta.get("system") != s.name:
+            problems.append(f"the encoders file is for system {head.meta.get('system')!r}")
+        _raise_problems(s, problems)
+        return head
+
+
+def prepare(system: EsmCodesSystem, *, cache_dir=None, local_files_only: bool = False) -> PreparedSystem:
+    """Fetch the bundle of ``system`` (a registry entry, see :func:`registered`) from its registry pin
+    (:func:`foldmatch.utils.model.get_esm_codes_bundle`, sha256 verified) and refuse it unless ``bundle.json`` and
+    the scoring npz agree with the system exactly.
+
+    Checked, deterministic and, once the bundle is cached, read-only (so it can run on every rank before ESM3):
+    :func:`check_implemented`; that ``system`` is the registry entry of its name; ``bundle.json`` format, every
+    ``DOCUMENT_FIELDS`` value (numbers as float64), that every file it lists is pinned with the same sha256, and its
+    table digest; the scoring npz ``meta_json`` likewise, its table arrays bit for bit, and the panel's shape, offsets
+    and content digest. Any difference raises :class:`BundleMismatchError` naming the fields. torch is not needed
+    (only :meth:`PreparedSystem.load_head` imports it).
+
+    ``local_files_only=True`` never downloads: a bundle file that is not cached raises
+    :class:`BundleUnavailableError`. Use it for the every-rank pre-flight after one process (``download-models``, or
+    rank 0) has fetched the bundle, so that no rank writes to the cache and a network failure cannot split the ranks.
+    """
+    if not isinstance(system, EsmCodesSystem):
+        raise TypeError(f"prepare needs an EsmCodesSystem, got {type(system).__name__}")
+    check_implemented(system)
+    from foldmatch.utils.model import get_esm_codes_bundle
+    from foldmatch.utils.tensor_digest import DIGEST_METHOD
+    files = get_esm_codes_bundle(system, cache_dir=cache_dir, local_files_only=local_files_only)
+    problems: list = []
+    try:
+        bundle = json.loads(Path(files[BUNDLE_JSON]).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise BundleMismatchError(f"{system.name}: {files[BUNDLE_JSON]} is not readable JSON: {e}") from e
+    if not isinstance(bundle, Mapping) or bundle.get("bundle_format") != BUNDLE_FORMAT:
+        got = bundle.get("bundle_format") if isinstance(bundle, Mapping) else None
+        raise BundleMismatchError(f"{system.name}: bundle.json format {got!r}, this FoldMatch reads "
+                                  f"{BUNDLE_FORMAT!r}")
+    _compare(system, bundle, 1, "bundle.json", problems)
+    digests = bundle.get("content_digests") if isinstance(bundle.get("content_digests"), Mapping) else {}
+    if digests.get("method") != DIGEST_METHOD:
+        problems.append(f"bundle.json content_digests.method = {digests.get('method')!r}, expected {DIGEST_METHOD!r}")
+    table = _table_digest(system)
+    if digests.get("table_sha256") != table:
+        problems.append(f"bundle.json content_digests.table_sha256 = {digests.get('table_sha256')!r}, the system's "
+                        f"table digests to {table}")
+    roles = _bundle_roles(system, bundle, problems)
+    if SCORING_FORMAT in roles and roles[SCORING_FORMAT] in files:
+        _check_scoring(system, _load_scoring_npz(files[roles[SCORING_FORMAT]]), problems)
+    _raise_problems(system, problems)
+    return PreparedSystem(system=system, files=MappingProxyType(dict(files)), bundle=bundle,
+                          encoders_file=roles[ENCODERS_FORMAT], scoring_file=roles[SCORING_FORMAT])

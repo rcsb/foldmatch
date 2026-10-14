@@ -218,15 +218,29 @@ _HF_FETCHES = {"snapshot_download", "hf_hub_download", "try_to_load_from_cache",
 _UNPINNED_FETCHES = {"from_pretrained"}
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _UNRESOLVED = "<not a literal>"
+# ``revision=<system>.bundle_revision``: the esm-codes bundle loader takes its revision from a scoring-system registry
+# entry, the only place a bundle revision exists (plan P4). Such a call is pinned when every registry entry's
+# bundle_revision is a 40-hex commit (EsmCodesSystem refuses anything else; checked again here).
+_REGISTRY_PIN = "<scoring-system registry bundle_revision>"
+
+
+def _registry_is_pinned():
+    from foldmatch.search import scoring_system
+    return all(isinstance(s.bundle_revision, str) and _COMMIT.fullmatch(s.bundle_revision) is not None
+               for s in scoring_system.REGISTRY.values())
 
 
 def _is_pinned(revision):
+    if revision == _REGISTRY_PIN:
+        return _registry_is_pinned()
     return isinstance(revision, str) and _COMMIT.fullmatch(revision) is not None
 
 
 def _resolve(node, scope, seen=()):
     if isinstance(node, ast.Constant):
         return node.value
+    if isinstance(node, ast.Attribute) and node.attr == "bundle_revision":
+        return _REGISTRY_PIN
     if isinstance(node, ast.Name) and node.id in scope and node.id not in seen:
         return _resolve(scope[node.id], scope, seen + (node.id,))
     return _UNRESOLVED
@@ -300,6 +314,10 @@ class ReleasePinTest(unittest.TestCase):
         calls = [where.split()[-1] for where, _ in self.revisions if where.endswith("()")]
         for fetch in ("snapshot_download()", "hf_hub_download()", "try_to_load_from_cache()"):
             self.assertIn(fetch, calls)
+        bundle_calls = [where for where, value in self.revisions if value == _REGISTRY_PIN]
+        self.assertEqual(len(bundle_calls), 1, bundle_calls)
+        self.assertTrue(bundle_calls[0].startswith("foldmatch/utils/model.py:"), bundle_calls)
+        self.assertTrue(bundle_calls[0].endswith("hf_hub_download()"), bundle_calls)
 
     def test_runtime_pins(self):
         for revision in (loaders.ESM_REVISION, model.REVISION):
@@ -330,6 +348,20 @@ class ReleasePinTest(unittest.TestCase):
                 continue
             self.assertEqual(values[-1], expected, source)
             self.assertEqual(_is_pinned(values[-1]), expected == sha, source)
+
+    def test_registry_revisions(self):
+        """revision=<system>.bundle_revision resolves to the registry, pinned exactly when every entry is a commit;
+        any other attribute is not a pin."""
+        source = 'def get(system):\n    return hf_hub_download(repo_id=system.bundle_repo, filename="f", ' \
+                 'revision=system.bundle_revision)'
+        self.assertEqual([v for _w, v in _revisions_in(ast.parse(source), "m.py")], [_REGISTRY_PIN])
+        source = 'def get(system):\n    return hf_hub_download(repo_id="r", filename="f", revision=system.revision)'
+        self.assertEqual([v for _w, v in _revisions_in(ast.parse(source), "m.py")], [_UNRESOLVED])
+        self.assertTrue(_is_pinned(_REGISTRY_PIN))
+        from foldmatch.search import scoring_system
+        loose = mock.Mock(bundle_revision="main")
+        with mock.patch.object(scoring_system, "REGISTRY", {"x": loose}):
+            self.assertFalse(_is_pinned(_REGISTRY_PIN))
 
 
 if __name__ == "__main__":

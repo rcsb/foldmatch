@@ -20,7 +20,8 @@ import typer
 from typing import Annotated, Optional, List
 
 from foldmatch import __version__
-from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.cli.args_utils import DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, download_models_command, \
+    set_log_level
 from foldmatch.types.api_types import (
     Accelerator,
     LogLevel,
@@ -450,12 +451,16 @@ def from_sequences_chain(
 
 @app.command(
     name="download-models",
-    help="Download ESM3 and aggregator models from Hugging Face."
+    help="Download ESM3, the aggregator model and the esm-codes scoring bundles (sha256-verified) from Hugging "
+         "Face, so that later runs work offline (HF_HUB_OFFLINE=1)."
 )
-def download_models():
-    from foldmatch.utils.model import get_residue_model, get_aggregator_model
-    get_residue_model()
-    get_aggregator_model()
+def download_models(
+        system: Annotated[Optional[List[str]], typer.Option(
+            "--system",
+            help=DOWNLOAD_MODELS_SYSTEM_HELP
+        )] = None
+):
+    download_models_command(system)
 
 
 def version_callback(value: bool):

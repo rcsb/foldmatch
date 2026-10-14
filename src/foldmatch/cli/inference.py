@@ -4,10 +4,11 @@ from pathlib import Path
 
 import typer
 
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 
 from foldmatch import __version__
-from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.cli.args_utils import DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, download_models_command, \
+    set_log_level
 from foldmatch.types.api_types import StructureFormat, Accelerator, SrcLocation, SrcProteinFrom, \
     SrcAssemblyFrom, SrcTensorFrom, OutFormat, Strategy, LogLevel, ResEmbeddingFormat
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -485,12 +486,16 @@ def complete_embedding(
 
 @app.command(
     name="download-models",
-    help="Download models from huggingface and store them in the default location."
+    help="Download models from huggingface and store them in the default location: ESM3, the aggregator and the "
+         "esm-codes scoring bundles (sha256-verified), so that later runs work offline (HF_HUB_OFFLINE=1)."
 )
-def download_models():
-    from foldmatch.utils.model import get_residue_model, get_aggregator_model
-    get_residue_model()
-    get_aggregator_model()
+def download_models(
+        system: Annotated[Optional[List[str]], typer.Option(
+            "--system",
+            help=DOWNLOAD_MODELS_SYSTEM_HELP
+        )] = None
+):
+    download_models_command(system)
 
 def version_callback(value: bool):
     if value:
