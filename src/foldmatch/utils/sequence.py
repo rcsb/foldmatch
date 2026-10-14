@@ -75,8 +75,10 @@ def _scan_records(fasta_file: Path) -> Iterator[Tuple[int, str, int, int, bool, 
     nonstandard, non_ascii, angle_bracket)``.
 
     The record rules are those of :func:`foldmatch.utils.fasta.iter_fasta_offsets`
-    (id = first token of the header, blank lines and empty records skipped),
-    but every figure is about the *normalised* sequence: ``length`` residues,
+    (id = first token of the header, blank lines and empty records skipped; a
+    header without an id raises ``ValueError``, where the readers would fail
+    with an ``IndexError``), but every figure is about the *normalised*
+    sequence: ``length`` residues,
     of which ``nonstandard`` are outside the 20 standard amino acids, and
     whether it holds a non-ASCII character or a ``<``/``>``.
 
@@ -100,7 +102,13 @@ def _scan_records(fasta_file: Path) -> Iterator[Tuple[int, str, int, int, bool, 
                 if name is not None and length > 0:
                     yield header_offset, name, length, nonstandard, non_ascii, angle_bracket
                 header_offset = pos
-                name = stripped[1:].split()[0]
+                words = stripped[1:].split()
+                if not words:
+                    raise ValueError(
+                        f"{fasta_file}: the header line at byte {pos} is empty ('>' without an id); every "
+                        f"record needs an id"
+                    )
+                name = words[0]
                 length = nonstandard = 0
                 non_ascii = angle_bracket = False
                 continue

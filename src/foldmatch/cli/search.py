@@ -1,12 +1,15 @@
 import glob
 import os
 import logging
+import sqlite3
 import typer
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Annotated, Optional, List
 
 from foldmatch import __version__
 from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.errors import RefusalError
 from foldmatch.search.db_path import parse_db_path
 from foldmatch.search.output import (
     CLUSTER_OUTPUT_FIELDS,
@@ -78,6 +81,14 @@ _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
     "(emb_<run id>-<rank>.parquet) from --tmp-embedding-folder once the "
     "database is built. By default they are kept."
+)
+
+# Plan section 8, P5.6 (verbatim).
+_RESIDUE_CODES_HELP = (
+    "Also compute 8-byte per-residue ESM3 codes in the same pass, enabling "
+    "`query sequences --scoring esm-codes`. Adds 8 B per residue plus up to "
+    "about 100 B per entry for the index, and a one-time ~26 MB download. "
+    "Sequence (FASTA) databases only."
 )
 
 
@@ -338,6 +349,10 @@ def build_database_from_fasta(
         cleanup_embeddings: Annotated[bool, typer.Option(
             help=_CLEANUP_EMBEDDINGS_HELP
         )] = False,
+        residue_codes: Annotated[bool, typer.Option(
+            "--residue-codes/--no-residue-codes",
+            help=_RESIDUE_CODES_HELP
+        )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging level.'
         )] = LogLevel.info
@@ -345,23 +360,39 @@ def build_database_from_fasta(
     """Build an embedding database from protein sequences in a FASTA file."""
 
     set_log_level(log_level)
-    preflight = _fasta_preflight(fasta_file, min_res_n, output_db=output_db)
+    if residue_codes:
+        preflight, embedding_computer, prepared = _residue_codes_preflight(
+            fasta_file, min_res_n, output_db, tmp_embedding_folder, num_nodes
+        )
+        # The pass also writes the residue codes and seq_sha1 into each shard.
+        from foldmatch.search.residue_shards import RESIDUE_CODES
+        residue = {"residue_output": RESIDUE_CODES, "scoring_system": prepared}
+    else:
+        preflight = _fasta_preflight(fasta_file, min_res_n, output_db=output_db)
 
-    from foldmatch.search.embedding_computer import EmbeddingComputer
-    embedding_computer = EmbeddingComputer(
-        embedding_folder=tmp_embedding_folder,
-    )
-    embedding_computer.compute_from_fasta(
-        fasta_file=fasta_file,
-        min_res_n=min_res_n,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_nodes=num_nodes,
-        accelerator=accelerator,
-        devices=arg_devices(devices),
-        strategy=strategy,
-        preflight=preflight,
-    )
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        embedding_computer = EmbeddingComputer(
+            embedding_folder=tmp_embedding_folder,
+        )
+        prepared = None
+        # A plain build calls the pass exactly as before.
+        residue = {}
+    # A --residue-codes build reports every refusal as a RefusalError (D20:
+    # exit 1); a plain build raises exactly what it raised before.
+    refusals = _refusals if residue_codes else nullcontext
+    with refusals():
+        embedding_computer.compute_from_fasta(
+            fasta_file=fasta_file,
+            min_res_n=min_res_n,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            num_nodes=num_nodes,
+            accelerator=accelerator,
+            devices=arg_devices(devices),
+            strategy=strategy,
+            preflight=preflight,
+            **residue,
+        )
 
     if not _is_rank_zero():
         return
@@ -370,12 +401,13 @@ def build_database_from_fasta(
     embedding_db = EmbeddingDatabase(
         db_path=output_db
     )
-    embedding_db.create_db(
-        embedding_batches=embedding_computer.get_embedding_batches(load_batch_size=load_batch_size),
-        use_gpu_index=use_gpu_index,
-        index_type=index_type,
-        index_config=IndexConfig(nlist=ivf_nlist, nprobe=ivf_nprobe),
-    )
+    with refusals():
+        embedding_db.create_db(
+            embedding_batches=embedding_computer.get_embedding_batches(load_batch_size=load_batch_size),
+            use_gpu_index=use_gpu_index,
+            index_type=index_type,
+            index_config=IndexConfig(nlist=ivf_nlist, nprobe=ivf_nprobe),
+        )
 
     # Persist a sidecar id->sequence store so this database can be the
     # subject (or query) of a Stage-2 pairwise-alignment search. Built
@@ -384,11 +416,20 @@ def build_database_from_fasta(
     # after the pass, so ranks never race on the SQLite file.
     from foldmatch.search.sequence_store import SequenceStore
     store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
-    store.create(
-        fasta_file=fasta_file,
-        min_res_n=min_res_n,
-    )
-    _check_store_matches_preflight(store, preflight, output_db)
+    with refusals():
+        store.create(
+            fasta_file=fasta_file,
+            min_res_n=min_res_n,
+        )
+        _check_store_matches_preflight(store, preflight, output_db)
+    if prepared is not None:
+        # Last, once the database it describes is complete; its manifest is
+        # written last of all. A refusal leaves the database (BLOSUM62) and the
+        # shards (for --from-shards) in place.
+        _build_residue_code_store(
+            embedding_computer, embedding_db, store, preflight, prepared.system,
+            min_res_n=min_res_n, load_batch_size=load_batch_size,
+        )
     if cleanup_embeddings:
         embedding_computer.remove_shards()
 
@@ -1215,6 +1256,106 @@ def _remove_outputs(output_db: str, suffixes) -> List[Path]:
             path.unlink()
             removed.append(path)
     return removed
+
+
+@contextmanager
+def _refusals(note: Optional[str] = None):
+    """Report a refused check of the block as a :class:`RefusalError` (D20: exit status 1).
+
+    The check's own exception (a ``ValueError``, an ``OSError`` such as a
+    missing or existing file or a full disk, or an SQLite file that is not a
+    database) becomes its ``__cause__``; ``note`` is appended to the message.
+    """
+    try:
+        yield
+    except RefusalError as exc:
+        if note is None:
+            raise
+        raise RefusalError(f"{exc} {note}") from exc
+    except (ValueError, OSError, sqlite3.DatabaseError) as exc:
+        raise RefusalError(str(exc) if note is None else f"{exc} {note}") from exc
+
+
+def _residue_codes_preflight(fasta_file: Path, min_res_n: int, output_db: str,
+                             tmp_embedding_folder: Path, num_nodes: int):
+    """Every rank's read-only, deterministic checks of a --residue-codes build, before ESM3.
+
+    In the order of plan section 3 (BUILD): the strict FASTA pre-flight
+    (duplicate ids, '<' / '>' and non-ASCII sequences refused) and the
+    outputs-exist check, ``.rescodes.*`` included; this run's id and its
+    shards; then the default scoring system's bundle, which only the process
+    that starts the run may download (every other rank finds it in the cache:
+    :func:`~foldmatch.inference.chain_complete_inference.prepare_scoring_system`).
+    The same files give every rank the same verdict, so a refusal stops them
+    all together. Returns ``(preflight, embedding_computer, prepared_system)``.
+    """
+    with _refusals():
+        preflight = _fasta_preflight(fasta_file, min_res_n, strict=True, output_db=output_db)
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        embedding_computer = EmbeddingComputer(embedding_folder=tmp_embedding_folder)
+        embedding_computer.refuse_existing_shards()
+        from foldmatch.inference.chain_complete_inference import prepare_scoring_system
+        from foldmatch.search.residue_shards import RESIDUE_CODES
+        prepared = prepare_scoring_system(residue_output=RESIDUE_CODES, num_nodes=num_nodes)
+    return preflight, embedding_computer, prepared
+
+
+def _code_store_build(run_id: str, shard_infos, *, from_shards: bool):
+    """``(pass record, manifest build block)`` of a code store built from a run's shards.
+
+    The build block describes the ESM3 pass that computed the codes, from the
+    shards' pass record (:func:`~foldmatch.search.residue_shards.pass_record`):
+    the device type and its ESM3 precision, the ranks (``devices``), the
+    encoder precision and the software versions of the pass. ``from_shards``
+    tells whether the store was built by the pass's own command or later by
+    ``build residue-codes --from-shards``.
+    """
+    from foldmatch.search.residue_shards import shards_pass_record
+    record = shards_pass_record(shard_infos)
+    build = {
+        "run_id": run_id,
+        "from_shards": from_shards,
+        "accelerator": record["accelerator"],
+        "devices": record["world_size"],
+        "esm_precision": record["esm_precision"],
+        "encoder_precision": record["encoder_precision"],
+        "foldmatch_version": record["foldmatch_version"],
+        "torch": record["torch"],
+        "esm": record["esm"],
+        "platform": record["platform"],
+    }
+    return record, build
+
+
+def _build_residue_code_store(embedding_computer, embedding_db, sequence_store, preflight, system, *,
+                              min_res_n: int, load_batch_size: int):
+    """Rank 0, after the FAISS index and the sequence store: the residue-code store from this run's shards.
+
+    ``create`` streams the shards' codes into the pending ``.rescodes.bin``
+    and ``.rescodes.idx``; ``validate`` checks them against the sequence
+    store, the pre-flight and the FAISS count, then moves them into place and
+    writes the manifest last. The manifest's ``build`` block comes from the
+    shards' pass record. A refusal removes only the code store and keeps the
+    shards.
+    """
+    from foldmatch.search.residue_code_store import ResidueCodeStore
+    from foldmatch.search.residue_shards import RESIDUE_CODES, check_shards
+    code_store = ResidueCodeStore(embedding_db.db_folder, embedding_db.index_name)
+    kept = (f"This build's shards are kept in {embedding_computer.embedding_folder} "
+            f"(run id {embedding_computer.run_id}).")
+    with _refusals(note=kept):
+        infos = check_shards(embedding_computer.shard_files(), RESIDUE_CODES, system)
+        _, build = _code_store_build(embedding_computer.run_id, infos, from_shards=False)
+        code_store.create(
+            embedding_computer.iter_residue_codes(system, load_batch_size=load_batch_size),
+            system, min_res_n=min_res_n, build=build,
+        )
+        manifest = code_store.validate(sequence_store, len(embedding_db.db.chain_ids), preflight=preflight)
+    logging.info(
+        f"Residue-code store written to {code_store.manifest_path} ({manifest['entries']} entries, "
+        f"{manifest['total_residues']} residues, system {manifest['system_name']})"
+    )
+    return manifest
 
 
 def _check_stage2_stores(subject_store, max_evalue: Optional[float], query_store=None) -> None:
