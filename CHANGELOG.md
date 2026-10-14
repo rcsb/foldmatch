@@ -46,12 +46,47 @@ While the major version is `0`, breaking changes are released in a minor bump.
   convention behind the scores, including the bundle's repo, pinned revision
   and file sha256s (about 26 MB), with its E-value statistics
   (`foldmatch.search.code_statistics`). A changed value will always be a new
-  system name. No command or option uses them yet: the residue-code database
-  build (`fm-search build sequences --residue-codes`) and query scoring
-  (`fm-search query sequences --scoring esm-codes`) come in later changes,
-  and existing commands, BLOSUM62 scoring and its output are unchanged.
-  `python -m foldmatch.search.swkern` runs the kernel's self-test (reference
-  hash and the BLAS similarity path) and prints a JSON report.
+  system name. Only the database build uses them so far (`--residue-codes`,
+  below); query scoring (`fm-search query sequences --scoring esm-codes`)
+  comes in a later change, and existing commands, BLOSUM62 scoring and its
+  output are unchanged. `python -m foldmatch.search.swkern` runs the kernel's
+  self-test (reference hash and the BLAS similarity path) and prints a JSON
+  report.
+- **`fm-search build sequences --residue-codes`** (opt-in, off by default).
+  The ESM3 pass that computes the chain embeddings also computes an 8-byte
+  ESM3 code per residue with the `esm-codes-v1` encoders, and the build
+  stores them next to the database: `<output-db>.rescodes.bin` (8 bytes per
+  residue), a SQLite index `<output-db>.rescodes.idx` (about 60 bytes per
+  entry) and a manifest `<output-db>.rescodes.json`, written last, that
+  records the scoring system, the ESM3 and bundle pins, the entry and
+  residue counts, the sha256 of the codes, and how the pass computed them
+  (device type and ESM3 precision, number of ranks, software versions;
+  the embedding shards record the same). The first such build downloads
+  the scoring bundle (about 26 MB; `download-models` fetches it in advance).
+  Before ESM3 is loaded, and on every rank alike, the build refuses FASTA
+  input the codes cannot be lined up with (duplicate ids, `<` or `>` in a
+  sequence, non-ASCII characters), any existing output (`.rescodes.*`
+  included) and a bundle that cannot be fetched or verified. After the pass
+  the codes are checked against the sequence store, the pre-flight counts
+  and the FAISS index; if a check fails, only the code store is removed, so
+  the database still serves BLOSUM62 searches, and the embedding shards are
+  kept for `build residue-codes`. FASTA (sequence) databases only. These
+  databases cannot be searched with the codes yet: `query sequences
+  --scoring esm-codes` comes in a later change. Without the option the build
+  and all its files are unchanged.
+- **`fm-search build residue-codes DB_FOLDER INDEX_NAME --from-shards DIR`**
+  rebuilds and validates the residue-code store of a database from the
+  embedding shards its `build sequences --residue-codes` run kept in
+  `--tmp-embedding-folder` (they are kept unless `--cleanup-embeddings`),
+  without running ESM3 again; the codes are byte-identical to the original
+  build's, and the manifest's `min_res_n` and build information come from
+  the shards, so they describe the pass that computed the codes. `--run-id`
+  picks the run when `DIR` holds the shards of several. `--force` replaces
+  an existing store, but only once the new codes have passed validation: the
+  new store is written next to the old one (room for both is needed
+  meanwhile), and a refused or interrupted rebuild leaves the old one as it
+  was. Shards without codes, of another encoding, or whose entry count
+  differs from the database's are refused before anything is changed.
 
 ### Changed
 
@@ -232,6 +267,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   mask outside the batched inference fast path (autograd enabled, training, or
   an unbatched input with a mask) now also leaves the padded rows out of the
   sum, which changes, and corrects, its output.
+- **`EmbeddingComputer.compute_from_fasta` (Python API) in a multi-process
+  run** now returns on every rank only once every rank has finished the pass.
+  Rank 0 could read the shards right after it returned and find another
+  rank's shard not yet written ("Found 1 embeddings in 1 shard(s) ... a
+  rank's shard is missing"). `fm-search` already waited and is unaffected.
+- **A FASTA header without an id** (a line holding only `>`) is now refused
+  before the ESM3 pass with a one-line error naming the file and position;
+  it used to stop the build with an `IndexError` traceback.
 
 ## [0.8.0] - 2026-07-21
 
