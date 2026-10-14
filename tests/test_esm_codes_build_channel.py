@@ -2,7 +2,8 @@
 
 Most tests need no ESM3: a fake ``per_residue_embedding`` hands the module real ESM3 rows from the fixtures (F2c, the
 FoldMatch CPU fp32 rows of ``test_sequences.fasta``; F2b, structure-derived rows used for arithmetic only), so the
-module hook, the plumbing, the writer and the readers run with the real esm-codes-v1 encoders on known inputs.
+module hook, the plumbing, the writer and the readers run with the real esm-codes-v1 encoders on known inputs. The
+F2c acceptance test runs real ESM3 on the CPU.
 
 The real encoders come from the scoring-system registry bundle (``esm_codes_bundle``): skipped only when offline and
 not cached.
@@ -811,6 +812,475 @@ class InferenceShardsTest(_FakeEsm3Pass):
                         q = np.frombuffer(data, dtype="<f2").reshape(-1, 64)
                         self.assertLessEqual(_row_ulps(q, q_ref), 1.0)
                     self.assertEqual(table.column("seq_sha1").to_pylist(), [_sha1(s) for _, s, _ in items])
+
+
+# =====================================================================================================================
+# P5.4 readers
+# =====================================================================================================================
+from foldmatch.search.query_encodings import QueryEncodingIndex, open_memmap  # noqa: E402
+
+
+class _Shards(unittest.TestCase):
+    #: residues per row in the two shards; 0 is an empty payload (a length mismatch in the pass)
+    residues = ((3, 0, 5), (2, 6))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.rows = [_rows(5, seed=0, residues=self.residues[0]), _rows(4, seed=1, residues=self.residues[1])]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def shards(self, residue_output, systems=(SYSTEM, SYSTEM), name="emb_run"):
+        return [_write_shard(self.tmp, name, rows, residue_output, system=system, rank=rank)
+                for rank, (rows, system) in enumerate(zip(self.rows, systems))]
+
+    def all_rows(self):
+        return [r for rows in self.rows for r in rows]
+
+
+class ResidueCodeReaderTest(_Shards):
+
+    def test_round_trip_in_shard_order(self):
+        shards = self.shards(rs.RESIDUE_CODES)
+        batches = list(rs.iter_residue_codes(shards, SYSTEM, load_batch_size=2))
+        self.assertEqual([len(b.ids) for b in batches], [2, 2, 1, 2, 2])
+        rows = self.all_rows()
+        self.assertEqual([i for b in batches for i in b.ids], [r[0] for r in rows])
+        self.assertEqual([int(n) for b in batches for n in b.lengths], [len(r[2]) // 8 for r in rows])
+        self.assertEqual([d for b in batches for d in b.seq_sha1s], [r[4] for r in rows])
+        codes = [c for b in batches for c in b.codes]
+        self.assertTrue(all(c.dtype == np.uint8 and c.ndim == 2 and c.shape[1] == 8 for c in codes))
+        self.assertEqual([c.tobytes() for c in codes], [r[2] for r in rows])
+        self.assertEqual(codes[1].shape, (0, 8))        # the empty payload
+        ids, per_entry, sha1s = batches[0]              # the store's (ids, codes, seq_sha1s) batch
+        self.assertEqual((len(ids), len(per_entry), len(sha1s)), (2, 2, 2))
+
+    def test_one_shard_at_a_time_with_column_projection(self):
+        shards = self.shards(rs.RESIDUE_CODES)
+        events = []
+        real = pq.ParquetFile
+
+        class Recording(real):
+            def __init__(self, path, *args, **kwargs):
+                events.append(("open", Path(path).name))
+                super().__init__(path, *args, **kwargs)
+
+            def iter_batches(self, *args, columns=None, **kwargs):
+                events.append(("columns", tuple(columns)))
+                return super().iter_batches(*args, columns=columns, **kwargs)
+
+            def close(self, *args, **kwargs):
+                events.append(("close",))
+                return super().close(*args, **kwargs)
+
+        with mock.patch.object(rs.pq, "ParquetFile", Recording):
+            stream = rs.iter_residue_codes(shards, SYSTEM, load_batch_size=100)
+            self.assertEqual(events, [])        # the footer checks do not open the data
+            first = next(stream)
+            self.assertEqual(events, [("open", shards[0].name), ("columns", ("id", "residue_codes", "seq_sha1"))])
+            self.assertEqual(len(first.ids), 5)
+            rest = list(stream)
+        self.assertEqual(events[2:], [("close",), ("open", shards[1].name),
+                                      ("columns", ("id", "residue_codes", "seq_sha1")), ("close",)])
+        self.assertEqual(len(rest), 1)
+
+    def test_embedding_computer(self):
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        with launch_env(FOLDMATCH_RUN_ID="run"):
+            computer = EmbeddingComputer(self.tmp)
+        self.shards(rs.RESIDUE_CODES)
+        _write_shard(self.tmp, "emb_other", self.rows[0], rs.RESIDUE_CODES, system=OTHER_ENCODING)  # another run
+        computer.expected_count = 9
+        ids = [i for b in computer.iter_residue_codes(SYSTEM) for i in b.ids]
+        self.assertEqual(ids, [r[0] for r in self.all_rows()])
+        # the chain embeddings read the same shards as before
+        embedding_ids = [i for batch_ids, _ in computer.get_embedding_batches() for i in batch_ids]
+        self.assertEqual(embedding_ids, ids)
+        computer.expected_count = 10
+        with self.assertRaises(ValueError):
+            computer.iter_residue_codes(SYSTEM)
+
+    def test_mixed_and_stale_shards_are_refused_before_any_batch(self):
+        cases = {
+            "mixed": ((SYSTEM, OTHER_ENCODING), SYSTEM),
+            "stale": ((OTHER_ENCODING, OTHER_ENCODING), SYSTEM),
+        }
+        for what, (systems, system) in cases.items():
+            with self.subTest(what=what):
+                shards = self.shards(rs.RESIDUE_CODES, systems, name=f"emb_{what}")
+                with mock.patch.object(rs, "iter_payload_batches") as data:
+                    with self.assertRaises(rs.ResidueShardError) as ctx:
+                        rs.iter_residue_codes(shards, system)
+                data.assert_not_called()
+                self.assertIn(what, str(ctx.exception))
+
+    def test_a_statistics_only_system_reuses_the_codes(self):
+        shards = self.shards(rs.RESIDUE_CODES, (OTHER_STATISTICS, OTHER_STATISTICS))
+        self.assertEqual(OTHER_STATISTICS.encoding_digest(), SYSTEM.encoding_digest())
+        self.assertEqual(len([i for b in rs.iter_residue_codes(shards, SYSTEM) for i in b.ids]), 9)
+
+    def test_shards_without_residue_codes_are_refused(self):
+        for residue_output in (None, rs.QUERY_ENCODING):
+            with self.subTest(residue_output=residue_output):
+                shards = self.shards(residue_output, name=f"emb_{residue_output}")
+                with self.assertRaises(rs.ResidueShardError):
+                    rs.iter_residue_codes(shards, SYSTEM)
+        plain = _write_shard(self.tmp, "emb_mix", self.rows[0])
+        codes = _write_shard(self.tmp, "emb_mix", self.rows[1], rs.RESIDUE_CODES, rank=1)
+        with self.assertRaisesRegex(rs.ResidueShardError, "mixed"):
+            rs.iter_residue_codes([plain, codes], SYSTEM)
+
+    def test_a_payload_that_is_not_whole_codes_is_refused(self):
+        rows = [("a", torch.zeros(4), b"\x00" * 9, b"", bytes(20))]
+        shard = _write_shard(self.tmp, "emb_bad", rows, rs.RESIDUE_CODES)
+        with self.assertRaisesRegex(rs.ResidueShardError, "multiple of 8"):
+            list(rs.iter_residue_codes([shard], SYSTEM))
+
+    def test_unreadable_shards_are_named(self):
+        """An empty or missing file, damaged pass metadata, or data damaged after the footer check: a
+        ResidueShardError naming the file (pyarrow's own message names none)."""
+        empty = self.tmp / "emb_empty-0.parquet"
+        empty.write_bytes(b"")
+        for path in (empty, self.tmp / "emb_missing-0.parquet"):
+            with self.subTest(path=path.name), self.assertRaises(rs.ResidueShardError) as ctx:
+                rs.check_shards([path], rs.RESIDUE_CODES, SYSTEM)
+            self.assertIn(f"{path}: not a readable Parquet embedding shard", str(ctx.exception))
+        shard, = self.shards(rs.RESIDUE_CODES)[:1]
+        table = pq.read_table(shard)
+        pq.write_table(table.replace_schema_metadata({**table.schema.metadata, rs.META_PASS: b"[1"}),
+                       self.tmp / "emb_meta-0.parquet")
+        with self.assertRaisesRegex(rs.ResidueShardError, "foldmatch.pass metadata is not a JSON object"):
+            rs.read_shard_info(self.tmp / "emb_meta-0.parquet")
+        damaged = self.tmp / "emb_damaged-0.parquet"
+        data = bytearray(shard.read_bytes())
+        data[8:28] = bytes(b ^ 0xFF for b in data[8:28])  # the first page header, after the 'PAR1' magic
+        damaged.write_bytes(bytes(data))
+        stream = rs.iter_residue_codes([damaged], SYSTEM)  # the footer is intact
+        with self.assertRaises(rs.ResidueShardError) as ctx:
+            list(stream)
+        self.assertIn(f"{damaged}: the shard could not be read", str(ctx.exception))
+
+    def test_shards_pass_record(self):
+        shards = self.shards(rs.RESIDUE_CODES)
+        infos = rs.check_shards(shards, rs.RESIDUE_CODES, SYSTEM)
+        self.assertEqual([i.pass_record for i in infos], [_pass_record(p) for p in shards])
+        self.assertEqual(rs.shards_pass_record(infos), infos[0].pass_record)
+        # the record describes the pass, not the shard's content: it is not part of the key
+        other = rs.read_shard_info(_write_shard(self.tmp, "emb_k", self.rows[0], rs.RESIDUE_CODES, min_res_n=3))
+        self.assertEqual(other.key, infos[0].key)
+        self.assertNotEqual(other.pass_record, infos[0].pass_record)
+        other = dataclasses.replace(infos[1], pass_record=dict(infos[1].pass_record, world_size=8))
+        with self.assertLogs(rs.logger, "WARNING") as logs:
+            self.assertEqual(rs.shards_pass_record([infos[0], other]), infos[0].pass_record)
+        self.assertIn("differ in world_size", logs.output[0])
+        self.assertEqual(rs.shards_pass_record([dataclasses.replace(i, pass_record=None) for i in infos]),
+                         dict.fromkeys(rs.PASS_KEYS))
+        self.assertEqual(rs.shards_pass_record([]), dict.fromkeys(rs.PASS_KEYS))
+
+
+class PassBarrierTest(unittest.TestCase):
+    """compute_from_fasta returns on every rank only once every rank has left the pass (and so closed its shard), so
+    rank 0 may read the shards right away (NERSC: rank 0 counted 1 of 2 shards without it)."""
+
+    def test_barrier_after_the_pass(self):
+        from foldmatch.search import embedding_computer as ec
+        import torch.distributed as dist
+        with tempfile.TemporaryDirectory() as tmp, launch_env(FOLDMATCH_RUN_ID="b"):
+            computer = ec.EmbeddingComputer(Path(tmp))
+            for initialized in (True, False):
+                with self.subTest(initialized=initialized), \
+                        mock.patch.object(ec, "chain_predict") as predict, \
+                        mock.patch.object(dist, "is_initialized", return_value=initialized), \
+                        mock.patch.object(dist, "barrier") as barrier:
+                    barrier.side_effect = lambda: self.assertTrue(predict.called)  # after the pass, not before
+                    computer.compute_from_fasta(_FASTA)
+                    self.assertEqual(barrier.call_count, int(initialized))
+
+
+class QueryEncodingIndexTest(_Shards):
+    residues = ((3, 1, 5), (2, 6))   # every query has an encoding
+
+    def test_build(self):
+        shards = self.shards(rs.QUERY_ENCODING)
+        rows = self.all_rows()
+        dst = self.tmp / "q.f16"
+        index = QueryEncodingIndex.build(shards, dst, system=SYSTEM, expected_count=9, load_batch_size=2)
+        q = [np.frombuffer(r[3], dtype="<f2").reshape(-1, 64) for r in rows]
+        self.assertEqual((index.rows, index.width, len(index)), (sum(len(x) for x in q), 64, 9))
+        self.assertEqual(os.path.getsize(dst), index.rows * 128)
+        np.testing.assert_array_equal(index.memmap().view(np.uint16), np.concatenate(q).view(np.uint16))
+        offset = 0
+        for r, x in zip(rows, q):
+            entry = index.entries[r[0]]
+            self.assertEqual(entry, (offset, len(x), r[4]))
+            np.testing.assert_array_equal(index.get(r[0]).view(np.uint16), x.view(np.uint16))
+            offset += len(x)
+        mm = open_memmap(*index.memmap_args())
+        self.assertEqual(mm.dtype, np.dtype("<f2"))
+        self.assertFalse(mm.flags.writeable)
+        np.testing.assert_array_equal(mm.view(np.uint16), index.memmap().view(np.uint16))
+        index.remove()
+        self.assertFalse(dst.exists())
+
+    def test_no_queries(self):
+        index = QueryEncodingIndex.build([], self.tmp / "q.f16", system=SYSTEM, expected_count=0)
+        self.assertEqual(index.memmap().shape, (0, 64))
+
+    def test_refusals_leave_no_file(self):
+        first = self.rows[0][0]
+        cases = {
+            "mixed": self.shards(rs.QUERY_ENCODING, (SYSTEM, OTHER_ENCODING), name="emb_mixed"),
+            "stale": self.shards(rs.QUERY_ENCODING, (OTHER_STATISTICS, OTHER_STATISTICS), name="emb_stale"),
+            "not query_encoding": self.shards(rs.RESIDUE_CODES, name="emb_codes"),
+            "duplicate": [_write_shard(self.tmp, "emb_dup", self.rows[0], rs.QUERY_ENCODING, rank=rank)
+                          for rank in (0, 1)],
+            "without an encoding": [_write_shard(self.tmp, "emb_empty", [first[:3] + (b"",) + first[4:]],
+                                                 rs.QUERY_ENCODING)],
+            "whole number": [_write_shard(self.tmp, "emb_ragged", [first[:3] + (b"\x00" * 130,) + first[4:]],
+                                          rs.QUERY_ENCODING)],
+        }
+        for what, shards in cases.items():
+            with self.subTest(what=what):
+                dst = self.tmp / f"{what}.f16"
+                with self.assertRaisesRegex(rs.ResidueShardError, what):
+                    QueryEncodingIndex.build(shards, dst, system=SYSTEM)
+                self.assertFalse(dst.exists())
+        shards = self.shards(rs.QUERY_ENCODING, name="emb_ok")
+        with self.assertRaisesRegex(rs.ResidueShardError, "input has 8"):
+            QueryEncodingIndex.build(shards, self.tmp / "count.f16", system=SYSTEM, expected_count=8)
+        self.assertFalse((self.tmp / "count.f16").exists())
+        taken = self.tmp / "taken.f16"
+        taken.write_bytes(b"someone else's")
+        with self.assertRaises(FileExistsError):
+            QueryEncodingIndex.build(shards, taken, system=SYSTEM)
+        self.assertEqual(taken.read_bytes(), b"someone else's")
+
+    def test_embedding_computer(self):
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        with launch_env(FOLDMATCH_RUN_ID="run"):
+            computer = EmbeddingComputer(self.tmp)
+        self.shards(rs.QUERY_ENCODING)
+        computer.expected_count = 9
+        index = computer.build_query_encodings(self.tmp / "q.f16", SYSTEM)
+        self.assertEqual(list(index.entries), [r[0] for r in self.all_rows()])
+
+    def test_workers_need_no_torch(self):
+        shards = self.shards(rs.QUERY_ENCODING)
+        code = (
+            "import sys, json; sys.modules['torch'] = None\n"
+            "from foldmatch.search import scoring_system as ss\n"
+            "from foldmatch.search.query_encodings import QueryEncodingIndex, open_memmap\n"
+            "index = QueryEncodingIndex.build(sys.argv[1:3], sys.argv[3], system=ss.get(ss.DEFAULT_ESM_CODES))\n"
+            "import hashlib\n"
+            "print(json.dumps([index.rows, hashlib.sha256(open_memmap(*index.memmap_args()).tobytes()).hexdigest(),\n"
+            "                  'torch' in sys.modules and sys.modules['torch'] is not None]))\n"
+        )
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p]))
+        run = subprocess.run([sys.executable, "-c", code, str(shards[0]), str(shards[1]), str(self.tmp / "w.f16")],
+                             env=env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr[-3000:])
+        rows, digest, torch_loaded = json.loads(run.stdout)
+        q = b"".join(r[3] for r in self.all_rows())
+        self.assertEqual(rows, len(q) // 128)
+        self.assertEqual(digest, hashlib.sha256(q).hexdigest())
+        self.assertFalse(torch_loaded)
+
+
+class LargePayloadRoundTripTest(unittest.TestCase):
+    """Not mocked: more than 2 GiB of payloads in one row group, written and read back (about 5 GB of memory)."""
+
+    @unittest.skipUnless(os.environ.get("FOLDMATCH_SLOW_TESTS") == "1", "set FOLDMATCH_SLOW_TESTS=1 (writes 2 GiB)")
+    def test_a_payload_chunk_over_2_gib_real(self):
+        size, n = 1 << 20, 2049   # 2049 MiB in one row group
+        payload = bytes(size)
+        rows = [(f"r{k}", torch.zeros(4), payload, b"", bytes(20)) for k in range(n)]
+        with tempfile.TemporaryDirectory() as tmp:
+            self._check(Path(tmp), size, n, rows)
+
+    def _check(self, tmp, size, n, rows):
+        path = _write_shard(tmp, "big", rows, rs.RESIDUE_CODES, batch=64, byte_budget=1 << 34)
+        meta = pq.ParquetFile(path).metadata
+        self.assertEqual((meta.num_rows, meta.num_row_groups), (n, 1))
+        # Read back streaming (64 rows at a time): every payload, more than 2 GiB in the one row group.
+        sizes = [int(k) for b in rs.iter_residue_codes([path], SYSTEM, load_batch_size=64) for k in b.lengths]
+        self.assertEqual(sizes, [size // 8] * n)
+        self.assertGreater(8 * sum(sizes), 2 ** 31)
+        with pq.ParquetFile(path) as pf:
+            ids = pf.read(columns=["id"]).column("id").to_pylist()
+        self.assertEqual(ids, [r[0] for r in rows])
+
+
+# =====================================================================================================================
+# real ESM3 on the fixture FASTA (CPU): F2c and the byte identities
+# =====================================================================================================================
+class RealEsm3Test(unittest.TestCase):
+    """The FoldMatch CPU pass on ``test_sequences.fasta``: codes match the F2c reference codes (A4-xcpu), the query
+    encodings match F2c q, and the chain embeddings and FAISS index are byte-identical with and without codes."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        _prepared()
+        gc.collect()  # earlier tests' ESM3 models, if only cycles still hold them
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.computers = {}
+        for kind in (None, rs.RESIDUE_CODES, rs.QUERY_ENCODING):
+            folder = cls.tmp / str(kind)
+            folder.mkdir()
+            with launch_env():
+                computer = EmbeddingComputer(folder)
+                kwargs = {} if kind is None else {"residue_output": kind, "scoring_system": SYSTEM}
+                computer.compute_from_fasta(_FASTA, accelerator=Accelerator.cpu, devices=1, batch_size=2, **kwargs)
+            cls.computers[kind] = computer
+            gc.collect()  # the pass's ESM3 (5.6 GB) is only reachable through reference cycles
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def test_f2c_codes(self):
+        items, codes_ref, _, offsets = _f2c()
+        batches = list(self.computers[rs.RESIDUE_CODES].iter_residue_codes(SYSTEM))
+        ids = [i for b in batches for i in b.ids]
+        lengths = [int(n) for b in batches for n in b.lengths]
+        codes = np.concatenate([c for b in batches for c in b.codes])
+        self.assertEqual(ids, [name for name, _, _ in items])
+        self.assertEqual((len(ids), sum(lengths)), (2, 303))
+        self.assertEqual(lengths, list(np.diff(offsets)))
+        self.assertEqual([d for b in batches for d in b.seq_sha1s], [_sha1(s) for _, s, _ in items])
+        equal, n = _bits_equal(codes, codes_ref)
+        print(f"\nF2c CPU code bits: {equal}/{n} = {equal / n:.6f}", file=sys.stderr)
+        self.assertGreaterEqual(equal / n, A4_XCPU_BITS, f"F2c code bits {equal}/{n}")
+
+    def test_f2c_query_encodings(self):
+        items, _, q_ref, offsets = _f2c()
+        index = self.computers[rs.QUERY_ENCODING].build_query_encodings(self.tmp / "q.f16", SYSTEM)
+        self.assertEqual([(name, index.entries[name][:2]) for name, _, _ in items],
+                         [(name, (int(offsets[k]), int(offsets[k + 1] - offsets[k]))) for k, (name, _, _)
+                          in enumerate(items)])
+        ulps = _row_ulps(np.asarray(index.memmap()), q_ref)
+        print(f"\nF2c CPU q: max {ulps} fp16 ulps of the row maximum", file=sys.stderr)
+        self.assertLessEqual(ulps, 1.0)
+
+    def test_chain_embeddings_and_faiss_are_byte_identical_with_and_without_codes(self):
+        from foldmatch.search.embedding_database import EmbeddingDatabase
+        from foldmatch.types.api_types import IndexConfig, IndexType
+
+        def embeddings(kind):
+            ids, arrays = zip(*self.computers[kind].get_embedding_batches())
+            return [i for b in ids for i in b], np.concatenate(arrays)
+
+        plain_ids, plain = embeddings(None)
+        for kind in rs.RESIDUE_OUTPUTS:
+            ids, arr = embeddings(kind)
+            self.assertEqual(ids, plain_ids)
+            np.testing.assert_array_equal(arr.view(np.uint32), plain.view(np.uint32))
+        files = {}
+        for kind in (None, rs.RESIDUE_CODES):
+            db = EmbeddingDatabase(db_path=str(self.tmp / f"db_{kind}" / "idx"))
+            (self.tmp / f"db_{kind}").mkdir()
+            db.create_db(embedding_batches=self.computers[kind].get_embedding_batches(), use_gpu_index=False,
+                         index_type=IndexType.flat, index_config=IndexConfig())
+            files[kind] = {p.name: _sha256(p) for p in sorted((self.tmp / f"db_{kind}").iterdir())}
+        self.assertEqual(sorted(files[None]), ["idx.index", "idx.metadata"])
+        self.assertEqual(files[rs.RESIDUE_CODES], files[None])
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "Apple GPU (MPS) not available")
+    def test_f2c_codes_on_mps(self):
+        """D18: residue codes on the Apple GPU meet the per-device A4 gate."""
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        items, codes_ref, _, _ = _f2c()
+        folder = self.tmp / "mps"
+        folder.mkdir()
+        with launch_env():
+            computer = EmbeddingComputer(folder)
+            computer.compute_from_fasta(_FASTA, accelerator=Accelerator.gpu, devices=1, batch_size=2,
+                                        residue_output=rs.RESIDUE_CODES)
+        gc.collect()
+        torch.mps.empty_cache()
+        codes = np.concatenate([c for b in computer.iter_residue_codes(SYSTEM) for c in b.codes])
+        equal, n = _bits_equal(codes, codes_ref)
+        print(f"\nF2c MPS code bits: {equal}/{n} = {equal / n:.6f}", file=sys.stderr)
+        self.assertGreaterEqual(equal / n, A4_DEVICE_BITS)
+
+
+
+_TWO_RANK_CHILD = r"""
+import json, os, sys
+from pathlib import Path
+from foldmatch.search import scoring_system as ss
+from foldmatch.search.embedding_computer import EmbeddingComputer
+from foldmatch.types.api_types import Accelerator
+
+folder, fasta = Path(sys.argv[1]), Path(sys.argv[2])
+rank = int(os.environ.get("LOCAL_RANK", "0"))
+prepare = ss.prepare
+
+def spy(system, **kwargs):
+    (folder / f"prepare-{rank}.json").write_text(json.dumps(kwargs))
+    return prepare(system, **kwargs)
+
+ss.prepare = spy
+computer = EmbeddingComputer(folder)
+computer.compute_from_fasta(fasta, accelerator=Accelerator.cpu, devices=2, residue_output="residue_codes")
+if rank == 0:
+    system = ss.get(ss.DEFAULT_ESM_CODES)
+    out = {i: c.tobytes().hex() for b in computer.iter_residue_codes(system) for i, c in zip(b.ids, b.codes)}
+    shards = [p.name for p in computer.shard_files()]
+    (folder / "result.json").write_text(json.dumps({"codes": out, "shards": shards}))
+"""
+
+
+# Rendezvous state this process may hold from an earlier in-process DDP pass (Lightning sets MASTER_ADDR/MASTER_PORT):
+# a child that inherited MASTER_PORT would try to join that process group, or find its port taken.
+_DDP_ENV_PREFIXES = ("MASTER_", "PL_", "TORCHELASTIC_")
+_DDP_ENV = ("WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK", "ROLE_RANK")
+
+
+def _child_env():
+    """This process's environment without the launch and rendezvous variables: a fresh run's."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+
+
+@unittest.skipUnless(os.environ.get("FOLDMATCH_SLOW_TESTS") == "1",
+                     "slow: two ESM3 ranks on CPU; set FOLDMATCH_SLOW_TESTS=1 to run")
+class TwoRankResidueSmoke(unittest.TestCase):
+    """A real two-process DDP pass (CPU, gloo) with residue codes: rank 0 fetches the bundle, the rank Lightning
+    starts checks it cached-only, both shards carry the same residue schema, and the codes are F2c's."""
+
+    def test_two_rank_residue_codes(self):
+        items, codes_ref, _, offsets = _f2c()
+        _prepared()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            script = tmp / "child.py"
+            script.write_text(_TWO_RANK_CHILD)
+            env = _child_env()
+            env["PYTHONPATH"] = os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p])
+            run = subprocess.run([sys.executable, str(script), str(tmp), str(_FASTA)], env=env, capture_output=True,
+                                 text=True, timeout=1800)
+            self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+            result = json.loads((tmp / "result.json").read_text())
+            calls = {rank: json.loads((tmp / f"prepare-{rank}.json").read_text()) for rank in (0, 1)}
+            infos = [rs.read_shard_info(tmp / name) for name in result["shards"]]
+        self.assertEqual(calls, {0: {"local_files_only": False}, 1: {"local_files_only": True}})
+        self.assertEqual(len(infos), 2)
+        self.assertEqual(infos[0].key, infos[1].key)
+        self.assertEqual(infos[0].pass_record, infos[1].pass_record)
+        self.assertEqual({k: infos[0].pass_record[k] for k in ("accelerator", "world_size", "min_res_n")},
+                         {"accelerator": "cpu", "world_size": 2, "min_res_n": 0})
+        self.assertEqual(sorted(result["codes"]), sorted(name for name, _, _ in items))
+        for k, (name, _, _) in enumerate(items):
+            got = np.frombuffer(bytes.fromhex(result["codes"][name]), dtype=np.uint8).reshape(-1, 8)
+            equal, n = _bits_equal(got, codes_ref[offsets[k]:offsets[k + 1]])
+            self.assertGreaterEqual(equal / n, A4_XCPU_BITS, f"{name} code bits {equal}/{n}")
+
 
 if __name__ == "__main__":
     unittest.main()

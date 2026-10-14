@@ -15,6 +15,8 @@ from foldmatch.types.api_types import (
     Accelerator,
     Granularity, SrcEsmFrom, Devices, Strategy,
 )
+from foldmatch.search.query_encodings import QueryEncodingIndex
+from foldmatch.search.residue_shards import ResidueCodeBatch, check_residue_output, iter_residue_codes
 from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, run_id
 from foldmatch.utils.sequence import FastaPreflight, preflight_fasta
 
@@ -128,18 +130,29 @@ class EmbeddingComputer:
             strategy: Strategy = Strategy.auto,
             accelerator: Accelerator = Accelerator.auto,
             preflight: Optional[FastaPreflight] = None,
+            residue_output: Optional[str] = None,
+            scoring_system=None,
     ):
         """Compute chain embeddings from protein sequences in a FASTA file.
 
         ``preflight`` is the :func:`preflight_fasta` result for this file and
         ``min_res_n``, as the CLI computes it on every rank before the pass;
         its offsets feed the dataset, so the file is scanned once. Without it
-        the pre-flight runs here (problems are only logged).
+        the pre-flight runs here (problems are only logged, or refused with a
+        residue output).
+
+        ``residue_output`` (``"residue_codes"`` for a build, ``"query_encoding"``
+        for a query) and ``scoring_system`` go to the pass unchanged (see
+        :func:`foldmatch.inference.chain_complete_inference.predict`); the
+        shards then also hold the per-residue payloads, read back with
+        :meth:`iter_residue_codes` or :meth:`build_query_encodings`. Without
+        them the pass is called exactly as before.
         """
 
+        residue_output = check_residue_output(residue_output)
         if preflight is None:
             preflight = preflight_fasta(fasta_file, min_res_n)
-            preflight.check(strict=False)
+            preflight.check(strict=residue_output is not None)
         elif Path(preflight.path).resolve() != Path(fasta_file).resolve() or preflight.min_res_n != min_res_n:
             raise ValueError(
                 f"Pre-flight of {preflight.path} (min_res_n={preflight.min_res_n}) does not "
@@ -148,6 +161,10 @@ class EmbeddingComputer:
         # One embedding per kept entry; rank 0 checks the shards against it after the pass.
         self.expected_count = preflight.entries_kept
         self.refuse_existing_shards()
+        # Only a residue pass gets the residue keywords: a plain pass is called exactly as before.
+        residue = {} if residue_output is None else {
+            "residue_output": residue_output, "scoring_system": scoring_system,
+        }
         # The other ranks Lightning launches inherit the exported run id.
         with exported_run_id(self.run_id):
             chain_predict(
@@ -165,7 +182,11 @@ class EmbeddingComputer:
                 out_name=self.out_name,
                 strategy=strategy,
                 return_predictions=False,
+                **residue,
             )
+        # A rank's shard is complete only once that rank has left the pass: wait for every rank, so rank 0 may read
+        # the shards (get_embedding_batches, iter_residue_codes, build_query_encodings) as soon as this returns.
+        _wait_for_every_rank()
 
     def shard_files(self) -> list[Path]:
         """This run's per-rank Parquet shards, ``emb_{run_id}-{rank}.parquet``.
@@ -246,6 +267,33 @@ class EmbeddingComputer:
                     flat.reshape(len(record), -1).astype(np.float32, copy=False)
                 )
                 yield ids, arr
+
+    def iter_residue_codes(self, system, load_batch_size: int = 32768) -> Iterator[ResidueCodeBatch]:
+        """Stream this run's residue codes, one shard at a time in shard order. Rank-0 only.
+
+        Yields :class:`~foldmatch.search.residue_shards.ResidueCodeBatch` ``(ids, codes, seq_sha1s)`` (one uint8
+        ``[L, 8]`` array per entry; what ``ResidueCodeStore.create`` takes), ``load_batch_size`` entries at a time,
+        reading only the ``id``, ``residue_codes`` and ``seq_sha1`` columns.
+        Before anything is yielded: the embedding count (:meth:`check_embedding_count`) and every shard's schema
+        (:func:`~foldmatch.search.residue_shards.check_shards`): shards without residue codes, mixed shards and
+        shards of another encoding than ``system``'s are refused (``ResidueShardError``).
+        """
+        self.check_embedding_count()
+        return iter_residue_codes(self.shard_files(), system, load_batch_size)
+
+    def build_query_encodings(self, dst, system) -> QueryEncodingIndex:
+        """This run's query encodings as a per-run fp16 memmap at ``dst`` (:meth:`QueryEncodingIndex.build`, one
+        pass in shard order; the same shard checks, plus one encoding per input entry). Rank-0 only."""
+        self.check_embedding_count()
+        return QueryEncodingIndex.build(self.shard_files(), dst, system=system, expected_count=self.expected_count)
+
+def _wait_for_every_rank() -> None:
+    """``torch.distributed.barrier()`` when the pass ran in a process group (every rank calls the pass, so every rank
+    reaches it); nothing otherwise."""
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
 
 def compute_from_structure_file(
         query_structure: Path,

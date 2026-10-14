@@ -36,8 +36,9 @@ pyarrow and numpy only: no torch, so Stage-2 code can import it.
 from __future__ import annotations
 
 import json
+import logging
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence
@@ -67,6 +68,8 @@ PASS_KEYS = ("min_res_n", "accelerator", "world_size", "esm_precision", "encoder
              "foldmatch_version", "torch", "esm", "platform")
 #: The residue-code encoders always run in fp32, without TF32 or autocast (method spec S3).
 ENCODER_PRECISION = "fp32-no-tf32"
+
+logger = logging.getLogger(__name__)
 
 #: The legacy shard schema (``id | embedding``), unchanged for plain passes.
 BASE_FIELDS = ((ID, pa.string()), (EMBEDDING, pa.list_(pa.float32())))
@@ -187,3 +190,204 @@ def large_binary_array(payloads: Sequence[bytes]) -> pa.LargeBinaryArray:
     np.cumsum(np.fromiter((len(p) for p in payloads), dtype=np.int64, count=n), out=offsets[1:])
     data = _concat_payloads(payloads, int(offsets[-1]))
     return pa.LargeBinaryArray.from_buffers(PAYLOAD_TYPE, n, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
+
+
+# =====================================================================================================================
+# readers
+# =====================================================================================================================
+@dataclass(frozen=True)
+class ShardInfo:
+    """What a shard's footer says (read with ``pq.read_schema``: no data). ``pass_record`` is its parsed
+    ``foldmatch.pass`` metadata (:func:`pass_record`), ``None`` if it has none; it describes the pass, so it is not
+    part of :attr:`key` (the ranks of one run may be told apart by it in principle; :func:`shards_pass_record`)."""
+    path: Path
+    residue_output: Optional[str]
+    system: Optional[str]
+    encoding_digest: Optional[str]
+    system_digest: Optional[str]
+    column_types: tuple
+    pass_record: Optional[Dict[str, Any]] = field(default=None, compare=False)
+
+    @property
+    def key(self) -> tuple:
+        return self.residue_output, self.system, self.encoding_digest, self.system_digest, self.column_types
+
+    def describe(self) -> str:
+        if self.residue_output is None:
+            return "no residue column (a plain pass)"
+        return (f"{self.residue_output} of {self.system} (encoding_digest {self.encoding_digest}, system_digest "
+                f"{self.system_digest})")
+
+
+def _type_name(t: pa.DataType) -> str:
+    # Parquet names a list's item field "element" where Arrow says "item": compare the value types only.
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return f"{'large_' if pa.types.is_large_list(t) else ''}list<{_type_name(t.value_type)}>"
+    return str(t)
+
+
+def _column_types(schema: pa.Schema) -> tuple:
+    return tuple((f.name, _type_name(f.type)) for f in schema)
+
+
+def read_shard_info(path) -> ShardInfo:
+    """The footer of the shard at ``path``; a file that is not a readable Parquet shard (empty, truncated, missing)
+    is a :class:`ResidueShardError` naming it."""
+    try:
+        schema = pq.read_schema(path)
+    except (pa.ArrowException, OSError) as e:
+        raise ResidueShardError(f"{path}: not a readable Parquet embedding shard ({e})") from e
+    meta = schema.metadata or {}
+
+    def text(key):
+        value = meta.get(key)
+        return value.decode("utf-8", "replace") if value is not None else None
+
+    record = None
+    if META_PASS in meta:
+        try:
+            record = json.loads(meta[META_PASS].decode("utf-8"))
+        except ValueError:
+            record = None
+        if not isinstance(record, dict):
+            raise ResidueShardError(f"{path}: its {META_PASS.decode()} metadata is not a JSON object")
+    return ShardInfo(path=Path(path), residue_output=text(META_RESIDUE_OUTPUT), system=text(META_SYSTEM),
+                     encoding_digest=text(META_ENCODING_DIGEST), system_digest=text(META_SYSTEM_DIGEST),
+                     column_types=_column_types(schema), pass_record=record)
+
+
+def shards_pass_record(infos: Sequence[ShardInfo]) -> Dict[str, Any]:
+    """The pass record of one run's shards (``PASS_KEYS``, every field ``None`` when they hold none): the first
+    shard's, which is rank 0's in path order. The ranks of a run share their settings, so a field on which the
+    shards disagree, or a shard without a record, is only logged."""
+    out: Dict[str, Any] = dict.fromkeys(PASS_KEYS)
+    records = [info.pass_record for info in infos if info.pass_record is not None]
+    if not records:
+        return out
+    first = records[0]
+    out.update({key: first.get(key) for key in PASS_KEYS})
+    differing = sorted({key for record in records[1:] for key in PASS_KEYS if record.get(key) != first.get(key)})
+    if differing or len(records) != len(infos):
+        logger.warning(f"{len(infos)} shard(s) ({infos[0].path.name}, ...): {len(records)} record their pass"
+                       + (f", and they differ in {', '.join(differing)}" if differing else "")
+                       + f"; using {infos[0].path.name}'s")
+    return out
+
+
+def check_shards(paths: Iterable, residue_output: str, system) -> List[ShardInfo]:
+    """Refuse (:class:`ResidueShardError`) unless every shard in ``paths`` holds ``residue_output`` computed with
+    ``system``'s encoding. Reads the footers only, all of them before any data.
+
+    Mixed shards (different kinds, systems, digests or column types between them) are refused naming each group;
+    then the common metadata must be ``system``'s: the ``encoding_digest`` for residue codes, and also the
+    ``system_digest`` for query encodings. The columns must be exactly :func:`shard_schema`'s.
+    """
+    residue_output = check_residue_output(residue_output)
+    if residue_output is None:
+        raise ValueError("check_shards needs a residue output")
+    infos = [read_shard_info(p) for p in paths]
+    if not infos:
+        return infos
+    groups: dict = {}
+    for info in infos:
+        groups.setdefault(info.key, []).append(info)
+    if len(groups) > 1:
+        shown = "; ".join(f"{len(g)} shard(s) with {g[0].describe()} (e.g. {g[0].path.name})"
+                          for g in groups.values())
+        raise ResidueShardError(f"mixed embedding shards: {shown}. Shards of one run must come from one pass; remove "
+                                "the shards of other runs or use another folder.")
+    info = infos[0]
+    where = f"{len(infos)} shard(s) ({info.path.name}, ...)"
+    if info.residue_output != residue_output:
+        raise ResidueShardError(f"{where} hold {info.describe()}, not {residue_output}: they were written by a pass "
+                                f"without --residue-codes or for another purpose")
+    want_types = _column_types(shard_schema(residue_output, system))
+    if info.column_types != want_types:
+        raise ResidueShardError(f"{where} have columns {list(info.column_types)}, expected {list(want_types)}")
+    stale = []
+    if info.encoding_digest != system.encoding_digest():
+        stale.append(f"encoding_digest {info.encoding_digest}, {system.name} has {system.encoding_digest()}")
+    if residue_output == QUERY_ENCODING and info.system_digest != system.digest():
+        stale.append(f"system_digest {info.system_digest}, {system.name} has {system.digest()}")
+    if stale:
+        raise ResidueShardError(f"stale embedding shards: {where} hold {info.describe()}, which is not the encoding "
+                                f"of {system.name} ({'; '.join(stale)}). Rebuild them with this FoldMatch.")
+    return infos
+
+
+class PayloadBatch(NamedTuple):
+    """One record batch of a residue shard: ``offsets`` (int64 ``[n + 1]``, in bytes, starting at 0) delimit each
+    row's payload in ``data`` (uint8)."""
+    ids: List[str]
+    offsets: np.ndarray
+    data: np.ndarray
+    seq_sha1s: List[bytes]
+
+
+def _payload_buffers(column: pa.Array, where: str):
+    if column.null_count:
+        raise ResidueShardError(f"{where}: {column.null_count} null payload(s)")
+    if not isinstance(column, pa.LargeBinaryArray):
+        raise ResidueShardError(f"{where}: payload column is {column.type}, expected large_binary")
+    _, offsets_buf, data_buf = column.buffers()
+    n = len(column)
+    offsets = np.frombuffer(offsets_buf, dtype=np.int64, count=column.offset + n + 1)[column.offset:]
+    start, stop = int(offsets[0]), int(offsets[-1])
+    data = (np.frombuffer(data_buf, dtype=np.uint8, count=stop)[start:stop] if stop
+            else np.empty(0, dtype=np.uint8))
+    return offsets - start, data
+
+
+def iter_payload_batches(path, residue_output: str, batch_size: int = 32768) -> Iterator[PayloadBatch]:
+    """Stream one shard's ``id``, payload and ``seq_sha1`` columns (column projection: the embeddings are not
+    read). Opens the shard when iteration starts and closes it when the shard is done."""
+    residue_output = check_residue_output(residue_output)
+    where = f"{Path(path).name}"
+    try:
+        with pq.ParquetFile(path) as pf:
+            for record in pf.iter_batches(batch_size=batch_size, columns=[ID, residue_output, SEQ_SHA1]):
+                offsets, data = _payload_buffers(record.column(residue_output), where)
+                sha1 = record.column(SEQ_SHA1)
+                if sha1.null_count:
+                    raise ResidueShardError(f"{where}: {sha1.null_count} null seq_sha1 value(s)")
+                yield PayloadBatch(record.column(ID).to_pylist(), offsets, data, sha1.to_pylist())
+    except (pa.ArrowException, OSError) as e:
+        # A shard damaged after its footer was checked (truncated data pages, a vanished file).
+        raise ResidueShardError(f"{path}: the shard could not be read ({e})") from e
+
+
+class ResidueCodeBatch(NamedTuple):
+    """Residue codes of consecutive entries, in shard order, as the code store's ``create()`` takes them: a
+    3-tuple ``(ids, codes, seq_sha1s)`` with one uint8 ``[L, 8]`` array per entry in ``codes`` (``[0, 8]`` for an
+    empty payload). The arrays are read-only, C-contiguous views of the batch's Arrow buffer, consecutive in it, so
+    ``codes[k].tobytes()`` is entry ``k``'s byte layout in the store."""
+    ids: List[str]
+    codes: List[np.ndarray]
+    seq_sha1s: List[bytes]
+
+    @property
+    def lengths(self) -> np.ndarray:
+        """Residues per entry (int64)."""
+        return np.fromiter((len(c) for c in self.codes), dtype=np.int64, count=len(self.codes))
+
+
+def iter_residue_codes(paths: Sequence, system, load_batch_size: int = 32768) -> Iterator[ResidueCodeBatch]:
+    """:func:`check_shards` on every shard (before anything is yielded), then the residue codes one shard at a
+    time, in the given order, ``load_batch_size`` entries per batch."""
+    paths = [Path(p) for p in paths]
+    check_shards(paths, RESIDUE_CODES, system)
+    return _residue_code_batches(paths, system.code_bytes, load_batch_size)
+
+
+def _residue_code_batches(paths, code_bytes: int, load_batch_size: int) -> Iterator[ResidueCodeBatch]:
+    for path in paths:
+        for batch in iter_payload_batches(path, RESIDUE_CODES, load_batch_size):
+            sizes = np.diff(batch.offsets)
+            bad = np.flatnonzero(sizes % code_bytes)
+            if bad.size:
+                raise ResidueShardError(f"{path.name}: {bad.size} residue-code payload(s) are not a multiple of "
+                                        f"{code_bytes} bytes (e.g. {batch.ids[int(bad[0])]!r}, "
+                                        f"{int(sizes[bad[0]])} bytes)")
+            codes = batch.data.reshape(-1, code_bytes)
+            bounds = batch.offsets[1:-1] // code_bytes
+            yield ResidueCodeBatch(batch.ids, np.split(codes, bounds) if len(batch.ids) else [], batch.seq_sha1s)
