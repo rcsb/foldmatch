@@ -429,7 +429,68 @@ def _registry(*systems: EsmCodesSystem) -> Mapping[str, EsmCodesSystem]:
 
 #: Every system this FoldMatch can build and query, by name. Entries are immutable once frozen (golden digests in
 #: tests/test_scoring_system.py); a change of any value is a new system name, never an edit (D17).
-REGISTRY: Mapping[str, EsmCodesSystem] = _registry()
+REGISTRY: Mapping[str, EsmCodesSystem] = _registry(
+    # esm-codes-v1: model M8_s0 (L2m_B8_s0), setting D, S = S_f - S_r, UniRef50 1,000-member panel, M3t999 table.
+    # FROZEN 2026-10-14 (after P0.6, P0.7 and the upload of the bundle to rcsb/foldmatch-esm-codes). Every value
+    # below equals the bundle's bundle.json / meta_json (prepare() checks it); the content digests are
+    # foldmatch-tensor-digest/1; the table is panel/fit2/results/ship_final.json (md5 c51735f9...).
+    EsmCodesSystem(
+        name="esm-codes-v1",
+        calibration_version="foldmatch-evalue-M8_s0-D_fmr-pnlU50s1000-M3t999-v1",
+        esm_repo="rcsb/rcsb-esm",
+        esm_weights_sha256="5ead5a135c658068db6a4f1b933e72d6110992c4668822e1c0e2dcc53e38acd9",
+        embedding_tap="per_residue_embedding",
+        input_normalisation="ascii_upper_nows_v1",
+        input_cast="float16",
+        transform_sha256="e8989b1cefc839784555ff973dabb9a2f7ef4bdf81ac78ad47767714227c3336",
+        transform_output_cast="float16",
+        target_encoder_sha256="58da263e005a79fd1689b0f5605adbb85b51532bca99e4ef7330916a50df6686",
+        encoder_architecture="esm-codes-mlp-v1",
+        encoder_dtype="float32",
+        code_bits=64,
+        code_bytes=8,
+        bitorder="big",
+        sign_rule="bit_k = (h_k >= 0)",
+        query_encoder_sha256="d8bed195068be23a60586632fa471a08f3a767fe8cf34b06aa6e733d90cd3bf8",
+        query_dtype="float16",
+        query_prep="fp64_seq_k_asc",
+        query_prep_eps=1e-12,
+        similarity="pm1_fp32_blas_gemm_per_pair",
+        determinism="tolerance_s16_v1",
+        normalisation=Normalisation(name="rowcol_z", std="population", eps=1e-08, degenerate_std_lt=1e-06),
+        offset=1.0,
+        gap_open=5.0,
+        gap_extend=0.5,
+        dp="fmsw/1",
+        score_form="fwd_minus_rev_view",
+        score_diff="float64",
+        panel_sha256="7aea2b00a24ee41c5a9f9adb91a5723ee02dff12dca23998767ab87da4b9dcf7",
+        panel_size=1000,
+        panel_residues=355626,
+        panel_quantile=0.9,
+        quantile_method="linear",
+        bin_centres=(32.58437573116228, 50.34161310783617, 80.8700900525453, 149.85910754690784,
+                     276.49344608131264, 594.9175724688861),
+        lam=(0.18775162858061797, 0.1227859873586807, 0.10488523441851651, 0.08222582327223689,
+             0.04784353519669357, 0.041619283794126286),
+        lnK=(-13.42382627313042, -13.969792295008805, -13.73906582316063, -13.454607332784638,
+             -14.484498724905178, -15.878915750325046),
+        low_m_rule="clamp",
+        high_m_rule="clamp",
+        calibrated_domain=CalibratedDomain(query_min_length=21, query_max_length=966, target_max_length=3000,
+                                           max_nonstandard_fraction=0.01, target_min_distinct_codes=2),
+        degenerate_query_rule="no_hits",
+        bundle_repo="rcsb/foldmatch-esm-codes",
+        bundle_revision="3a14f46b72f5971f47203a57ba418e87054142bd",
+        bundle_files=(
+            ("LICENSE", "49f7a86fb623fa33dcb951fd53f840795989eadb9f03dda5c0587a2f451258d1"),
+            ("README.md", "70bd8e84c48b2a511ec3b37cededa7eaa1f46e7b3da6ea86f5881126bc02416c"),
+            ("bundle.json", "dcd29bddbff0bb7dc93209bbe292d422d7bff21dd48c80f6e1f6b74f23789fe8"),
+            ("esm_codes_v1_encoders.pt", "1696ab91089ece8bce787d38b9d4d68bbc8ca4abff06f836f6e9363a23a1c02b"),
+            ("esm_codes_v1_scoring.npz", "a5bebd626ec874626fb9372a63d10c32a001ed09c358717448bc9e1fd0ddedd6"),
+        ),
+    ),
+)
 
 
 def known_names() -> Tuple[str, ...]:

@@ -1,9 +1,10 @@
 """P2.2: ESM3 residue-code encoders (plan §6 P2.2, spec S2-S5).
 
 Structural tests use tiny synthetic bundles (a 16-dimensional embedding, registered as a test-only architecture) and
-always run. Tests that need the real esm-codes-v1 weights read the bundle from the directory named by
-``FOLDMATCH_ESM_CODES_BUNDLE`` (the files of the HF repo rcsb/foldmatch-esm-codes) and are skipped when it is not set;
-P4 replaces the variable with the pinned, sha256-verified download.
+always run. Tests that need the real esm-codes-v1 weights get the bundle from the scoring-system registry
+(``get_esm_codes_bundle(get(DEFAULT_ESM_CODES))``: pinned revision, sha256-verified, downloaded once into the Hugging
+Face cache; see ``esm_codes_bundle.py``), or from the directory named by ``FOLDMATCH_ESM_CODES_BUNDLE`` when it is set.
+They are skipped only when the bundle is neither cached nor downloadable.
 """
 import hashlib
 import io
@@ -21,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import esm_codes_bundle
 from foldmatch.model import residue_code_encoder as rce
 from foldmatch.model.residue_code_encoder import (
     ARCHITECTURES, ENCODERS_FORMAT, IMPLEMENTED_CONVENTIONS, EsmCodesBundleError, ResidueCodeHead,
@@ -31,7 +33,6 @@ _TEST_PATH = Path(__file__).parent
 _FIXTURES = _TEST_PATH / "resources" / "esm_codes"
 _EMBEDDINGS = _TEST_PATH / "resources" / "embeddings"
 _SRC = Path(rce.__file__).resolve().parents[2]
-BUNDLE_ENV = "FOLDMATCH_ESM_CODES_BUNDLE"
 ENCODERS_FILE = "esm_codes_v1_encoders.pt"
 SCORING_FILE = "esm_codes_v1_scoring.npz"
 
@@ -465,31 +466,19 @@ class Fp32ContextTest(unittest.TestCase):
 # =====================================================================================================================
 # Tests with the real esm-codes-v1 bundle
 # =====================================================================================================================
-def _bundle_dir():
-    d = os.environ.get(BUNDLE_ENV)
-    return Path(d) if d else None
-
-
-_SKIP_NO_BUNDLE = unittest.skipIf(
-    _bundle_dir() is None,
-    f"{BUNDLE_ENV} is not set: point it at a directory holding the esm-codes-v1 bundle files ({ENCODERS_FILE}, "
-    f"{SCORING_FILE}, bundle.json); P4 adds the pinned HF download")
-
-
 class _RealBundle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        d = _bundle_dir()
+        d = esm_codes_bundle.bundle_dir()          # unittest.SkipTest only when offline and not cached
         cls.dir = d
         for f in (ENCODERS_FILE, SCORING_FILE, "bundle.json"):
             if not (d / f).is_file():
-                raise AssertionError(f"{BUNDLE_ENV}={d} has no {f}")
+                raise AssertionError(f"the esm-codes bundle directory {d} has no {f}")
         cls.bundle_json = json.loads((d / "bundle.json").read_text())
         cls.head = load_esm_codes_encoders(d / ENCODERS_FILE,
                                            sha256=cls.bundle_json["files"][ENCODERS_FILE]["sha256"])
 
 
-@_SKIP_NO_BUNDLE
 class BundleFilesTest(_RealBundle):
     """The published files themselves: weights_only, sha256s, content digests, torch-free scoring npz."""
 
@@ -571,7 +560,6 @@ def _bits_equal(a, b):
     return int((np.unpackbits(a, axis=1) == np.unpackbits(b, axis=1)).sum()), int(a.size * 8)
 
 
-@_SKIP_NO_BUNDLE
 class EncoderParityTest(_RealBundle):
     """Acceptance (plan §6): F2 bits >= 0.99999 and q within 1 fp16 ulp; F2b and F2c codes identical to the reference
     encoder on the same rows.
@@ -619,7 +607,6 @@ class EncoderParityTest(_RealBundle):
         self.assertLessEqual(_row_ulps(q, q_ref), 4.0)
 
 
-@_SKIP_NO_BUNDLE
 class NotRecoverableFromWeightsTest(_RealBundle):
     """The weights alone do not define the codes: GELU-tanh, dropping an fp16 cast or folding the whitener into the
     first layer each changes the reference codes and the query encodings.

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from foldmatch.search import code_statistics as cs
 
@@ -236,6 +237,70 @@ class Q90Test(unittest.TestCase):
             cs.q90([1.0, 2.0], method="nearest")
         with self.assertRaises(ValueError):
             cs.q90([1.0, 2.0], quantile=1.0)
+
+
+
+# =====================================================================================================================
+# with the registry entry and its bundle
+# =====================================================================================================================
+class RegistryTableTest(unittest.TestCase):
+
+    def test_registry_entry_gives_the_f4_values(self):
+        from foldmatch.search import scoring_system as ss
+        system, table = ss.get(ss.DEFAULT_ESM_CODES), f4_table()
+        for r in F4["rows"]:
+            self.assertEqual(cs.lam_lnk(r["m"], system), cs.lam_lnk(r["m"], table))
+            self.assertEqual(cs.log_evalue(r["S_prime"], r["m"], r["N"], system),
+                             cs.log_evalue(r["S_prime"], r["m"], r["N"], table))
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class BundlePanelTest(unittest.TestCase):
+    """S10 / S11 through the production path with the registry bundle's panel: per-pair BLAS similarity, fmsw S_f and
+    S_r, Q90 = np.quantile(S, 0.9), then lnE at N = 1e9. F1 (50 CATH pairs) within S16 of the research values (Q90
+    and lnE within 1e-4); F3 (20 benchmark queries, 21-966 aa) Q90 within 1e-3."""
+
+    @classmethod
+    def setUpClass(cls):
+        import esm_codes_bundle
+        from foldmatch.search import scoring_system as ss
+        esm_codes_bundle.registry_files()               # unittest.SkipTest only when offline and not cached
+        cls.spec = ss.prepare(ss.get(ss.DEFAULT_ESM_CODES)).for_worker()
+        cls.codes, cls.offsets = cls.spec.load_panel()
+
+    def _scores(self, q16, codes, offsets):
+        from foldmatch.search import swkern
+        r = swkern.score_fwd_rev(swkern.query_prep(q16), codes, offsets, self.spec.dp_params())
+        self.assertFalse(np.any(r.skipped))
+        return r.s_fwd.astype(np.float64) - r.s_rev.astype(np.float64)
+
+    def _q90(self, q16):
+        return cs.q90(self._scores(q16, self.codes, self.offsets), self.spec.panel_quantile, self.spec.quantile_method)
+
+    def test_f1_q90_and_lne(self):
+        z = np.load(_RES / "pairs_v1.npz")
+        qo, to = z["q_offsets"], z["t_offsets"]
+        q90, lne = [], []
+        for p in range(len(z["pair_q"])):
+            a, b = int(z["pair_q"][p]), int(z["pair_t"][p])
+            q16 = z["q"][qo[a]:qo[a + 1]]
+            q = self._q90(q16)
+            S = float(self._scores(q16, z["codes"][to[b]:to[b + 1]], np.array([0, to[b + 1] - to[b]]))[0])
+            bound = 5e-5 * (max(abs(z["S_f"][p]), 1.0) + max(abs(z["S_r"][p]), 1.0))     # S16 on S_f and S_r
+            self.assertLessEqual(abs(S - z["S"][p]), bound)
+            q90.append(q)
+            lne.append(cs.log_evalue(S - q, len(q16), 1e9, self.spec))
+        q90, lne = np.array(q90), np.array(lne)
+        self.assertLessEqual(float(np.max(np.abs(q90 - z["q90"]))), 1e-4)
+        self.assertLessEqual(float(np.max(np.abs(lne - z["lnE_N1e9"]))), 1e-4)
+        self.assertEqual(int(np.sum(lne <= math.log(1e-3))), 3)
+
+    def test_f3_q90(self):
+        z = np.load(_RES / "q90_queries_v1.npz")
+        o = z["offsets"]
+        got = np.array([self._q90(z["q"][o[k]:o[k + 1]]) for k in range(len(o) - 1)])
+        self.assertEqual(len(got), 20)
+        self.assertLessEqual(float(np.max(np.abs(got - z["q90"]))), 1e-3)
 
 
 if __name__ == "__main__":

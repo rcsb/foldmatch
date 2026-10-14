@@ -870,7 +870,7 @@ class PrepareTest(_CacheCase):
         self.assertEqual(ss.IMPLEMENTED["encoder_dtype"], rce.IMPLEMENTED_CONVENTIONS[("encoder", "dtype")])
 
 
-class OfflineReadOnlyTest(_CacheCase):
+class _OfflineBase(_CacheCase):
     """The bundle loader and prepare() in a subprocess with HF_HUB_OFFLINE=1, an unreachable endpoint (any network
     use would fail) and, optionally, a read-only cache; without torch (Stage 2 never imports it)."""
 
@@ -930,6 +930,9 @@ class OfflineReadOnlyTest(_CacheCase):
                 p.chmod(stat.S_IRUSR | stat.S_IXUSR)
             elif p.is_file() and not p.is_symlink():
                 p.chmod(stat.S_IRUSR)
+
+
+class OfflineReadOnlyTest(_OfflineBase):
 
     def test_offline(self):
         self._check(_SyntheticBundle().write(self.cache))
@@ -1010,6 +1013,253 @@ class DownloadModelsTest(unittest.TestCase):
                 self.assertEqual(r.exit_code, 0)
                 self.assertIn("--system", r.output)
                 self.assertIn("esm-codes", r.output)
+
+
+# =====================================================================================================================
+# the frozen registry (P4.4) and the published bundle
+# =====================================================================================================================
+# The golden digests of the registry freeze live in tests/test_scoring_system_golden.py (standard library only, so the
+# CI kernel jobs on Linux and macOS run them too).
+_FIXTURES = Path(__file__).parent / "resources" / "esm_codes"
+
+
+class RegistryEntryTest(unittest.TestCase):
+
+    def test_default_is_registered(self):
+        self.assertEqual(ss.known_names(), ("esm-codes-v1",))
+        self.assertIs(ss.get(ss.DEFAULT_ESM_CODES), ss.REGISTRY["esm-codes-v1"])
+
+    def test_every_entry_is_implemented(self):
+        for s in ss.REGISTRY.values():
+            ss.check_implemented(s)
+            self.assertEqual(s.dp, swkern.DP_ID)
+            self.assertEqual(swkern.DPParams(s.offset, s.gap_open, s.gap_extend), swkern.SETTING_D)
+
+    def test_esm3_pin_is_the_loaders(self):
+        from foldmatch.utils.esm import loaders
+        for s in ss.REGISTRY.values():
+            self.assertEqual((s.esm_repo, s.esm_weights_sha256), (loaders.ESM_REPO_ID, loaders.ESM_WEIGHTS_SHA256))
+
+    def test_v1_matches_the_frozen_fixtures(self):
+        """The v1 entry against the P0.8 fixtures (made from the research artefacts, independently of the bundle):
+        the E-value table of ship_final.json bit for bit, the setting and the identity strings."""
+        s = ss.get("esm-codes-v1")
+        f4 = json.loads((_FIXTURES / "evalue_grid_v1.json").read_text())
+        self.assertEqual(s.bin_centres, tuple(f4["table"]["center_len"]))
+        self.assertEqual(s.lam, tuple(f4["table"]["lam"]))
+        self.assertEqual(s.lnK, tuple(f4["table"]["lnK"]))
+        fixtures = json.loads((_FIXTURES / "FIXTURES.json").read_text())
+        self.assertEqual((s.name, s.calibration_version), (fixtures["system"], fixtures["calibration_version"]))
+        setting = fixtures["setting"]
+        self.assertEqual((s.offset, s.gap_open, s.gap_extend), (setting["offset"], setting["gap_open"],
+                                                               setting["gap_extend"]))
+        self.assertEqual((s.normalisation.degenerate_std_lt, s.query_prep_eps), (setting["s7_eps"],
+                                                                                 setting["qprep_eps"]))
+        self.assertEqual(s.esm_weights_sha256, fixtures["esm3"]["weights_blob_sha256"])
+        self.assertEqual(f4["calibration_version"], s.calibration_version)
+
+    def test_v1_encoder_is_the_encoder_modules(self):
+        from foldmatch.model import residue_code_encoder as rce
+        s = ss.get("esm-codes-v1")
+        self.assertEqual((s.encoder_architecture, s.encoder_dtype), ("esm-codes-mlp-v1", "float32"))
+        self.assertEqual(rce.ARCHITECTURES[s.encoder_architecture]["activation"], "gelu_exact")
+
+    def test_v1_calibrated_domain_and_rules(self):
+        """S13 / S13b / D14 / D15 as decided 2026-10-12."""
+        s = ss.get("esm-codes-v1")
+        self.assertEqual(s.calibrated_domain, CalibratedDomain(21, 966, 3000, 0.01, 2))
+        self.assertEqual((s.low_m_rule, s.high_m_rule, s.degenerate_query_rule), ("clamp", "clamp", "no_hits"))
+        self.assertEqual((s.similarity, s.determinism), ("pm1_fp32_blas_gemm_per_pair", "tolerance_s16_v1"))
+        self.assertEqual((s.panel_size, s.panel_residues, s.panel_quantile, s.quantile_method),
+                         (1000, 355626, 0.9, "linear"))
+
+    def test_bundle_json_states_every_value_but_the_pins(self):
+        stated = {entry[0][0] for entry in ss.DOCUMENT_FIELDS}
+        self.assertEqual(stated, {f.name for f in dataclasses.fields(EsmCodesSystem)} - {"bundle_revision",
+                                                                                         "bundle_files"})
+
+
+class SingleSourceOfTruthTest(unittest.TestCase):
+    """A bundle revision is written down exactly once: in its registry entry (plan principle 2, R5)."""
+
+    SKIP_DIRS = {".git", "build", "dist", "__pycache__", ".venv", "venv", ".idea", ".pytest_cache"}
+    SKIP_SUFFIXES = {".so", ".dylib", ".pyc", ".o"}
+
+    def test_bundle_revision_exists_only_in_the_registry_entry(self):
+        root = Path(__file__).resolve().parents[1]
+        if not (root / "src" / "foldmatch").is_dir():
+            self.skipTest("not a source checkout")
+        revisions = {s.bundle_revision.encode() for s in ss.REGISTRY.values()}
+        hits = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS and not d.endswith(".egg-info")
+                           and (not d.startswith(".") or d == ".github")]
+            for f in filenames:
+                path = Path(dirpath) / f
+                if path.suffix in self.SKIP_SUFFIXES or path.is_symlink():
+                    continue
+                data = path.read_bytes()
+                for rev in revisions:
+                    if rev in data:
+                        hits[(path.relative_to(root).as_posix(), rev.decode())] = data.count(rev)
+        self.assertEqual(hits, {("src/foldmatch/search/scoring_system.py", r.decode()): 1 for r in revisions})
+
+
+class RealBundleTest(unittest.TestCase):
+    """prepare() and the head on the published bundle at the registry's revision (downloaded once, sha256-verified)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import esm_codes_bundle
+        cls.files = esm_codes_bundle.registry_files()
+        cls.system = ss.get(ss.DEFAULT_ESM_CODES)
+        cls.prepared = ss.prepare(cls.system)
+
+    def test_files_are_the_pinned_ones(self):
+        self.assertEqual(sorted(self.files), [n for n, _ in self.system.bundle_files])
+        for name, sha in self.system.bundle_files:
+            self.assertEqual(model._file_sha256(self.files[name]), sha, name)
+            self.assertEqual(Path(self.files[name]).parent.name, self.system.bundle_revision)
+
+    def test_prepare_accepts_the_published_bundle(self):
+        p = self.prepared
+        self.assertEqual((p.encoders_file, p.scoring_file), ("esm_codes_v1_encoders.pt", "esm_codes_v1_scoring.npz"))
+        self.assertEqual(p.bundle["licence"]["spdx"], "MIT")
+        spec = p.for_worker()
+        self.assertEqual(pickle.loads(pickle.dumps(spec)), spec)
+        codes, offsets = spec.load_panel()
+        self.assertEqual((codes.shape, codes.dtype, offsets.shape), ((355626, 8), np.uint8, (1001,)))
+        self.assertEqual(tensor_digest({"codes": codes, "offsets": offsets}), self.system.panel_sha256)
+
+    def test_table_off_by_one_ulp_is_refused(self):
+        """A registry entry one ulp off the bundle (as if mistyped and registered) is refused by prepare(); an
+        unregistered variant never reaches the bundle (test_unregistered_variants_are_refused)."""
+        for key, i, direction in (("lam", 3, math.inf), ("lnK", 0, -math.inf), ("bin_centres", 5, math.inf)):
+            v = list(getattr(self.system, key))
+            v[i] = math.nextafter(v[i], direction)
+            variant = dataclasses.replace(self.system, **{key: v})
+            with self.subTest(field=key), _registered(variant), \
+                    self.assertRaisesRegex(BundleMismatchError, rf"statistics\.{key}"):
+                ss.prepare(variant)
+
+    def test_other_differences_are_refused(self):
+        cases = {"panel_quantile": 0.95, "calibration_version": "foldmatch-evalue-other",
+                 "calibrated_domain": CalibratedDomain(21, 966, 1000, 0.01, 2), "panel_residues": 355627,
+                 "target_encoder_sha256": "0" * 64, "name": "esm-codes-v2"}
+        for key, value in cases.items():
+            variant = dataclasses.replace(self.system, **{key: value})
+            with self.subTest(field=key), _registered(variant), self.assertRaises(BundleMismatchError):
+                ss.prepare(variant)
+
+    def test_unregistered_variants_are_refused(self):
+        d = json.loads(self.system.to_json())
+        d["bundle_revision"] = "d" * 40
+        variants = {"foreign revision": EsmCodesSystem.from_json(json.dumps(d)),
+                    "other quantile": dataclasses.replace(self.system, panel_quantile=0.95)}
+        for label, variant in variants.items():
+            with self.subTest(case=label), mock.patch.object(model, "hf_hub_download") as hub:
+                with self.assertRaises(UnknownScoringSystemError):
+                    ss.prepare(variant)
+                hub.assert_not_called()
+        self.assertEqual(ss.registered(EsmCodesSystem.from_json(self.system.to_json())), self.system)
+
+    def test_load_head(self):
+        head = self.prepared.load_head()
+        self.assertEqual(head.content_digests(), {k: getattr(self.system, k) for k in (
+            "transform_sha256", "query_encoder_sha256", "target_encoder_sha256")})
+        self.assertEqual(head.meta["system"], self.system.name)
+        other = dataclasses.replace(self.prepared, system=dataclasses.replace(self.system,
+                                                                              query_encoder_sha256="0" * 64))
+        with self.assertRaisesRegex(BundleMismatchError, "query_encoder_sha256"):
+            other.load_head()
+        foreign = dataclasses.replace(self.prepared, system=dataclasses.replace(self.system,
+                                                                                esm_weights_sha256="0" * 64))
+        with self.assertRaisesRegex(UnsupportedSystemError, "ESM3 weights"):
+            foreign.load_head()
+        for change, pattern in ((dict(encoder_architecture="esm-codes-mlp-v2"), "architecture is 'esm-codes-mlp-v1'"),
+                                (dict(encoder_dtype="bfloat16"), "encoder dtype is 'float32'")):
+            other = dataclasses.replace(self.prepared, system=dataclasses.replace(self.system, **change))
+            with self.subTest(**change), self.assertRaisesRegex(BundleMismatchError, pattern):
+                other.load_head()
+
+
+class RealBundleOfflineTest(_OfflineBase):
+    """The published bundle, copied from the cache it was downloaded into, used offline and read-only, without
+    torch and with an unreachable endpoint."""
+
+    REGISTER = False                # the published system is the real registry entry
+
+    def setUp(self):
+        super().setUp()
+        import shutil
+        import esm_codes_bundle
+        self.system = ss.get(ss.DEFAULT_ESM_CODES)
+        repo = Path(esm_codes_bundle.registry_files()[ss.BUNDLE_JSON]).parents[2]
+        shutil.copytree(repo, self.cache / repo.name, symlinks=True)
+
+    def test_offline(self):
+        out = self._check(self.system)
+        self.assertEqual(out["lnE"], cs.log_evalue(3.0, 100, 1e9, self.system))
+
+    def test_read_only_cache_offline_and_online(self):
+        self._read_only()
+        self._require_read_only()
+        self._check(self.system, offline=True)
+        self._check(self.system, offline=False)
+
+
+class BundleHelperSkipRuleTest(unittest.TestCase):
+    """tests/esm_codes_bundle.py skips the real-bundle tests only when offline mode is on and the bundle is not
+    cached; an unreachable Hub with offline mode off, a sha256 mismatch or any other failure is a test error, so CI
+    never turns green without the acceptance checks (P4 review)."""
+
+    def setUp(self):
+        import esm_codes_bundle
+        self.helper = esm_codes_bundle
+        esm_codes_bundle._fetch.cache_clear()
+        self.addCleanup(esm_codes_bundle._fetch.cache_clear)
+
+    def _classify(self, *, offline, error=None):
+        from huggingface_hub import constants as hf_constants
+        self.helper._fetch.cache_clear()
+        files = {"bundle.json": Path("/cache/snap/bundle.json")}
+        with mock.patch.object(model, "get_esm_codes_bundle", side_effect=error, return_value=files), \
+                mock.patch.object(hf_constants, "HF_HUB_OFFLINE", offline):
+            try:
+                got = self.helper.registry_files()
+            except unittest.SkipTest:
+                return "skip"
+            except RuntimeError as e:
+                self.assertIsInstance(e.__cause__, type(error))
+                return "error"
+        self.assertEqual(got, files)
+        return "ok"
+
+    def test_skip_only_offline_and_not_cached(self):
+        unavailable = BundleUnavailableError("bundle.json is not in the Hugging Face cache and offline mode is on")
+        unreachable = BundleUnavailableError("bundle.json is not in the cache and the Hugging Face Hub is unreachable")
+        cases = {
+            "offline, not cached": (dict(offline=True, error=unavailable), "skip"),
+            "Hub unreachable, offline mode off": (dict(offline=False, error=unreachable), "error"),
+            "sha256 mismatch offline": (dict(offline=True, error=BundleMismatchError("sha256 differs")), "error"),
+            "sha256 mismatch online": (dict(offline=False, error=BundleMismatchError("sha256 differs")), "error"),
+            "not the registry entry": (dict(offline=True, error=UnknownScoringSystemError("x")), "error"),
+            "a bug": (dict(offline=True, error=TypeError("x")), "error"),
+            "fetched": (dict(offline=False), "ok"),
+            "fetched offline": (dict(offline=True), "ok"),
+        }
+        for label, (kw, want) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._classify(**kw), want)
+
+    def test_one_fetch_per_session(self):
+        from huggingface_hub import constants as hf_constants
+        with mock.patch.object(model, "get_esm_codes_bundle", side_effect=BundleUnavailableError("down")) as fetch, \
+                mock.patch.object(hf_constants, "HF_HUB_OFFLINE", False):
+            for _ in range(3):
+                with self.assertRaises(RuntimeError):
+                    self.helper.registry_files()
+        self.assertEqual(fetch.call_count, 1)
 
 
 class NoTorchImportTest(unittest.TestCase):

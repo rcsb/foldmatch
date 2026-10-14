@@ -99,6 +99,11 @@ jobs:
       - name: Kernel tests
         run: python -m pytest tests/test_swkern.py -rs
 
+      # The esm-codes registry golden digests (plan P4 acceptance: identical on Linux and macOS). The test module needs
+      # only the standard library and foldmatch.search.scoring_system, so it runs on every kernel runner.
+      - name: Scoring-system golden digests
+        run: python -m pytest tests/test_scoring_system_golden.py -rs
+
       - name: selftest() for each ISA
         run: |
           for isa in ${{ matrix.isas }}; do
