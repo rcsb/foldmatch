@@ -28,18 +28,35 @@ Fidelity notes:
   * ``fident`` is nident/alnlen (identical columns over the whole alignment
     length, gaps included) — the same fraction MMseqs2 reports; ``pident`` is
     that fraction as a percentage (100*fident), per the field's name.
-  * ``bits`` is emitted as an integer via MMseqs2's ``int(bitScore + 0.5)``.
+  * ``bits`` is emitted as an integer. BLOSUM62 keeps MMseqs2's
+    ``int(bitScore + 0.5)``, so its output is unchanged; it truncates towards
+    zero, so a negative bit score (``--significance-mode sampled`` with low
+    gap costs gives some) prints one higher: -7.6 prints -7. esm-codes bit
+    scores are rounded half up, ``floor(bitScore + 0.5)`` (method S11): -7.6
+    prints -8.
+  * ``evalue`` is ``%.3E``; under esm-codes it is rendered from ln E, so it
+    never underflows (``5.076E-435``).
   * ``gapopen`` counts maximal gap RUNS (query- and target-side independently),
     not gap characters.
   * CIGAR ops follow MMseqs2: ``M`` aligned pair, ``D`` gap in query (deletion),
     ``I`` gap in target (insertion).
+
+esm-codes columns (``query sequences --scoring esm-codes``, method S9-S13):
+``raw`` is ``S_f`` as ``%.3f`` (an integer under BLOSUM62, as before); the
+optional ``rawrev`` (``S_r``), ``q90`` (the query's panel quantile) and
+``rawadj`` (``S' = S_f - S_r - Q90``) are ``%.3f``, and ``ecal`` is ``1`` for
+a hit inside the calibrated domain (S13), else ``0``. These four render empty
+under BLOSUM62 (and ``query db``); ``evalue``, ``bits``, ``q90`` and
+``rawadj`` render empty when the panel pass was skipped (D11).
 --------------------------------------------------------------------------- #
 """
 
 import logging
+import numbers
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
+from foldmatch.search.code_statistics import format_evalue_from_log, render_bits
 from foldmatch.types.api_types import FormatMode
 
 if TYPE_CHECKING:  # avoids a runtime import cycle; alignment imports this module
@@ -204,7 +221,7 @@ OUTPUT_FIELD_DESCRIPTIONS: Dict[str, str] = {
     "tend": "1-indexed alignment end position in target sequence",
     "tlen": "Target sequence length",
     "alnlen": "Alignment length (number of aligned columns)",
-    "raw": "Raw alignment score",
+    "raw": "Raw alignment score (blosum62: the integer Smith-Waterman score; esm-codes: S_f)",
     "bits": "Bit score",
     "cigar": "Alignment CIGAR string (M match, D gap in query, I gap in target)",
     "qseq": "Query sequence",
@@ -214,9 +231,16 @@ OUTPUT_FIELD_DESCRIPTIONS: Dict[str, str] = {
     "mismatch": "Number of mismatches",
     "qcov": "Fraction of query sequence covered by alignment",
     "tcov": "Fraction of target sequence covered by alignment",
+    "rawrev": "esm-codes: score of the row-reversed query, S_r (empty under blosum62)",
+    "q90": "esm-codes: the query's 0.9 quantile of S over the score panel, Q90 (empty under blosum62)",
+    "rawadj": "esm-codes: adjusted score S_f - S_r - Q90, the score behind evalue and bits (empty under blosum62)",
+    "ecal": "esm-codes: 1 if the hit is inside the calibrated domain of the E-values, else 0 (empty under blosum62)",
 }
 
 SUPPORTED_OUTPUT_FIELDS: Tuple[str, ...] = tuple(OUTPUT_FIELD_DESCRIPTIONS)
+
+# Fields only esm-codes Stage 2 computes; they render empty under BLOSUM62.
+ESM_CODES_OUTPUT_FIELDS: Tuple[str, ...] = ("rawrev", "q90", "rawadj", "ecal")
 
 # MMseqs2's own default column set, plus the Stage-1 embedding score right
 # after the identifiers (this tool's prefilter has no MMseqs2 equivalent, and
@@ -262,14 +286,44 @@ def needs_significance(fields: List[str]) -> bool:
     return any(f in SIGNIFICANCE_FIELDS for f in fields)
 
 
+def _format_3f(value: Optional[float]) -> str:
+    """``%.3f``, empty for None; a value that rounds to zero prints ``0.000``, never ``-0.000``."""
+    if value is None:
+        return ""
+    text = f"{value:.3f}"
+    return "0.000" if text == "-0.000" else text
+
+
+def _render_raw(m) -> str:
+    """The integer BLOSUM62 score as before; the float esm-codes S_f as ``%.3f``."""
+    return str(m.score) if isinstance(m.score, numbers.Integral) else _format_3f(m.score)
+
+
+def _render_bits(m) -> str:
+    """BLOSUM62 (an integer score): MMseqs2's ``int(bits + 0.5)``, unchanged; esm-codes: ``floor(bits + 0.5)``."""
+    if m.bit_score is None:
+        return ""
+    if isinstance(m.score, numbers.Integral):
+        return str(int(m.bit_score + 0.5))
+    return str(render_bits(m.bit_score))
+
+
+def _render_evalue(m) -> str:
+    """From ln E when the aligner gives it (esm-codes: no underflow), else the E-value as ``%.3E``."""
+    if m.log_evalue is not None:
+        return format_evalue_from_log(m.log_evalue)
+    return f"{m.evalue:.3E}" if m.evalue is not None else ""
+
+
 # Per-field renderers: ``(query_id, hit) -> str``. Significance-derived fields
 # render to "" when significance was not computed; heavy strings render to ""
-# when they were not requested (and so were never materialized).
+# when they were not requested (and so were never materialized); the esm-codes
+# fields render to "" under BLOSUM62.
 _FIELD_RENDERERS: Dict[str, Callable[[str, "Hit"], str]] = {
     "query":    lambda qid, h: qid,
     "target":   lambda qid, h: h.subject_id,
     "embscore": lambda qid, h: format_embedding_score(h.emb_score),
-    "evalue":   lambda qid, h: f"{h.metrics.evalue:.3E}" if h.metrics.evalue is not None else "",
+    "evalue":   lambda qid, h: _render_evalue(h.metrics),
     "gapopen":  lambda qid, h: str(h.metrics.gap_open),
     "pident":   lambda qid, h: f"{100.0 * h.metrics.identity_aln:.3f}",
     "fident":   lambda qid, h: f"{h.metrics.identity_aln:.3f}",
@@ -281,8 +335,8 @@ _FIELD_RENDERERS: Dict[str, Callable[[str, "Hit"], str]] = {
     "tend":     lambda qid, h: str(h.metrics.t_end),
     "tlen":     lambda qid, h: str(h.metrics.subject_len),
     "alnlen":   lambda qid, h: str(h.metrics.aln_len),
-    "raw":      lambda qid, h: str(h.metrics.score),
-    "bits":     lambda qid, h: str(int(h.metrics.bit_score + 0.5)) if h.metrics.bit_score is not None else "",
+    "raw":      lambda qid, h: _render_raw(h.metrics),
+    "bits":     lambda qid, h: _render_bits(h.metrics),
     "cigar":    lambda qid, h: h.metrics.cigar or "",
     "qseq":     lambda qid, h: h.metrics.q_seq or "",
     "tseq":     lambda qid, h: h.metrics.t_seq or "",
@@ -291,6 +345,10 @@ _FIELD_RENDERERS: Dict[str, Callable[[str, "Hit"], str]] = {
     "mismatch": lambda qid, h: str(h.metrics.mismatch),
     "qcov":     lambda qid, h: f"{h.metrics.query_coverage:.3f}",
     "tcov":     lambda qid, h: f"{h.metrics.subject_coverage:.3f}",
+    "rawrev":   lambda qid, h: _format_3f(h.metrics.score_rev),
+    "q90":      lambda qid, h: _format_3f(h.metrics.q90),
+    "rawadj":   lambda qid, h: _format_3f(h.metrics.score_adj),
+    "ecal":     lambda qid, h: "" if h.metrics.ecal is None else ("1" if h.metrics.ecal else "0"),
 }
 
 

@@ -246,6 +246,10 @@ class TestParseFormatOutput(unittest.TestCase):
         never be materialized and would silently render as an empty string in
         every output file. Requesting each field *on its own* is what exercises
         the gate; asking for them all at once would mask a missing entry.
+
+        The esm-codes-only fields (``rawrev``, ``q90``, ``rawadj``, ``ecal``) are
+        the exception: BLOSUM62 never computes them, so they render empty here
+        (tests/test_code_alignment.py covers them under esm-codes).
         """
         for field in SUPPORTED_OUTPUT_FIELDS:
             with self.subTest(field=field):
@@ -262,6 +266,9 @@ class TestParseFormatOutput(unittest.TestCase):
                     output_fields=[field],
                 )
                 hit = res["q1"][0]
+                if field in output.ESM_CODES_OUTPUT_FIELDS:
+                    self.assertEqual(output.format_row("q1", hit, [field]), "")
+                    continue
                 self.assertNotEqual(
                     output.format_row("q1", hit, [field]), "",
                     f"column '{field}' rendered empty when requested alone — "

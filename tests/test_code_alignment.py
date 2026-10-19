@@ -1097,5 +1097,159 @@ class PoolAndWorkerTest(_WorldCase):
         self.assertIsNone(ca._STATE)                    # a pool owned by the call is closed after it
 
 
+
+# =====================================================================================================================
+# P6.5: output fields
+# =====================================================================================================================
+def _metrics(**kw):
+    base = dict(identity_aln=0.5, identity_shorter=0.5, query_coverage=1.0, subject_coverage=1.0, aln_len=10,
+                score=12.25, query_len=10, subject_len=10, n_ident=5, mismatch=5)
+    base.update(kw)
+    return alignment.AlignmentMetrics(**base)
+
+
+def _row(m, fields):
+    return output.format_row("q", alignment.Hit("t", 0.5, m), fields).split(output.DELIMITER)
+
+
+class OutputRenderingTest(unittest.TestCase):
+
+    def test_field_registry(self):
+        self.assertEqual(output.DEFAULT_OUTPUT_FIELDS,
+                         ("query", "target", "embscore", "fident", "alnlen", "mismatch", "gapopen", "qstart", "qend",
+                          "tstart", "tend", "evalue", "bits"))
+        self.assertEqual(output.ESM_CODES_OUTPUT_FIELDS, ("rawrev", "q90", "rawadj", "ecal"))
+        self.assertEqual(output.SUPPORTED_OUTPUT_FIELDS[-4:], output.ESM_CODES_OUTPUT_FIELDS)
+        self.assertLessEqual(ca.PANEL_FIELDS, set(output.SUPPORTED_OUTPUT_FIELDS))   # the panel gate's fields exist
+        self.assertEqual(output.parse_format_output("query,rawrev,q90,rawadj,ecal"),
+                         ["query", "rawrev", "q90", "rawadj", "ecal"])
+
+    def test_bits_round_half_up_including_negative_scores(self):
+        """esm-codes (a float score): floor(bits + 0.5) (D9, S11); MMseqs2's int(bits + 0.5) would print -1 for
+        -1.7 and 0 for -0.6."""
+        for bits, want in ((-2.5, "-2"), (-0.4, "0"), (-0.5, "0"), (-0.6, "-1"), (-1.7, "-2"), (0.5, "1"),
+                           (2.4999, "2"), (41.5, "42")):
+            self.assertEqual(_row(_metrics(bit_score=bits), ["bits"]), [want], bits)
+        self.assertEqual(_row(_metrics(), ["bits"]), [""])
+
+    def test_blosum62_bits_keep_mmseqs2_rounding(self):
+        """BLOSUM62 (an integer score) keeps int(bits + 0.5), negative bit scores included, so its output is
+        byte-identical to before P6 (principle 5)."""
+        for bits, want in ((-7.6, "-7"), (-2.5, "-2"), (-0.6, "0"), (-1.7, "-1"), (-0.4, "0"), (0.5, "1"),
+                           (2.4999, "2"), (41.5, "42")):
+            self.assertEqual(_row(_metrics(score=37, bit_score=bits), ["bits"]), [want], bits)
+        # --significance-mode sampled with low gap costs gives negative bit scores (here -3.2 and -7.5)
+        q = ("MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKA"
+             "LRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVF"
+             "LVGIGGKLSDGHRHDVRAPDYDDWUAIGLLKEDGDLTQQALGEAKLDD")
+        subjects = {"s_close": q[5:200], "s_far": "GSHMLEDPVDAFQKAIGLLQEHGKEVVHVVGHSMGGRWAKKLSEEGVPVAALVLFAPSKHGLTEPEA",
+                    "s_rand": "PLWQERTYIPASDFGHKLCVNM" * 6}
+        res = alignment.align_candidates(
+            query_sequences={"q1": q},
+            prefilter_results={"q1": (list(subjects), [0.9, 0.8, 0.7])},
+            fetch_subject_sequences=lambda ids: {i: subjects[i] for i in ids},
+            min_seq_identity=0.0, min_coverage=0.0, max_evalue=None, gap_open=3, gap_extend=1, num_workers=0,
+            subject_db_size=10_000_000, compute_significance=True,
+            significance_mode=alignment.SignificanceMode.sampled, output_fields=["bits"])
+        negative = 0
+        for h in res["q1"]:
+            self.assertIsInstance(h.metrics.score, int)
+            self.assertEqual(output.format_row("q1", h, ["bits"]), str(int(h.metrics.bit_score + 0.5)))
+            if h.metrics.bit_score < 0 and int(h.metrics.bit_score + 0.5) != math.floor(h.metrics.bit_score + 0.5):
+                negative += 1
+        self.assertGreater(negative, 0, [h.metrics.bit_score for h in res["q1"]])
+
+    def test_evalue_from_ln_e_never_underflows(self):
+        self.assertEqual(_row(_metrics(log_evalue=-1000.0, evalue=0.0), ["evalue"]), ["5.076E-435"])
+        self.assertEqual(_row(_metrics(log_evalue=0.0, evalue=1.0), ["evalue"]), ["1.000E+00"])
+        self.assertEqual(_row(_metrics(log_evalue=math.log(2.5e-7), evalue=2.5e-7), ["evalue"]), ["2.500E-07"])
+        self.assertEqual(_row(_metrics(evalue=3.2e-5), ["evalue"]), ["3.200E-05"])          # BLOSUM62, as before
+        self.assertEqual(_row(_metrics(), ["evalue"]), [""])
+
+    def test_esm_codes_scores_and_ecal(self):
+        m = _metrics(score=171.25, score_rev=12.5, q90=20.0625, score_adj=138.6875, ecal=True)
+        self.assertEqual(_row(m, ["raw", "rawrev", "q90", "rawadj", "ecal"]),
+                         ["171.250", "12.500", "20.062", "138.688", "1"])
+        self.assertEqual(_row(_metrics(score=0.5, score_adj=-1e-9, q90=-0.0004, ecal=False),
+                              ["raw", "rawadj", "q90", "ecal"]), ["0.500", "0.000", "0.000", "0"])
+        self.assertEqual(_row(_metrics(score_adj=-2.25), ["rawadj"]), ["-2.250"])
+
+    def test_blosum62_metrics_keep_their_columns_and_leave_the_new_ones_empty(self):
+        m = _metrics(score=37, bit_score=19.78, evalue=1.5e-3)
+        self.assertEqual(_row(m, ["raw", "bits", "evalue", "rawrev", "q90", "rawadj", "ecal"]),
+                         ["37", "20", "1.500E-03", "", "", "", ""])
+        res = alignment.align_candidates(
+            query_sequences={"q1": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+            prefilter_results={"q1": (["s1"], [0.9])},
+            fetch_subject_sequences=lambda ids: {"s1": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVA"},
+            min_seq_identity=0.0, min_coverage=0.0, max_evalue=None, num_workers=1, subject_db_size=1000,
+            output_fields=ALL_FIELDS)
+        h = res["q1"][0]
+        row = dict(zip(ALL_FIELDS, output.format_row("q1", h, ALL_FIELDS).split(output.DELIMITER)))
+        self.assertEqual(row["raw"], str(h.metrics.score))
+        self.assertIsInstance(h.metrics.score, int)
+        self.assertEqual(row["bits"], str(int(h.metrics.bit_score + 0.5)))            # bits >= 0: unchanged
+        self.assertEqual(row["evalue"], f"{h.metrics.evalue:.3E}")
+        self.assertEqual([row[f] for f in output.ESM_CODES_OUTPUT_FIELDS], ["", "", "", ""])
+
+    def test_tsv_header_names_the_new_fields(self):
+        fields = ["query", "target", "raw", "rawrev", "q90", "rawadj", "ecal"]
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "hits.tsv"
+            m = _metrics(score=3.0, score_rev=1.0, q90=0.5, score_adj=1.5, ecal=True)
+            output.write_aligned_results({"q": [alignment.Hit("t", 0.5, m)]}, fields, str(out),
+                                         output.FormatMode.tsv)
+            lines = out.read_text().splitlines()
+        self.assertEqual(lines, ["\t".join(fields), "q\tt\t3.000\t1.000\t0.500\t1.500\t1"])
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class EsmCodesOutputTest(_WorldCase):
+
+    def test_columns_of_f1_hits(self):
+        res, _ = self.f1_world().align(_f1_own_target(), max_evalue=None)
+        fields = ["raw", "rawrev", "q90", "rawadj", "ecal", "evalue", "bits"]
+        for hits in res.values():
+            m = hits[0].metrics
+            row = _row(m, fields)
+            self.assertEqual(row[:4], [f"{v:.3f}" for v in (m.score, m.score_rev, m.q90, m.score_adj)])
+            self.assertEqual(row[4], "1")
+            self.assertEqual(row[5], f"{math.exp(m.log_evalue):.3E}")
+            self.assertEqual(row[6], str(math.floor(m.bit_score + 0.5)))
+
+    def test_every_field_materialises_when_requested_alone(self):
+        """Under esm-codes every supported column renders, also when requested on its own (the E-value columns
+        then turn the panel on)."""
+        world = self.f1_world()
+        p = _f1()[4]
+        for field in ALL_FIELDS:
+            with self.subTest(field=field):
+                res, stats = world.align({p["qid"]: ([p["tid"]], [0.5])}, max_evalue=None, output_needs=[field])
+                self.assertEqual(stats["panel"], field in ca.PANEL_FIELDS)
+                self.assertNotEqual(output.format_row(p["qid"], res[p["qid"]][0], [field]), "", field)
+
+    def test_skipped_panel_leaves_the_e_value_columns_empty(self):
+        fields = ["query", "target", "raw", "rawrev", "ecal", "fident"]
+        res, stats = self.f1_world().align(_f1_mixed(range(0, 50, 10), per_query=4), max_evalue=None,
+                                           output_needs=fields)
+        self.assertFalse(stats["panel"])
+        for qid, hits in res.items():
+            for h in hits:
+                self.assertEqual(output.format_row(qid, h, ["evalue", "bits", "q90", "rawadj"]), "\t\t\t")
+                self.assertTrue(all(output.format_row(qid, h, fields).split("\t")))
+
+    def test_degenerate_hits_render_ecal_0(self):
+        z = np.load(_RES / "degenerate_v1.npz")
+        ro = z["real_offsets"]
+        names = list(z["real_ids"].astype(str))
+        a, b = names.index("allX30"), names.index("polyA50")
+        folder = self.tmp / "ecal0"
+        folder.mkdir()
+        world = World(folder, [("t", str(z["real_sequences"][b]), z["real_codes"][ro[b]:ro[b + 1]])],
+                      [("q", str(z["real_sequences"][a]), z["real_q"][ro[a]:ro[a + 1]])], name="ecal0")
+        res, _ = world.align({"q": (["t"], [0.5])}, max_evalue=None)
+        self.assertEqual(output.format_row("q", res["q"][0], ["ecal"]), "0")
+
+
 if __name__ == "__main__":
     unittest.main()
