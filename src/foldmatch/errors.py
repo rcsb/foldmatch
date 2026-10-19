@@ -18,3 +18,12 @@ class RefusalError(ValueError):
     command-line tools that already report ``ValueError`` as a one-line error (exit status 1) handle it unchanged;
     the refused check's own exception, when there is one, is its ``__cause__``.
     """
+
+
+class InternalError(RuntimeError):
+    """An internal consistency check failed: a FoldMatch bug, not a problem with the input or the database.
+
+    Raised instead of ``assert`` (which ``python -O`` removes) where a result would otherwise be wrong without notice,
+    e.g. when the esm-codes Stage-2 traceback score differs from the round-1 score behind the reported E-value (P6.4).
+    Not a ``ValueError``: the command-line tools do not report it as a one-line refusal.
+    """

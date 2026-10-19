@@ -4,7 +4,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -192,13 +192,23 @@ class AlignmentMetrics:
     scalar fields are always computed (cheap); the heavy strings (``cigar``,
     ``q_aln``, ``t_aln``, ``q_seq``, ``t_seq``) are ``None`` unless the active
     output format requested them (see :class:`_FieldNeeds`).
+
+    The same record carries both Stage-2 scorings. Under BLOSUM62 ``score`` is
+    the integer Smith-Waterman score and the esm-codes fields at the end stay
+    ``None``. Under esm-codes (:mod:`foldmatch.search.code_alignment`, method
+    S9-S13) ``score`` is the float ``S_f`` (an exact float32 value) and
+    ``score_rev`` the float ``S_r``, so ``S = score - score_rev`` in float64;
+    ``q90``, ``score_adj`` (``S' = S - Q90``), ``log_evalue`` (ln E),
+    ``bit_score`` and ``evalue`` are ``None`` when the panel pass was skipped
+    (D11), and ``ecal`` tells whether the hit is inside the calibrated domain
+    (S13).
     """
     identity_aln: float        # identical positions / alignment length == fident
     identity_shorter: float    # identical positions / length of the shorter sequence
     query_coverage: float      # aligned query residues / full query length == qcov
     subject_coverage: float    # aligned subject residues / full subject length == tcov
     aln_len: int               # alignment length (columns, gaps included) == alnlen
-    score: int                 # raw Smith-Waterman score (comp-bias corrected when on) == raw
+    score: Union[int, float]   # raw score == raw: the int SW score (comp-bias corrected when on); esm-codes S_f
     # Karlin-Altschul significance. Scale depends on significance_mode:
     # calibrated ('default') or relative-only ('sampled').
     # Never BLAST-comparable — see module header.
@@ -224,6 +234,12 @@ class AlignmentMetrics:
     t_aln: Optional[str] = None
     q_seq: Optional[str] = None
     t_seq: Optional[str] = None
+    # esm-codes only (None under BLOSUM62).
+    score_rev: Optional[float] = None    # S_r, the score-only run on the row-reversed similarity == rawrev
+    q90: Optional[float] = None          # the query's panel quantile Q90 (S10) == q90
+    score_adj: Optional[float] = None    # S' = fp64(S_f) - fp64(S_r) - Q90 (S11) == rawadj
+    log_evalue: Optional[float] = None   # ln E (S11); evalue is rendered from it, so it never underflows
+    ecal: Optional[bool] = None          # inside the calibrated domain (S13) == ecal
 
 
 @dataclass
