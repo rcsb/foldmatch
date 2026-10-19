@@ -1,4 +1,4 @@
-"""P6.1-P6.2: ``fm-search query sequences --scoring blosum62|esm-codes`` (plan section 8 P6; D7, D8, D11, D14, D20).
+"""P6.1-P6.3: ``fm-search query sequences --scoring blosum62|esm-codes`` (plan section 8 P6; D7, D8, D11, D14, D20).
 
 Most tests replace the ESM3 pass by a fake that writes the shards the real pass writes (same dataset, same writer),
 with the F2c reference codes (builds) and query encodings (queries) of the fixture FASTA: the command-line
@@ -485,16 +485,20 @@ class RefusalTest(_DbCase):
 
     def test_one_fetch_then_cached_only(self):
         """The process that starts the run may download the bundle; a rank Lightning starts, or a multi-node run,
-        finds it cached."""
+        finds it cached; the pass gets the prepared registry system and writes query encodings."""
         db = self.database("codes")
+        stop = RuntimeError("stop at the pass")
         for rank_env, extra, local_only in (({}, (), False), ({"LOCAL_RANK": 1, "FOLDMATCH_RUN_ID": "r"}, (), True),
                                             ({}, ("--num-nodes", "2"), True)):
             with self.subTest(rank_env=rank_env, extra=extra), launch_env(**rank_env), \
-                    mock.patch.object(ss, "prepare", wraps=ss.prepare) as prepare, _esm3_spy() as esm3:
+                    mock.patch.object(ss, "prepare", wraps=ss.prepare) as prepare, \
+                    mock.patch("foldmatch.search.embedding_computer.chain_predict", side_effect=stop) as predict:
                 result = invoke(*_query_args(db, _FASTA, self.qshards, self.tmp / "o.tsv", *_esm(*extra)))
-                self.assertIn("not implemented yet (plan P6.3)", self.refused(result))
+                self.assertIs(result.exception.__cause__ or result.exception, stop)
                 prepare.assert_called_once_with(SYSTEM, local_files_only=local_only)
-                esm3.assert_not_called()
+                kwargs = predict.call_args.kwargs
+                self.assertEqual(kwargs["residue_output"], "query_encoding")
+                self.assertIs(kwargs["scoring_system"].system, SYSTEM)
 
     def test_query_fasta_the_method_cannot_take(self):
         """Duplicate ids, '<' / '>' and non-ASCII sequences: refused by the strict query pre-flight, before the
@@ -516,6 +520,45 @@ class RefusalTest(_DbCase):
         self.assertIsInstance(result.exception, AssertionError)  # the blosum62 pass was reached
         esm3.assert_called_once()
 
+    def test_query_encodings_of_an_earlier_run_in_the_way(self):
+        db = self.database("codes")
+        with launch_env(FOLDMATCH_RUN_ID="same"):
+            (self.qshards / "query_encodings_same.f16").touch()
+            with _esm3_spy() as esm3, _no_pass():
+                result = invoke(*_query_args(db, _FASTA, self.qshards, self.tmp / "o.tsv", *_esm()))
+        self.assertIn("query_encodings_same.f16", self.refused(result, FileExistsError))
+        esm3.assert_not_called()
+        self.assertEqual([p.name for p in self.qshards.iterdir()], ["query_encodings_same.f16"])
+
+    def test_shards_of_the_same_run_id(self):
+        db = self.database("codes")
+        with launch_env(FOLDMATCH_RUN_ID="r"):
+            (self.qshards / "emb_r-0.parquet").touch()
+            with _esm3_spy() as esm3:
+                result = invoke(*_query_args(db, _FASTA, self.qshards, self.tmp / "o.tsv", *_esm()))
+        self.assertIn("same run id", self.refused(result, FileExistsError))
+        esm3.assert_not_called()
+        self.assertEqual([p.name for p in self.qshards.iterdir()], ["emb_r-0.parquet"])  # not this run's: kept
+
+    def test_the_faiss_count_after_the_index_loads(self):
+        """Rank 0 compares the live FAISS count with the code store once the index is loaded (after the pass); the
+        run's shards and query encodings are removed all the same."""
+        from foldmatch.search.faiss_database import FaissEmbeddingDatabase
+        load = FaissEmbeddingDatabase.load_database
+
+        def one_more(self_, *args, **kwargs):
+            out = load(self_, *args, **kwargs)
+            self_.chain_ids = list(self_.chain_ids) + ["phantom"]
+            return out
+
+        db = self.database("codes")
+        with mock.patch.object(FaissEmbeddingDatabase, "load_database", one_more):
+            result, out = self.query(db, *_esm())
+        message = self.refused(result, IncompatibleCodeStoreError)
+        self.assertIn("has 2 entries, the FAISS index 3", message)
+        self.assertEqual(list(self.qshards.iterdir()), [])
+        self.assertFalse(out.exists())
+
     def test_exit_status_of_a_refusal(self):
         """fm-search prints a refusal on one line and exits 1 (D20)."""
         db = self.database("plain")
@@ -532,6 +575,476 @@ class RefusalTest(_DbCase):
         errors = [line for line in stderr.getvalue().splitlines() if line.startswith("Error: ")]
         self.assertEqual(len(errors), 1, stderr.getvalue())
         self.assertIn("was built without --residue-codes", errors[0])
+
+
+# =====================================================================================================================
+# P6.1-P6.3: the query (fake ESM3 pass, real bundle and kernel)
+# =====================================================================================================================
+class QueryTest(_DbCase):
+
+    def assert_self_hits(self, rows):
+        lengths = {name: len(seq) for name, seq in _fasta_records(_FASTA)}
+        by_query = {}
+        for row in rows:
+            by_query.setdefault(row["query"], []).append(row)
+        self.assertEqual(set(by_query), set(lengths))
+        for qid, hits in by_query.items():
+            top = hits[0]
+            self.assertEqual(top["target"], qid)
+            self.assertEqual((top["qstart"], top["qend"]), (top["tstart"], top["tend"]))   # main diagonal
+            self.assertEqual(top["gapopen"], "0")
+            self.assertEqual(int(top["alnlen"]), int(top["qend"]) - int(top["qstart"]) + 1)
+            self.assertGreaterEqual(float(top["fident"]), 0.99)
+            self.assertGreaterEqual(int(top["alnlen"]) / lengths[qid], 0.9)                 # qcov = tcov here
+            self.assertLessEqual(float(top["evalue"]), 1e-3)
+
+    def test_esm_codes_query(self):
+        """Default columns, no empty cell; each query's top hit is itself on the diagonal; Stage 2 got the defaults
+        of D8, N = the manifest's 303 residues, the run's query encodings; BLOSUM62 was not used."""
+        db = self.database("codes")
+        calls = []
+        with mock.patch.object(code_alignment, "align_candidates_esm_codes",
+                               wraps=code_alignment.align_candidates_esm_codes) as esm, \
+                mock.patch("foldmatch.search.alignment.align_candidates",
+                           side_effect=AssertionError("BLOSUM62 Stage 2")) as blosum:
+            result, out = self.query(db, *_esm("--align-workers", "0"), calls=calls)
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        blosum.assert_not_called()
+        esm.assert_called_once()
+        args, kwargs = esm.call_args
+        query_index, prefilter, code_store, _fetch, prepared, db_residues, _pool = args
+        self.assertEqual(db_residues, 303)
+        self.assertEqual((code_store.base, prepared.system), (db, SYSTEM))
+        self.assertEqual((kwargs["min_seq_identity"], kwargs["min_coverage"], kwargs["max_evalue"]), (0.0, 0.0, 1e-3))
+        self.assertEqual(kwargs["output_needs"], list(DEFAULT_FIELDS))
+        self.assertEqual(kwargs["query_sequences"], dict(_fasta_records(_FASTA)))
+        self.assertEqual(sorted(query_index.entries), ["1acb_E", "2uzi_A"])
+        self.assertEqual(query_index.path.name, "query_encodings_q.f16")
+        self.assertEqual(calls[0]["residue_output"], "query_encoding")
+        rows = _rows(out)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertTrue(all(row.values()), row)
+        self.assert_self_hits(rows)
+        # The run's shards and its query encodings are gone.
+        self.assertEqual(list(self.qshards.iterdir()), [])
+
+    def test_blosum62_is_unchanged(self):
+        """Without --scoring: the BLOSUM62 Stage 2 with its old defaults; on a database with codes it writes the
+        same bytes as on one without; the esm-codes fields render empty."""
+        outs = {}
+        for kind in ("codes", "plain"):
+            db = self.database(kind)
+            with mock.patch("foldmatch.search.alignment.align_candidates",
+                            wraps=__import__("foldmatch.search.alignment", fromlist=["x"]).align_candidates) as blosum, \
+                    mock.patch.object(code_alignment, "align_candidates_esm_codes",
+                                      side_effect=AssertionError("esm-codes Stage 2")):
+                result, outs[kind] = self.query(db, out=self.tmp / f"{kind}.tsv", run_id=f"b{kind}")
+            self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+            kwargs = blosum.call_args.kwargs
+            self.assertEqual({k: kwargs[k] for k in ("min_seq_identity", "min_coverage", "max_evalue", "gap_open",
+                                                       "gap_extend", "comp_bias_corr", "significance_mode")},
+                             dict(min_seq_identity=0.3, min_coverage=0.8, max_evalue=1e-3, gap_open=11, gap_extend=1,
+                                  comp_bias_corr=False, significance_mode=SignificanceMode.default))
+        self.assertEqual(_sha256(outs["codes"]), _sha256(outs["plain"]))
+        self.assertTrue(_rows(outs["codes"]))
+        result, out = self.query(self.database("codes"), "--format-output", ALL_FIELDS, run_id="ball")
+        self.assertEqual(result.exit_code, 0, result.output)
+        rows = _rows(out, output.SUPPORTED_OUTPUT_FIELDS)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual([row[f] for f in output.ESM_CODES_OUTPUT_FIELDS], [""] * 4)
+            self.assertNotIn(".", row["raw"])   # the integer BLOSUM62 score
+
+    def test_explicit_values_are_honoured(self):
+        db = self.database("codes")
+        with mock.patch.object(code_alignment, "align_candidates_esm_codes",
+                               wraps=code_alignment.align_candidates_esm_codes) as esm:
+            result, _ = self.query(db, *_esm("--min-seq-identity", "0.5", "--min-coverage", "0.7", "--max-evalue",
+                                             "10", "--align-workers", "0"))
+        self.assertEqual(result.exit_code, 0, result.output)
+        kwargs = esm.call_args.kwargs
+        self.assertEqual((kwargs["min_seq_identity"], kwargs["min_coverage"], kwargs["max_evalue"]), (0.5, 0.7, 10.0))
+
+    def test_every_field_and_the_header(self):
+        db = self.database("codes")
+        result, out = self.query(db, *_esm("--format-output", ALL_FIELDS, "--format-mode", "tsv", "--max-evalue",
+                                           "inf", "--threshold", "-2", "--align-workers", "0"))
+        self.assertEqual(result.exit_code, 0, result.output)
+        lines = out.read_text().splitlines()
+        self.assertEqual(lines[0], ALL_FIELDS.replace(",", "\t"))
+        rows = [dict(zip(output.SUPPORTED_OUTPUT_FIELDS, line.split("\t"))) for line in lines[1:]]
+        self.assertEqual(len(rows), 4)  # every candidate traced back, each pair aligned
+        for row in rows:
+            self.assertTrue(all(row.values()), row)
+            for field in NUMERIC_FIELDS:
+                self.assertTrue(math.isfinite(float(row[field])), (field, row[field]))
+            self.assertEqual(row["ecal"], "1")
+            raw, rawrev, q90, rawadj = (float(row[f]) for f in ("raw", "rawrev", "q90", "rawadj"))
+            self.assertAlmostEqual(rawadj, raw - rawrev - q90, delta=2e-3)
+            self.assertEqual(len(row["qaln"]), int(row["alnlen"]))
+
+    def test_serial_and_pool_give_the_same_bytes(self):
+        """S16 on one machine: the default worker pool (spawn) and the in-process run write identical files."""
+        db = self.database("codes")
+        outs = []
+        for k, extra in enumerate((("--align-workers", "0"), (), ("--align-workers", "3"))):
+            result, out = self.query(db, *_esm("--format-output", ALL_FIELDS, "--max-evalue", "inf", *extra),
+                                     out=self.tmp / f"o{k}.tsv", run_id=f"p{k}")
+            self.assertEqual(result.exit_code, 0, result.output)
+            outs.append(_sha256(out))
+        self.assertEqual(len(set(outs)), 1)
+
+    def test_queries_without_candidates_are_skipped_before_the_panel(self):
+        db = self.database("codes")
+        stats = {}
+        real = code_alignment.align_candidates_esm_codes
+
+        def align(*args, **kwargs):
+            return real(*args, stats=stats, **kwargs)
+
+        with mock.patch.object(code_alignment, "align_candidates_esm_codes", align):
+            result, out = self.query(db, *_esm("--threshold", "2", "--align-workers", "0"))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual((stats["queries"], stats["queries_without_candidates"], stats["panel_pairs"],
+                          stats["round1_tasks"]), (2, 2, 0, 0))
+        self.assertEqual(out.read_text(), "")
+
+    def test_queries_outside_the_calibrated_domain(self):
+        """A 9-aa query: aligned, its hits reported with ecal=0, and one warning gives the counts (S13)."""
+        db = self.database("codes")
+        fasta = _write(self.tmp / "short.fasta", _FASTA.read_text() + ">short\nACDEFGHIK\n")
+        with self.assertLogs("foldmatch.search.code_alignment", "WARNING") as logs:
+            result, out = self.query(db, *_esm("--format-output", "query,target,ecal,evalue", "--max-evalue",
+                                               "inf", "--threshold", "-2", "--align-workers", "0"), fasta=fasta)
+        self.assertEqual(result.exit_code, 0, result.output)
+        rows = _rows(out, ("query", "target", "ecal", "evalue"))
+        short = [r for r in rows if r["query"] == "short"]
+        self.assertTrue(short)
+        self.assertEqual({r["ecal"] for r in short}, {"0"})
+        self.assertEqual({r["ecal"] for r in rows if r["query"] != "short"}, {"1"})
+        warnings = [r.getMessage() for r in logs.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1 queries shorter than 21 aa", warnings[0])
+
+    def test_an_encoding_that_does_not_match_its_query_is_an_error(self):
+        """A missing encoding (empty payload), a length or a seq_sha1 that differs from the query's: an error after
+        the pass (exit 1, not a refusal), with the run's files removed."""
+        db = self.database("codes")
+
+        def short_payload(name, sequence):
+            q = _fake_q(name, sequence)
+            return q[:-1] if name == "2uzi_A" else q
+
+        def empty_payload(name, sequence):
+            return np.empty((0, 64), np.float16) if name == "2uzi_A" else _fake_q(name, sequence)
+
+        cases = {
+            "length": (fake_query_pass(payload=short_payload), "its sequence has 58 residues, its encoding 57 rows"),
+            "empty": (fake_query_pass(payload=empty_payload), "without an encoding"),
+            "seq_sha1": (fake_query_pass(seq_sha1=lambda name, s: _sha1(s + "A") if name == "1acb_E" else _sha1(s)),
+                         "seq_sha1 differs"),
+        }
+        for case, (predict, text) in cases.items():
+            with self.subTest(case=case):
+                result, out = self.query(db, *_esm("--align-workers", "0"), predict=predict, run_id=f"e{case}")
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertNotIsInstance(result.exception, RefusalError)
+                self.assertIsInstance(result.exception, ValueError)
+                self.assertIn(text, str(result.exception))
+                self.assertEqual(list(self.qshards.iterdir()), [])
+                self.assertFalse(out.exists())
+
+    def test_the_run_files_are_removed_after_a_stage_2_failure(self):
+        db = self.database("codes")
+        with mock.patch.object(code_alignment, "align_candidates_esm_codes",
+                               side_effect=RuntimeError("stage 2 failed")):
+            result, _ = self.query(db, *_esm())
+        self.assertEqual(str(result.exception), "stage 2 failed")
+        self.assertEqual(list(self.qshards.iterdir()), [])
+
+    def test_a_failed_pass_deletes_the_shard_it_wrote(self):
+        """The query shard holds the query encodings (128 B per residue): a process whose pass fails deletes the shard
+        it wrote, and the error goes on (not a refusal)."""
+        db = self.database("codes")
+        write = fake_query_pass()
+
+        def failing(**kwargs):
+            write(**kwargs)
+            raise RuntimeError("the ESM3 pass failed after writing its shard")
+
+        result, out = self.query(db, *_esm(), predict=failing, run_id="f")
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual(str(result.exception), "the ESM3 pass failed after writing its shard")
+        self.assertNotIsInstance(result.exception, RefusalError)
+        self.assertEqual(list(self.qshards.iterdir()), [])
+        self.assertFalse(out.exists())
+
+    def test_a_rank_other_than_0_leaves_after_the_pass(self):
+        """Only rank 0 searches, aligns and writes: a rank > 0 (LOCAL_RANK=1; its process group simulated through
+        _is_rank_zero) returns after the pass without loading the index, running Stage 2, writing the output or
+        deleting the run's shards, which rank 0 reads."""
+        db = self.database("codes")
+        out = self.tmp / "out.tsv"
+        from foldmatch.search.embedding_database import EmbeddingDatabase
+        with launch_env(LOCAL_RANK=1, FOLDMATCH_RUN_ID="r1"), \
+                mock.patch.object(search, "_is_rank_zero", return_value=False), \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict", fake_query_pass()), \
+                mock.patch.object(EmbeddingDatabase, "load", side_effect=AssertionError("index loaded")) as load, \
+                mock.patch.object(code_alignment, "align_candidates_esm_codes",
+                                  side_effect=AssertionError("Stage 2 ran")) as esm:
+            result = invoke(*_query_args(db, _FASTA, self.qshards, out, *_esm()))
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        load.assert_not_called()
+        esm.assert_not_called()
+        self.assertFalse(out.exists())
+        self.assertEqual([p.name for p in self.qshards.iterdir()], ["emb_r1-0.parquet"])
+
+
+# =====================================================================================================================
+# real ESM3 (CPU): the end-to-end smoke and the F-deg items through the command line
+# =====================================================================================================================
+def _track_models():
+    """Patches recording a weak reference to every ESM3 model and aggregator the pass builds, and whether they are
+    still alive when Stage 2 starts. Returns ``(patches, refs, alive_at_stage_2)``."""
+    from foldmatch.inference import chain_complete_inference as cci
+    refs, alive = [], []
+
+    def track(fn):
+        def build(*args, **kwargs):
+            model = fn(*args, **kwargs)
+            refs.append(weakref.ref(model))
+            return model
+        return build
+
+    real_align = code_alignment.align_candidates_esm_codes
+
+    def align(*args, **kwargs):
+        alive.append([ref() is not None for ref in refs])
+        return real_align(*args, **kwargs)
+
+    patches = (mock.patch.object(cci, "get_residue_model", track(cci.get_residue_model)),
+               mock.patch.object(cci, "get_aggregator_model", track(cci.get_aggregator_model)),
+               mock.patch.object(code_alignment, "align_candidates_esm_codes", align))
+    return patches, refs, alive
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class RealEsm3SmokeTest(unittest.TestCase):
+    """The plan's end-to-end smoke (CPU, the 2-sequence fixture, ESM3 from the cache): build with --residue-codes, then
+    query the same FASTA with --scoring esm-codes --threshold 0; a blosum62 query on that database writes the same
+    bytes as on a database built without codes. The commands' wall times are printed (acceptance: the smoke within
+    2x the current query sequences test)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        esm_codes_bundle.registry_files()
+        swkern.load()
+        gc.collect()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.results, cls.seconds = {}, {}
+        patches, cls.model_refs, cls.alive = _track_models()
+        steps = (
+            ("build codes", _build_args(_FASTA, cls.tmp / "codes" / "db", cls.tmp / "bshards", "--residue-codes")),
+            ("query esm-codes", _query_args(cls.tmp / "codes" / "db", _FASTA, cls.tmp / "qshards",
+                                            cls.tmp / "esm.tsv", *_esm("--threshold", "0"))),
+            ("query blosum62 codes db", _query_args(cls.tmp / "codes" / "db", _FASTA, cls.tmp / "qshards",
+                                                    cls.tmp / "blosum_codes.tsv")),
+            ("build plain", _build_args(_FASTA, cls.tmp / "plain" / "db", cls.tmp / "bshards")),
+            ("query blosum62 plain db", _query_args(cls.tmp / "plain" / "db", _FASTA, cls.tmp / "qshards",
+                                                    cls.tmp / "blosum_plain.tsv")),
+        )
+        for folder in ("codes", "plain", "bshards", "qshards"):
+            (cls.tmp / folder).mkdir()
+        with launch_env(), patches[0], patches[1], patches[2]:
+            for k, (name, args) in enumerate(steps):
+                os.environ["FOLDMATCH_RUN_ID"] = f"smoke{k}"
+                t0 = time.perf_counter()
+                cls.results[name] = invoke(*args)
+                cls.seconds[name] = time.perf_counter() - t0
+                gc.collect()
+        print("\nP6 smoke wall times (s): " + ", ".join(f"{k} {v:.1f}" for k, v in cls.seconds.items()),
+              file=sys.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def setUp(self):
+        for name, result in self.results.items():
+            self.assertEqual(result.exit_code, 0, f"{name}: {result.output[-4000:]} {result.exception!r}")
+
+    def test_each_query_finds_itself(self):
+        rows = _rows(self.tmp / "esm.tsv")
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertTrue(all(row.values()), row)          # the default 13 columns, no empty cell
+        QueryTest.assert_self_hits(self, rows)
+        manifest = ResidueCodeStore(self.tmp / "codes", "db").manifest()
+        self.assertEqual((manifest["entries"], manifest["total_residues"]), (2, 303))   # N = 303
+
+    def test_blosum62_on_a_database_with_codes_is_byte_identical(self):
+        self.assertEqual(_sha256(self.tmp / "blosum_codes.tsv"), _sha256(self.tmp / "blosum_plain.tsv"))
+        self.assertTrue(_rows(self.tmp / "blosum_codes.tsv"))
+        for suffix in _DB_SUFFIXES:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(_sha256(self.tmp / "codes" / f"db{suffix}"), _sha256(self.tmp / "plain" / f"db{suffix}"))
+
+    def test_the_models_are_freed_before_stage_2(self):
+        self.assertEqual(len(self.alive), 1)
+        self.assertEqual(len(self.alive[0]), 4)   # ESM3 and the aggregator of the build and of the query pass
+        self.assertEqual(self.alive[0], [False] * 4)
+
+    def test_query_files_are_removed(self):
+        self.assertEqual(list((self.tmp / "qshards").iterdir()), [])
+
+
+def _fdeg_items():
+    z = np.load(_FDEG, allow_pickle=False)
+    return [(str(i), str(s)) for i, s in zip(z["real_ids"], z["real_sequences"])]
+
+
+#: Two longer chains (F3 queries of 439 and 609 aa) whose best cell against the length-1 target M is clearly positive
+#: (S_f 0.27 / 0.26 on the Mac CPU, where 1acb_E's is only 0.016), so the length-1 target is aligned and reported.
+_F3_CHAINS = ("Q8X1D8_1", "P17169_1")
+
+
+def _f3_items(ids):
+    z = np.load(_TEST_PATH / "resources" / "esm_codes" / "q90_queries_v1.npz", allow_pickle=False)
+    sequences = {str(i): str(s) for i, s in zip(z["ids"], z["sequences"])}
+    return [(i, sequences[i]) for i in ids]
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class RealEsm3DegenerateTest(unittest.TestCase):
+    """The real-ESM3 F-deg items through the command line (plan section 8 P6 Tests; D14, S13, S13b): a database of the
+    six items, the fixture's two chains and two longer F3 chains, built with --residue-codes, queried with the same
+    FASTA under --max-evalue inf. Every output is finite and every hit's ecal is S13's; all-X, poly-A, HHHHHH, GS and
+    the 10-aa peptide are aligned and reported; the single-residue query M returns no hits and is counted in the
+    warning, as is a synthetic identical-row query (poly-A with its encoding rows made identical); the length-1
+    target M is aligned by the long chains and gets ecal=0."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        esm_codes_bundle.registry_files()
+        swkern.load()
+        gc.collect()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.sequences = dict(_fdeg_items() + _fasta_records(_FASTA) + _f3_items(_F3_CHAINS))
+        cls.fasta = cls.tmp / "fdeg.fasta"
+        cls.fasta.write_text("".join(f">{name}\n{seq}\n" for name, seq in cls.sequences.items()))
+        for folder in ("db", "bshards", "qshards"):
+            (cls.tmp / folder).mkdir()
+        cls.db = cls.tmp / "db" / "fdeg"
+        cls.results, cls.warnings = {}, {}
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        real_build = EmbeddingComputer.build_query_encodings
+
+        def identical_rows(self_, dst, system):   # poly-A's encoding rows made identical (a synthetic S13b query)
+            index = real_build(self_, dst, system)
+            entry = index.entries["polyA50"]
+            rows = np.memmap(index.path, dtype=np.float16, mode="r+", shape=(index.rows, index.width))
+            rows[entry.offset:entry.offset + entry.length] = rows[entry.offset]
+            rows.flush()
+            del rows
+            return index
+
+        query = ("--scoring", "esm-codes", "--max-evalue", "inf", "--threshold", "-2", "--format-output", ALL_FIELDS)
+        with launch_env():
+            os.environ["FOLDMATCH_RUN_ID"] = "fdeg-build"
+            cls.results["build"] = invoke(*_build_args(cls.fasta, cls.db, cls.tmp / "bshards", "--residue-codes"))
+            gc.collect()
+            for name, patch in (("real", None), ("identical", identical_rows)):
+                os.environ["FOLDMATCH_RUN_ID"] = f"fdeg-{name}"
+                handler = _Records()
+                logger = logging.getLogger("foldmatch.search.code_alignment")
+                logger.addHandler(handler)
+                try:
+                    with (mock.patch.object(EmbeddingComputer, "build_query_encodings", patch) if patch
+                          else mock.patch.dict(os.environ)):
+                        cls.results[name] = invoke(*_query_args(cls.db, cls.fasta, cls.tmp / "qshards",
+                                                                cls.tmp / f"{name}.tsv", *query))
+                finally:
+                    logger.removeHandler(handler)
+                cls.warnings[name] = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+                gc.collect()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def setUp(self):
+        for name, result in self.results.items():
+            self.assertEqual(result.exit_code, 0, f"{name}: {result.output[-4000:]} {result.exception!r}")
+
+    def rows(self, name):
+        return _rows(self.tmp / f"{name}.tsv", output.SUPPORTED_OUTPUT_FIELDS)
+
+    def distinct_codes(self) -> dict:
+        store = ResidueCodeStore(self.tmp / "db", "fdeg")
+        codes = np.asarray(store.open_memmap())
+        return {name: len(np.unique(codes[e.offset:e.offset + e.length], axis=0))
+                for name, e in store.lookup(self.sequences).items()}
+
+    def expected_ecal(self, qid, tid, distinct):
+        def nonstandard(seq):
+            return sum(c not in STANDARD_AMINO_ACIDS for c in seq) / len(seq) > DOMAIN.max_nonstandard_fraction
+        q, t = self.sequences[qid], self.sequences[tid]
+        inside = (DOMAIN.query_min_length <= len(q) <= DOMAIN.query_max_length and not nonstandard(q)
+                  and len(t) <= DOMAIN.target_max_length and not nonstandard(t)
+                  and distinct[tid] >= DOMAIN.target_min_distinct_codes)
+        return "1" if inside else "0"
+
+    def test_outputs_are_finite_and_ecal_follows_s13(self):
+        distinct = self.distinct_codes()
+        self.assertEqual(distinct["Met1"], 1)
+        for name in ("real", "identical"):
+            rows = self.rows(name)
+            self.assertTrue(rows)
+            for row in rows:
+                with self.subTest(run=name, query=row["query"], target=row["target"]):
+                    self.assertTrue(all(row.values()), row)
+                    for field in NUMERIC_FIELDS:
+                        self.assertTrue(math.isfinite(float(row[field])), (field, row[field]))
+                    self.assertGreater(int(row["alnlen"]), 0)
+                    self.assertEqual(row["ecal"], self.expected_ecal(row["query"], row["target"], distinct))
+
+    def test_d14_items_are_aligned_and_reported(self):
+        rows = self.rows("real")
+        queries = {row["query"] for row in rows}
+        for qid in ("allX30", "polyA50", "His6", "GS", "angiotensinI"):
+            self.assertIn(qid, queries)
+        for qid in ("allX30", "His6", "GS", "angiotensinI"):   # outside S13 (non-standard, or shorter than 21 aa)
+            self.assertEqual({row["ecal"] for row in rows if row["query"] == qid}, {"0"}, qid)
+        self.assertIn("1", {row["ecal"] for row in rows if row["query"] == "polyA50"})
+
+    def test_a_length_1_target_gets_ecal_0(self):
+        on_met1 = [row for row in self.rows("real") if row["target"] == "Met1"]
+        self.assertTrue({row["query"] for row in on_met1} & set(_F3_CHAINS), "no query aligned to the length-1 target")
+        self.assertEqual({row["ecal"] for row in on_met1}, {"0"})
+
+    def test_fully_degenerate_queries_report_no_hits(self):
+        """S13b, even with --max-evalue inf: M (one residue) in both runs, poly-A when its rows are identical; each
+        counted in the run's one warning."""
+        self.assertNotIn("Met1", {row["query"] for row in self.rows("real")})
+        identical = {row["query"] for row in self.rows("identical")}
+        self.assertNotIn("Met1", identical)
+        self.assertNotIn("polyA50", identical)
+        for name, want in (("real", "1 fully degenerate queries"), ("identical", "2 fully degenerate queries")):
+            with self.subTest(run=name):
+                self.assertEqual(len(self.warnings[name]), 1, self.warnings[name])
+                self.assertIn(want, self.warnings[name][0])
+                self.assertIn("Met1", self.warnings[name][0])
+        self.assertIn("polyA50", self.warnings["identical"][0])
+        # The other queries' hits are those of the real run.
+        real = [row for row in self.rows("real") if row["query"] != "polyA50"]
+        self.assertEqual([row for row in self.rows("identical")], real)
 
 
 class _Records(logging.Handler):

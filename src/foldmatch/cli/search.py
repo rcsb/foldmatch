@@ -1858,24 +1858,148 @@ def resolve_esm_codes_database(db_path: str, max_evalue: Optional[float], *, num
                                  manifest=manifest, system=system, kernel=kernel, prepared=prepared)
 
 
+def query_encodings_path(embedding_computer) -> Path:
+    """The per-run query-encoding memmap of an esm-codes query, next to the run's shards (deleted after the run)."""
+    return Path(embedding_computer.embedding_folder) / f"query_encodings_{embedding_computer.run_id}.f16"
+
+
+def _release_pass_models() -> None:
+    """Rank 0, after the query pass: free the ESM3 model and the aggregator before Stage 2 (P6.3).
+
+    Nothing holds them once the pass has returned but the reference cycles of its Lightning objects, so a collection
+    frees them; the GPU allocators' caches are emptied too."""
+    import gc
+    gc.collect()
+    import torch
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+@contextmanager
+def _own_shard_removed_if_the_pass_fails(embedding_computer):
+    """Around the query pass of an esm-codes query: if it fails, this process deletes the shard it wrote (its query
+    embeddings and encodings, 128 B per residue), then the error goes on. Only a shard this run wrote: one that
+    existed before the pass (an earlier run's, refused by the pass) is left alone. Every rank cleans its own shard;
+    rank 0's ``finally`` removes the run's files once the pass has finished."""
+    before = {path.name for path in embedding_computer.shard_files()}
+    try:
+        yield
+    except BaseException:
+        import torch.distributed as dist
+        from foldmatch.utils.dist import launch_rank
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else launch_rank()
+        own = Path(embedding_computer.embedding_folder) / f"{embedding_computer.out_name}-{rank}.parquet"
+        if own.name not in before:
+            try:
+                own.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning(f"Could not delete the query shard {own} of the failed pass: {exc}")
+        raise
+
+
 def _query_sequences_esm_codes(*, db_path: str, fasta_file: Path, tmp_embedding_folder: Path, output_file: str,
                                min_res_n: int, top_k: int, threshold: Optional[float], use_gpu_index: bool,
                                accelerator, num_nodes: int, devices, strategy, batch_size: int, num_workers: int,
                                nprobe: Optional[int], stage2: QueryStage2Options, align_workers: Optional[int],
                                format_output: str, format_mode: FormatMode) -> None:
-    """``query sequences --scoring esm-codes`` (plan section 3, QUERY; P6.1-P6.2): every rank's read-only checks
-    before ESM3. The remaining option checks (exit status 2), the strict query pre-flight (duplicate ids, '<' / '>'
-    and non-ASCII sequences refused) and :func:`resolve_esm_codes_database` (exit status 1). The query pass with the
-    query encodings and the esm-codes Stage 2 come with P6.3.
+    """``query sequences --scoring esm-codes`` (plan section 3, QUERY; P6.1-P6.3).
+
+    Every rank, read-only, before ESM3: the remaining option checks (exit status 2), the strict query pre-flight
+    (duplicate ids, '<' / '>' and non-ASCII sequences refused) and :func:`resolve_esm_codes_database` (exit status 1).
+    The ESM3 pass writes each query's chain embedding, S5 encoding and seq_sha1 into the run's shards. Then rank 0:
+    frees the models, loads the FAISS index and checks its count against the code store, builds the run's
+    query-encoding memmap in shard order, searches (Stage 1), and aligns with the codes
+    (:func:`~foldmatch.search.code_alignment.align_candidates_esm_codes`, N = the manifest's ``total_residues``).
+    The run's shards and the memmap are deleted at the end, whatever happens (G7); a process whose pass fails deletes
+    the shard it wrote.
     """
     if align_workers is not None and align_workers < 0:
         raise typer.BadParameter(f"must be >= 0, got {align_workers}.", param_hint="--align-workers")
-    _esm_codes_output_fields(format_output)
+    output_fields = _esm_codes_output_fields(format_output)
     with _refusals():
-        _fasta_preflight(fasta_file, min_res_n, strict=True)
-    resolve_esm_codes_database(db_path, stage2.max_evalue, num_nodes=num_nodes)
-    raise RefusalError("--scoring esm-codes: the database and the query pass every check, but the query pass with "
-                       "query encodings is not implemented yet (plan P6.3). --scoring blosum62 works.")
+        preflight = _fasta_preflight(fasta_file, min_res_n, strict=True)
+    database = resolve_esm_codes_database(db_path, stage2.max_evalue, num_nodes=num_nodes)
+
+    from foldmatch.search.embedding_computer import EmbeddingComputer
+    from foldmatch.search.residue_shards import QUERY_ENCODING
+    with _refusals():
+        embedding_computer = EmbeddingComputer(embedding_folder=tmp_embedding_folder)
+        encodings_path = query_encodings_path(embedding_computer)
+        if encodings_path.exists():
+            raise FileExistsError(
+                f"{encodings_path}, the query encodings of an earlier run with the same run id "
+                f"({embedding_computer.run_id}), is in the way: remove it, or use another --tmp-embedding-folder.")
+        with _own_shard_removed_if_the_pass_fails(embedding_computer):
+            embedding_computer.compute_from_fasta(
+                fasta_file=fasta_file,
+                min_res_n=min_res_n,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                num_nodes=num_nodes,
+                accelerator=accelerator,
+                devices=arg_devices(devices),
+                strategy=strategy,
+                preflight=preflight,
+                residue_output=QUERY_ENCODING,
+                scoring_system=database.prepared,
+            )
+
+    if not _is_rank_zero():
+        return
+
+    query_index = None
+    try:
+        _release_pass_models()
+        logging.info("Loading database...")
+        from foldmatch.search.embedding_database import EmbeddingDatabase
+        embedding_db = EmbeddingDatabase(db_path=db_path, use_gpu_for_search=use_gpu_index)
+        embedding_db.load(nprobe=nprobe)
+        with _refusals():
+            database.code_store.check_faiss_count(len(embedding_db.db.chain_ids))
+        query_index = embedding_computer.build_query_encodings(encodings_path, database.system)
+        logging.info(f"Query encodings of {len(query_index)} sequence(s) ({query_index.rows} residues) in "
+                     f"{encodings_path}")
+        results = embedding_db.search_by_embeddings(
+            embedding_batches=embedding_computer.get_embedding_batches(),
+            top_k=top_k
+        )
+        # The query embeddings are only needed for this search.
+        embedding_computer.remove_shards()
+        logging.info(f"Searched {len(results)} sequence(s)")
+        results = _filter_results_by_threshold(results, threshold)
+
+        from foldmatch.search import output
+        from foldmatch.search.code_alignment import CodeAlignmentPool, align_candidates_esm_codes
+        from foldmatch.utils.fasta import iter_fasta
+        from foldmatch.utils.sequence import normalize_sequence
+        # The sequences ESM3 encoded (the strict pre-flight refused non-ASCII ones), normalised like the stored
+        # subjects; Stage 2 checks each against its encoding's length and seq_sha1.
+        query_sequences = {name: normalize_sequence(sequence) for name, sequence in iter_fasta(fasta_file)
+                           if name in results}
+        logging.info("Computing esm-codes alignments (Stage 2)...")
+        with CodeAlignmentPool(align_workers) as pool:
+            aligned = align_candidates_esm_codes(
+                query_index,
+                results,
+                database.code_store,
+                database.sequence_store.fetch,
+                database.prepared,
+                database.total_residues,
+                pool,
+                query_sequences=query_sequences,
+                min_seq_identity=stage2.min_seq_identity,
+                min_coverage=stage2.min_coverage,
+                max_evalue=stage2.max_evalue,
+                output_needs=output_fields,
+            )
+        output.write_aligned_results(aligned, output_fields, output_file, format_mode)
+    finally:
+        # QueryEncodingIndex.build removes its own file when it fails.
+        if query_index is not None:
+            query_index.remove()
+        embedding_computer.remove_shards()
 
 
 def _stage2_align_and_report(
