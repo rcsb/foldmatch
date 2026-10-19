@@ -551,6 +551,8 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
     )
 
     def test_defaults_are_in_step(self):
+        """``query sequences`` resolves these defaults per ``--scoring`` (its typer default is None): its BLOSUM62
+        defaults are the ones that must equal the library's."""
         import inspect
 
         from foldmatch.cli import search as cli
@@ -560,11 +562,15 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
             cmd = inspect.signature(command).parameters
             for name in self.SHARED_DEFAULTS:
                 with self.subTest(command=command.__name__, threshold=name):
+                    default = cmd[name].default
+                    if command is cli.query_database_from_fasta and name in cli.BLOSUM62_QUERY_DEFAULTS:
+                        self.assertIsNone(default)
+                        default = cli.BLOSUM62_QUERY_DEFAULTS[name]
                     self.assertEqual(
-                        lib[name].default, cmd[name].default,
+                        lib[name].default, default,
                         f"align_candidates {name}={lib[name].default!r} but "
                         f"--{name.replace('_', '-')} defaults to "
-                        f"{cmd[name].default!r}; update both (and the README).",
+                        f"{default!r}; update both (and the README).",
                     )
 
 

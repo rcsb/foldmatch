@@ -4,8 +4,10 @@ import logging
 import sqlite3
 import typer
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Optional, List
+from types import MappingProxyType
+from typing import Annotated, Any, List, Mapping, Optional
 
 from foldmatch import __version__
 from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, \
@@ -16,6 +18,7 @@ from foldmatch.search.output import (
     CLUSTER_OUTPUT_FIELDS,
     DEFAULT_FORMAT_OUTPUT,
     EMBEDDING_OUTPUT_FIELDS,
+    ESM_CODES_OUTPUT_FIELDS,
     SUPPORTED_OUTPUT_FIELDS,
     write_embedding_results,
 )
@@ -29,6 +32,8 @@ from foldmatch.types.api_types import (
     LogLevel,
     SignificanceMode,
     FormatMode,
+    ScoringChoice,
+    DEFAULT_SCORING,
 )
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -68,7 +73,9 @@ _FORMAT_MODE_HELP = (
 _FORMAT_OUTPUT_HELP = (
     "Comma-separated columns for the Stage-2 sequence-identity output, written "
     "as tab-separated rows with no header. "
-    f"Available fields: {', '.join(SUPPORTED_OUTPUT_FIELDS)}."
+    f"Available fields: {', '.join(SUPPORTED_OUTPUT_FIELDS)}. "
+    f"Only 'query sequences --scoring esm-codes' fills {', '.join(ESM_CODES_OUTPUT_FIELDS)}; "
+    "they are empty under BLOSUM62 scoring (and in 'query db')."
 )
 
 # Stage 2 keeps a hit only if min(qcov, tcov) >= --min-coverage.
@@ -77,6 +84,37 @@ _MIN_COVERAGE_HELP = (
     "subject coverage both reach this fraction (0-1); a hit is dropped when "
     "either side is below it."
 )
+
+# query sequences: one Stage-2 scoring per run (plan P6.1, D7). The filter defaults depend on it (D8), and the
+# BLOSUM62-only options are refused under esm-codes (D20: exit status 2).
+_SCORING_HELP = (
+    "Stage-2 scoring, one per run: 'blosum62' (BLOSUM62 Smith-Waterman with BLAST-style "
+    "statistics) or 'esm-codes' (alignment of the ESM3 residue codes, with E-values calibrated "
+    "over the database's residues; needs a database built with 'build sequences "
+    "--residue-codes', and uses the scoring system its residue-code manifest names). Under "
+    "esm-codes the identity and coverage filters default to 0, --gap-open, --gap-extend, "
+    "--comp-bias-corr, --significance-mode and --no-seq-identity are refused, and query "
+    "FASTA files with duplicate ids, '<' or '>' are refused."
+)
+
+_QUERY_MIN_SEQ_IDENTITY_HELP = (
+    "When --seq-identity is set, drop hits whose alignment identity is below this "
+    "fraction (0-1). Default: 0.3 under --scoring blosum62, 0 under esm-codes."
+)
+
+_QUERY_MIN_COVERAGE_HELP = (
+    f"{_MIN_COVERAGE_HELP} Default: 0.8 under --scoring blosum62, 0 under esm-codes."
+)
+
+_QUERY_MAX_EVALUE_HELP = (
+    "When --seq-identity is set, drop hits whose database E-value is above this "
+    "(default 1e-3); pass 'inf' to disable E-value filtering. Under --scoring blosum62 "
+    "it forces the significance pass (and, in --significance-mode default, its 11/1 gap "
+    "penalties); under esm-codes the E-value is the calibrated one, over the database's "
+    "residue count."
+)
+
+_BLOSUM62_ONLY = " BLOSUM62 scoring only: refused with --scoring esm-codes."
 
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
@@ -743,49 +781,51 @@ def query_database_from_fasta(
                  'Defaults to the value baked in at build time. '
                  'Ignored for flat/hnsw indexes.'
         )] = None,
+        scoring: Annotated[ScoringChoice, typer.Option(
+            help=_SCORING_HELP
+        )] = DEFAULT_SCORING,
         seq_identity: Annotated[Optional[bool], typer.Option(
             help='Stage 2: after the embedding prefilter, pairwise-align each '
                  'query against its candidate subjects and report exact sequence '
                  'identity. Default: AUTO — on when the subject database has a '
                  'sequence store (built from FASTA), else embedding-only. Use '
                  '--no-seq-identity to force off, --seq-identity to force on '
-                 '(errors if the store is missing).'
+                 '(errors if the store is missing). --scoring esm-codes always '
+                 'runs Stage 2.'
         )] = None,
-        min_seq_identity: Annotated[float, typer.Option(
-            help='When --seq-identity is set, drop hits whose alignment identity '
-                 'is below this fraction (0-1).'
-        )] = 0.3,
-        min_coverage: Annotated[float, typer.Option(
-            help=_MIN_COVERAGE_HELP
-        )] = 0.8,
-        max_evalue: Annotated[float, typer.Option(
-            help='When --seq-identity is set, drop hits whose database E-value is '
-                 'above this. Forces the significance pass (and, in '
-                 "--significance-mode default, its 11/1 gap penalties); pass "
-                 "'inf' to disable E-value filtering."
-        )] = 1e-3,
-        gap_open: Annotated[int, typer.Option(
-            help='Gap-open penalty (positive) for Stage-2 alignment.'
-        )] = 11,
-        gap_extend: Annotated[int, typer.Option(
-            help='Gap-extend penalty (positive) for Stage-2 alignment.'
-        )] = 1,
-        comp_bias_corr: Annotated[bool, typer.Option(
+        min_seq_identity: Annotated[Optional[float], typer.Option(
+            help=_QUERY_MIN_SEQ_IDENTITY_HELP
+        )] = None,
+        min_coverage: Annotated[Optional[float], typer.Option(
+            help=_QUERY_MIN_COVERAGE_HELP
+        )] = None,
+        max_evalue: Annotated[Optional[float], typer.Option(
+            help=_QUERY_MAX_EVALUE_HELP
+        )] = None,
+        gap_open: Annotated[Optional[int], typer.Option(
+            help='Gap-open penalty (positive) for Stage-2 alignment. Default: 11.' + _BLOSUM62_ONLY
+        )] = None,
+        gap_extend: Annotated[Optional[int], typer.Option(
+            help='Gap-extend penalty (positive) for Stage-2 alignment. Default: 1.' + _BLOSUM62_ONLY
+        )] = None,
+        comp_bias_corr: Annotated[Optional[bool], typer.Option(
             help='Correct Stage-2 alignment scores for locally biased amino-acid '
                  'composition. Changes the alignment itself (coordinates, '
-                 'identity, coverage) as well as the raw score, bits and E-value.'
-        )] = False,
+                 'identity, coverage) as well as the raw score, bits and E-value. '
+                 'Default: off.' + _BLOSUM62_ONLY
+        )] = None,
         comp_bias_corr_scale: Annotated[float, typer.Option(
             min=0.0, max=1.0,
             help='Scale applied to the compositional bias correction when '
                  '--comp-bias-corr is set (0-1).'
         )] = 1.0,
-        significance_mode: Annotated[SignificanceMode, typer.Option(
+        significance_mode: Annotated[Optional[SignificanceMode], typer.Option(
             help="Scale for the BitScore/Pvalue/Evalue columns. 'default' uses "
                  "calibrated statistics, but requires the default gap penalties "
                  "11/1; 'sampled' works at any gap penalties but its absolute "
-                 "values are unreliable and comparable only within this tool."
-        )] = SignificanceMode.default,
+                 "values are unreliable and comparable only within this tool. "
+                 "Default: 'default'." + _BLOSUM62_ONLY
+        )] = None,
         significance_sample_size: Annotated[int, typer.Option(
             help="For --significance-mode sampled: number of random alignments "
                  "sampled to estimate lambda/K for the BitScore/Pvalue/Evalue "
@@ -810,6 +850,24 @@ def query_database_from_fasta(
 
     set_log_level(log_level)
     _check_comp_bias_corr_scale(comp_bias_corr_scale)
+    # The per-scoring defaults; under esm-codes the BLOSUM62-only options are refused (exit 2), before anything is read.
+    stage2 = resolve_query_stage2_options(
+        scoring, seq_identity=seq_identity, min_seq_identity=min_seq_identity, min_coverage=min_coverage,
+        max_evalue=max_evalue, gap_open=gap_open, gap_extend=gap_extend, comp_bias_corr=comp_bias_corr,
+        significance_mode=significance_mode,
+    )
+    if stage2.scoring is ScoringChoice.esm_codes:
+        _query_sequences_esm_codes(
+            db_path=db_path, fasta_file=fasta_file, tmp_embedding_folder=tmp_embedding_folder,
+            output_file=output_file, min_res_n=min_res_n, top_k=top_k, threshold=threshold,
+            use_gpu_index=use_gpu_index, accelerator=accelerator, num_nodes=num_nodes, devices=devices,
+            strategy=strategy, batch_size=batch_size, num_workers=num_workers, nprobe=nprobe, stage2=stage2,
+            align_workers=align_workers, format_output=format_output, format_mode=format_mode,
+        )
+        return
+    min_seq_identity, min_coverage, max_evalue = stage2.min_seq_identity, stage2.min_coverage, stage2.max_evalue
+    gap_open, gap_extend, comp_bias_corr = stage2.gap_open, stage2.gap_extend, stage2.comp_bias_corr
+    significance_mode = stage2.significance_mode
     preflight = _fasta_preflight(fasta_file, min_res_n)
     # Read-only, on every rank, before ESM3: whether Stage 2 runs, and whether
     # the subject's sequence store can serve it.
@@ -1607,6 +1665,217 @@ def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missin
         "Build with 'fm-search build sequences' to enable sequence identity."
     )
     return False
+
+
+# =====================================================================================================================
+# query sequences --scoring (plan P6.1-P6.3)
+# =====================================================================================================================
+#: Defaults of the Stage-2 options of ``query sequences`` per scoring (P6.1). BLOSUM62's are the values the options
+#: had before --scoring; esm-codes filters on the E-value only (D8).
+BLOSUM62_QUERY_DEFAULTS = MappingProxyType(dict(
+    min_seq_identity=0.3, min_coverage=0.8, max_evalue=1e-3, gap_open=11, gap_extend=1, comp_bias_corr=False,
+    significance_mode=SignificanceMode.default,
+))
+ESM_CODES_QUERY_DEFAULTS = MappingProxyType(dict(min_seq_identity=0.0, min_coverage=0.0, max_evalue=1e-3))
+#: The BLOSUM62-only options, refused under esm-codes whatever their value (D20: exit status 2).
+_BLOSUM62_ONLY_OPTIONS = (("gap_open", "--gap-open"), ("gap_extend", "--gap-extend"),
+                          ("comp_bias_corr", "--comp-bias-corr/--no-comp-bias-corr"),
+                          ("significance_mode", "--significance-mode"))
+
+
+@dataclass(frozen=True)
+class QueryStage2Options:
+    """The Stage-2 options of one ``query sequences`` run, resolved for its scoring (:func:`resolve_query_stage2_options`).
+    The BLOSUM62-only fields are None under esm-codes."""
+    scoring: ScoringChoice
+    min_seq_identity: float
+    min_coverage: float
+    max_evalue: Optional[float]
+    gap_open: Optional[int] = None
+    gap_extend: Optional[int] = None
+    comp_bias_corr: Optional[bool] = None
+    significance_mode: Optional[SignificanceMode] = None
+
+
+def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optional[bool] = None,
+                                 min_seq_identity: Optional[float] = None, min_coverage: Optional[float] = None,
+                                 max_evalue: Optional[float] = None, gap_open: Optional[int] = None,
+                                 gap_extend: Optional[int] = None, comp_bias_corr: Optional[bool] = None,
+                                 significance_mode: Optional[SignificanceMode] = None) -> QueryStage2Options:
+    """``query sequences``' Stage-2 options for ``scoring`` (P6.1): an option left out (None) takes the scoring's
+    default (:data:`BLOSUM62_QUERY_DEFAULTS`, :data:`ESM_CODES_QUERY_DEFAULTS`), an explicit value is kept.
+
+    Under esm-codes, every BLOSUM62-only option given (``--gap-open``, ``--gap-extend``,
+    ``--comp-bias-corr/--no-comp-bias-corr``, ``--significance-mode``) and ``--no-seq-identity`` are refused, and
+    so are filter values out of range: ``typer.BadParameter`` (exit status 2, D20), before anything is read.
+    Under blosum62 nothing is checked here, as before.
+    """
+    try:
+        scoring = ScoringChoice(scoring)
+    except ValueError:
+        raise typer.BadParameter(f"{scoring!r} is not a scoring; expected one of "
+                                 f"{', '.join(c.value for c in ScoringChoice)}.", param_hint="--scoring") from None
+    given = dict(min_seq_identity=min_seq_identity, min_coverage=min_coverage, max_evalue=max_evalue)
+    if scoring is ScoringChoice.blosum62:
+        blosum = dict(gap_open=gap_open, gap_extend=gap_extend, comp_bias_corr=comp_bias_corr,
+                      significance_mode=significance_mode)
+        values = {name: BLOSUM62_QUERY_DEFAULTS[name] if value is None else value
+                  for name, value in {**given, **blosum}.items()}
+        if values["significance_mode"] is not None:
+            values["significance_mode"] = SignificanceMode(values["significance_mode"])
+        return QueryStage2Options(scoring=scoring, **values)
+    refused = [flag for name, flag in _BLOSUM62_ONLY_OPTIONS
+               if {"gap_open": gap_open, "gap_extend": gap_extend, "comp_bias_corr": comp_bias_corr,
+                   "significance_mode": significance_mode}[name] is not None]
+    problems = []
+    if refused:
+        problems.append(
+            f"{', '.join(refused)} {'is a BLOSUM62 option' if len(refused) == 1 else 'are BLOSUM62 options'}: "
+            f"--scoring esm-codes takes its gap costs and E-value statistics from the scoring system the "
+            f"database's residue codes were built for")
+    if seq_identity is False:
+        problems.append("--no-seq-identity asks for an embedding-only search, which has no Stage-2 scoring: "
+                        "drop --scoring esm-codes for it")
+    if problems:
+        raise typer.BadParameter("; ".join(problems) + ". Remove them, or use --scoring blosum62.",
+                                 param_hint="--scoring")
+    values = {name: ESM_CODES_QUERY_DEFAULTS[name] if value is None else value for name, value in given.items()}
+    for name, flag in (("min_seq_identity", "--min-seq-identity"), ("min_coverage", "--min-coverage")):
+        if not 0.0 <= values[name] <= 1.0:  # NaN fails too
+            raise typer.BadParameter(f"must be a fraction between 0 and 1, got {values[name]}.", param_hint=flag)
+    if not values["max_evalue"] >= 0.0:
+        raise typer.BadParameter(f"must be >= 0 ('inf' for no E-value filter), got {values['max_evalue']}.",
+                                 param_hint="--max-evalue")
+    return QueryStage2Options(scoring=scoring, **values)
+
+
+def _esm_codes_output_fields(format_output: str) -> List[str]:
+    """The ``--format-output`` fields of an esm-codes query, refused (exit status 2) before anything is read."""
+    from foldmatch.search import output
+    try:
+        return output.parse_format_output(format_output)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--format-output") from None
+
+
+@dataclass(frozen=True)
+class EsmCodesQueryDatabase:
+    """What :func:`resolve_esm_codes_database` found: the database's stores, its code-store manifest, its scoring
+    system (the registry entry the manifest names), the kernel and the prepared (sha256-verified) bundle."""
+    db_path: str
+    sequence_store: Any
+    code_store: Any
+    manifest: Mapping[str, Any]
+    system: Any
+    kernel: Any
+    prepared: Any
+
+    @property
+    def total_residues(self) -> int:
+        """N of the E-values: the database's residue count (manifest ``total_residues``)."""
+        return int(self.manifest["total_residues"])
+
+
+def resolve_esm_codes_database(db_path: str, max_evalue: Optional[float], *, num_nodes: int = 1
+                               ) -> EsmCodesQueryDatabase:
+    """The read-only resolution of ``query sequences --scoring esm-codes`` (plan P6.2), run on every rank before
+    ESM3, so a refusal stops every rank alike. Each step refuses with its own message, as a
+    :class:`~foldmatch.errors.RefusalError` (exit status 1, D20):
+
+    1. the database has a sequence store and a complete residue-code store: a database built without
+       ``--residue-codes`` and a partial build of the codes are told apart;
+    2. the registry knows the system the manifest names (else the database comes from a newer FoldMatch);
+    3. ``check_compatible`` of the code store against the system and the sequence store's meta;
+    4. the native kernel loads (else the message gives the rebuild command);
+    5. ``prepare`` of the system's bundle, pinned by its registry entry: downloaded only by the process that starts
+       the run, and found in the cache by every other rank
+       (:func:`~foldmatch.inference.chain_complete_inference.prepare_scoring_system`);
+    6. the option combinations that depend on the database: a finite ``max_evalue`` needs residues to count.
+
+    The live FAISS count is checked later, on rank 0, once the index is loaded.
+    """
+    from foldmatch.search import scoring_system as ss
+    from foldmatch.search import swkern
+    from foldmatch.search.residue_code_store import (
+        IncompatibleCodeStoreError, ResidueCodeStore, ResidueCodeStoreError,
+    )
+    code_store = ResidueCodeStore.from_db_path(db_path)
+    database = code_store.base
+    blosum = "--scoring blosum62 still works with this database."
+    sequence_store = code_store.sequence_store()
+    if not sequence_store.exists():
+        raise RefusalError(
+            f"--scoring esm-codes: {database} has no sequence store ({sequence_store.path}). It needs a sequence "
+            f"database with residue codes, built with 'fm-search build sequences --residue-codes'.")
+    # 1. The code store and its manifest.
+    from_shards = (f"'fm-search build residue-codes {code_store.db_folder} {code_store.index_name} "
+                   f"--from-shards DIR'")
+    try:
+        manifest = code_store.manifest()
+    except FileNotFoundError as exc:
+        raise RefusalError(
+            f"--scoring esm-codes: {database} was built without --residue-codes: it has no residue codes "
+            f"({code_store.manifest_path} not found). Rebuild it with 'fm-search build sequences --residue-codes', "
+            f"or add the codes from the shards its build kept with {from_shards}. {blosum}") from exc
+    except IncompatibleCodeStoreError as exc:
+        raise RefusalError(f"--scoring esm-codes: {exc}. {blosum}") from exc
+    except ResidueCodeStoreError as exc:
+        raise RefusalError(
+            f"--scoring esm-codes: the residue codes of {database} are a partial build: "
+            f"{code_store.base}.rescodes.* has no manifest ({code_store.manifest_path}), so the build that wrote "
+            f"them stopped before they were validated. Rebuild them with {from_shards}, or rebuild the database "
+            f"with 'fm-search build sequences --residue-codes'. {blosum}") from exc
+    # 2. The registry.
+    name = manifest.get("system_name")
+    try:
+        system = ss.get(name)
+    except ss.UnknownScoringSystemError as exc:
+        raise RefusalError(
+            f"--scoring esm-codes: the residue codes of {database} were built for the scoring system {name!r}, "
+            f"which this FoldMatch ({__version__}) does not know (it knows: {', '.join(ss.known_names())}): the "
+            f"database was built by a newer FoldMatch; upgrade FoldMatch to query it with esm-codes. {blosum}"
+        ) from exc
+    # 3. The codes against the system and the sequence store.
+    with _refusals():
+        manifest = code_store.check_compatible(system)
+    # 4. The kernel.
+    try:
+        kernel = swkern.load()
+    except swkern.KernelError as exc:
+        raise RefusalError(
+            f"--scoring esm-codes needs the native Smith-Waterman kernel, which cannot be used here: {exc}. "
+            f"{blosum}") from exc
+    # 5. The bundle: one fetch, then cached-only on every other rank.
+    from foldmatch.inference.chain_complete_inference import prepare_scoring_system
+    from foldmatch.search.residue_shards import QUERY_ENCODING
+    with _refusals():
+        prepared = prepare_scoring_system(system, residue_output=QUERY_ENCODING, num_nodes=num_nodes)
+    # 6. The option combinations the database decides.
+    from foldmatch.search.alignment import check_evalue_search_space
+    with _refusals():
+        check_evalue_search_space(max_evalue, manifest["total_residues"])
+    return EsmCodesQueryDatabase(db_path=db_path, sequence_store=sequence_store, code_store=code_store,
+                                 manifest=manifest, system=system, kernel=kernel, prepared=prepared)
+
+
+def _query_sequences_esm_codes(*, db_path: str, fasta_file: Path, tmp_embedding_folder: Path, output_file: str,
+                               min_res_n: int, top_k: int, threshold: Optional[float], use_gpu_index: bool,
+                               accelerator, num_nodes: int, devices, strategy, batch_size: int, num_workers: int,
+                               nprobe: Optional[int], stage2: QueryStage2Options, align_workers: Optional[int],
+                               format_output: str, format_mode: FormatMode) -> None:
+    """``query sequences --scoring esm-codes`` (plan section 3, QUERY; P6.1-P6.2): every rank's read-only checks
+    before ESM3. The remaining option checks (exit status 2), the strict query pre-flight (duplicate ids, '<' / '>'
+    and non-ASCII sequences refused) and :func:`resolve_esm_codes_database` (exit status 1). The query pass with the
+    query encodings and the esm-codes Stage 2 come with P6.3.
+    """
+    if align_workers is not None and align_workers < 0:
+        raise typer.BadParameter(f"must be >= 0, got {align_workers}.", param_hint="--align-workers")
+    _esm_codes_output_fields(format_output)
+    with _refusals():
+        _fasta_preflight(fasta_file, min_res_n, strict=True)
+    resolve_esm_codes_database(db_path, stage2.max_evalue, num_nodes=num_nodes)
+    raise RefusalError("--scoring esm-codes: the database and the query pass every check, but the query pass with "
+                       "query encodings is not implemented yet (plan P6.3). --scoring blosum62 works.")
 
 
 def _stage2_align_and_report(
