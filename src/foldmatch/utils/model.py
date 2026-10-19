@@ -1,7 +1,9 @@
 """Model downloads from Hugging Face: the aggregator, ESM3 and the esm-codes scoring bundles.
 
 torch and ESM3 are imported only by the functions that build models, so the esm-codes bundle loader
-(:func:`get_esm_codes_bundle`) works in processes without torch.
+(:func:`get_esm_codes_bundle`) and the download-only functions behind ``download-models``
+(:func:`download_aggregator_weights`, :func:`foldmatch.utils.esm.loaders.download_esm3_snapshot`,
+:func:`download_esm_codes_bundles`) work in processes without torch.
 """
 from __future__ import annotations
 
@@ -20,6 +22,13 @@ from foldmatch.search.scoring_system import BundleMismatchError, BundleUnavailab
 REPO_ID = "rcsb/rcsb-embedding-model"
 FILE_NAME = "rcsb-embedding-model.pt"
 REVISION = "410606e40b1bb7968ce318c41009355c3ac32503"
+# sha256 of FILE_NAME at REVISION (its Hugging Face LFS blob name), checked by download-models.
+AGGREGATOR_SHA256 = "0dc20e4fb5f5767bd1c30c9e67b011186c2c68d8eef596ffad121388c567b687"
+
+
+class AggregatorWeightsMismatchError(ValueError):
+    """The aggregator weights file is not the pinned one (``AGGREGATOR_SHA256``). A ``ValueError``, so the
+    command-line tools report it as a one-line ``Error: ...``."""
 
 
 def get_aggregator_model(device=None):
@@ -44,6 +53,39 @@ def get_residue_model(device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return esm_open(device)
+
+
+def download_aggregator_weights(*, cache_dir=None) -> Path:
+    """``download-models``: fetch the pinned aggregator weights (``REPO_ID``/``FILE_NAME`` at ``REVISION``, the file
+    :func:`get_aggregator_model` loads) into the Hugging Face cache (``cache_dir``, else ``HF_HUB_CACHE`` /
+    ``HF_HOME``) and verify their sha256 (``AGGREGATOR_SHA256``, a full hash). Returns the file's path.
+
+    Download only: no torch, no model, no device. A cached file is not downloaded again (no network at a commit
+    revision). A cached file whose sha256 differs is downloaded once more (``force_download``); it is refused
+    (:class:`AggregatorWeightsMismatchError`) if that fails or the fresh file still differs.
+    """
+    where = f"{REPO_ID}@{REVISION}"
+    try:
+        path = Path(hf_hub_download(repo_id=REPO_ID, filename=FILE_NAME, revision=REVISION, cache_dir=cache_dir))
+    except LocalEntryNotFoundError as e:   # offline or Hub unreachable, and not cached
+        raise FileNotFoundError(f"aggregator weights {FILE_NAME} ({where}) are not in the Hugging Face cache and "
+                                f"could not be downloaded ({e})") from e
+    got = _file_sha256(path)
+    if got == AGGREGATOR_SHA256:
+        return path
+    corrupt = (f"aggregator weights {path} ({where}) have sha256 {got}, expected {AGGREGATOR_SHA256}: the cached "
+               "copy is corrupt or was replaced.")
+    try:
+        path = Path(hf_hub_download(repo_id=REPO_ID, filename=FILE_NAME, revision=REVISION, cache_dir=cache_dir,
+                                    force_download=True))
+    except (OSError, ValueError) as e:  # offline, Hub unreachable (requests errors are OSErrors), a full disk
+        raise AggregatorWeightsMismatchError(f"{corrupt} Downloading it again failed ({type(e).__name__}: {e}).") from e
+    got = _file_sha256(path)
+    if got != AGGREGATOR_SHA256:
+        raise AggregatorWeightsMismatchError(
+            f"aggregator weights {FILE_NAME} ({where}) have sha256 {got} after a fresh download, expected "
+            f"{AGGREGATOR_SHA256}: the file at the pinned revision is not the pinned one")
+    return path
 
 
 def release_mps_cache(device):

@@ -56,26 +56,36 @@ def set_log_level(level: LogLevel):
         logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
 
 
+DOWNLOAD_MODELS_HELP = (
+    "Download ESM3, the aggregator model and the esm-codes scoring bundles from Hugging Face into its cache and "
+    "verify their sha256, so that later runs work offline (HF_HUB_OFFLINE=1). Download only: no model is loaded and "
+    "no GPU is used.")
+
 DOWNLOAD_MODELS_SYSTEM_HELP = (
     "Fetch only this esm-codes scoring system's bundle (repeatable). Default: the bundles of every registered "
     "system. ESM3 and the aggregator are always fetched.")
 
 
 def download_models_command(systems=None):
-    """The ``download-models`` commands: ESM3, the aggregator and the esm-codes bundles of every registered system
-    (or of ``systems``), into the Hugging Face cache, sha256-verified, so later runs work with ``HF_HUB_OFFLINE=1``.
-    Unknown system names are refused before anything is downloaded."""
+    """The ``download-models`` command of ``fm-search``, ``fm-embedding`` and ``inference``: ESM3 (the pinned
+    snapshot), the aggregator and the esm-codes bundles of every registered system (or of ``systems``), into the
+    Hugging Face cache, sha256-verified, so later runs work with ``HF_HUB_OFFLINE=1``. Download only: no model is
+    built, torch is not imported and no GPU is touched (a GPU login node is safe). Unknown system names are refused
+    before anything is downloaded."""
     import typer
     from foldmatch.search import scoring_system
     from foldmatch.utils import model
+    from foldmatch.utils.esm import loaders
     known = scoring_system.known_names()
     names = list(dict.fromkeys(systems)) if systems else list(known)
     for name in names:
         if name not in known:
             raise typer.BadParameter(f"unknown esm-codes scoring system {name!r}; this FoldMatch knows: "
                                      f"{', '.join(known) or 'none'}", param_hint="--system")
-    model.get_residue_model()
-    model.get_aggregator_model()
+    snapshot = loaders.download_esm3_snapshot()
+    typer.echo(f"ESM3: {loaders.ESM_REPO_ID}@{loaders.ESM_REVISION}, weights sha256 verified, in {snapshot}")
+    aggregator = model.download_aggregator_weights()
+    typer.echo(f"aggregator: {model.REPO_ID}@{model.REVISION}, sha256 verified, in {aggregator.parent}")
     for name, files in model.download_esm_codes_bundles(names).items():
         s = scoring_system.get(name)
         folder = Path(files[scoring_system.BUNDLE_JSON]).parent

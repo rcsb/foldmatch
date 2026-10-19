@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Annotated, Optional, List
 
 from foldmatch import __version__
-from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, \
+    download_models_command, set_log_level
 from foldmatch.errors import RefusalError
 from foldmatch.search.db_path import parse_db_path
 from foldmatch.search.output import (
@@ -1211,6 +1212,20 @@ def similarity_graph(
     output_path = Path(output_file)
     graph.write_graphml(str(output_path))
     logging.info(f"Similarity graph saved to {output_path}")
+
+
+@app.command(
+    name="download-models",
+    help=DOWNLOAD_MODELS_HELP
+)
+def download_models(
+        system: Annotated[Optional[List[str]], typer.Option(
+            "--system",
+            help=DOWNLOAD_MODELS_SYSTEM_HELP
+        )] = None
+):
+    """The same command as ``fm-embedding download-models`` and ``inference download-models``."""
+    download_models_command(system)
 
 
 def version_callback(value: bool):

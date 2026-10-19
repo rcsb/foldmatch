@@ -965,16 +965,18 @@ class DownloadModelsTest(unittest.TestCase):
         def fake_bundle(system, cache_dir=None, **kw):
             self.fetched.append(system.name)
             return {n: Path("/cache/snap") / n for n, _ in system.bundle_files}
+        from foldmatch.utils.esm import loaders
         patches = [mock.patch.object(ss, "REGISTRY", ss._registry(self.a, self.b)),
                    mock.patch.object(model, "get_esm_codes_bundle", side_effect=fake_bundle),
-                   mock.patch.object(model, "get_residue_model"), mock.patch.object(model, "get_aggregator_model")]
+                   mock.patch.object(loaders, "download_esm3_snapshot", return_value=Path("/cache/esm3")),
+                   mock.patch.object(model, "download_aggregator_weights", return_value=Path("/cache/agg/a.pt"))]
         self.mocks = [p.start() for p in patches]
         for p in patches:
             self.addCleanup(p.stop)
 
     def _apps(self):
-        from foldmatch.cli import embedding, inference
-        return {"fm-embedding": embedding.app, "inference": inference.app}
+        from foldmatch.cli import embedding, inference, search
+        return {"fm-search": search.app, "fm-embedding": embedding.app, "inference": inference.app}
 
     def test_every_registered_system_by_default(self):
         for label, app in self._apps().items():
@@ -994,7 +996,7 @@ class DownloadModelsTest(unittest.TestCase):
                 self.assertEqual(self.fetched, ["esm-codes-b"])
 
     def test_unknown_system_is_refused_before_any_download(self):
-        residue, aggregator = self.mocks[2], self.mocks[3]
+        esm3, aggregator = self.mocks[2], self.mocks[3]
         for label, app in self._apps().items():
             with self.subTest(cli=label):
                 r = CliRunner().invoke(app, ["download-models", "--system", "esm-codes-a", "--system", "nope"])
@@ -1003,7 +1005,7 @@ class DownloadModelsTest(unittest.TestCase):
                 self.assertIn("esm-codes-a, esm-codes-b", r.output)
                 self.assertNotIn("database", r.output)
         self.assertEqual(self.fetched, [])
-        residue.assert_not_called()
+        esm3.assert_not_called()
         aggregator.assert_not_called()
 
     def test_help_names_the_option(self):

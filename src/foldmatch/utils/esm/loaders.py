@@ -1,3 +1,11 @@
+"""ESM3: the pinned snapshot, its weights check, the model builder and the per-residue embedding.
+
+torch and esm are imported only by the functions that build or run the model, so the pins, the weights check and
+:func:`download_esm3_snapshot` (``download-models``) work in processes without torch, and importing this module
+never touches a GPU.
+"""
+from __future__ import annotations
+
 import hashlib
 import os
 import re
@@ -5,15 +13,9 @@ import threading
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-import torch
 
-from esm.models.esm3 import ESM3
-from esm.sdk.api import SamplingConfig
-from esm.models.vqvae import StructureTokenEncoder
-from esm.tokenization import TokenizerCollection, EsmSequenceTokenizer, StructureTokenizer, SecondaryStructureTokenizer, \
-    SASADiscretizingTokenizer, InterProQuantizedTokenizer, ResidueAnnotationsTokenizer
-
-from huggingface_hub import  snapshot_download, try_to_load_from_cache
+from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 ESM_REPO_ID = "rcsb/rcsb-esm"
 # Pinned: the aggregator and everything calibrated downstream read these weights as frozen
@@ -80,12 +82,17 @@ def verify_esm_weights(weights_path, full_hash=False):
     if not full_hash and resolved.parent.name == "blobs" and _SHA256_HEX.fullmatch(resolved.name):
         _check_esm_sha256(weights_path, resolved.name)
         return "blob-name"
+    _check_esm_sha256(weights_path, _sha256_once(resolved))
+    return "sha256"
+
+
+def _sha256_once(resolved):
+    """The sha256 of the file ``resolved``, hashed at most once per process for one file identity."""
     stat = resolved.stat()
     key = (str(resolved), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
     if key not in _hashed:
         _hashed[key] = _file_sha256(resolved)
-    _check_esm_sha256(weights_path, _hashed[key])
-    return "sha256"
+    return _hashed[key]
 
 
 def _check_esm_sha256(weights_path, sha256):
@@ -105,7 +112,48 @@ def _file_sha256(path, chunk_size=1 << 24):
     return digest.hexdigest()
 
 
+def download_esm3_snapshot(*, cache_dir=None) -> Path:
+    """``download-models``: fetch the pinned ESM3 snapshot (``ESM_REPO_ID`` at ``ESM_REVISION``, the snapshot
+    :func:`data_root` serves) into the Hugging Face cache (``cache_dir``, else ``HF_HUB_CACHE`` / ``HF_HOME``) and
+    verify the weights against ``ESM_WEIGHTS_SHA256`` by a full sha256 (once per process). Returns the snapshot folder.
+
+    Download only: no torch, no model, no device. A cached snapshot is not downloaded again (with ``HF_HUB_OFFLINE=1``
+    nothing touches the network). A cached weights file whose content differs from the pin (a truncated or corrupted
+    blob, whose name alone would pass) is downloaded once more (``force_download``); it is refused
+    (:class:`EsmWeightsMismatchError`) if that fails or the fresh file still differs.
+    """
+    try:
+        snapshot = Path(snapshot_download(repo_id=ESM_REPO_ID, revision=ESM_REVISION, cache_dir=cache_dir))
+    except LocalEntryNotFoundError as e:   # offline or Hub unreachable, and not cached
+        raise FileNotFoundError(f"ESM3 snapshot {ESM_REPO_ID}@{ESM_REVISION} is not in the Hugging Face cache and "
+                                f"could not be downloaded ({e})") from e
+    weights = snapshot / ESM_WEIGHTS_FILE
+    if not weights.is_file():
+        raise FileNotFoundError(
+            f"ESM3 weights {ESM_WEIGHTS_FILE} are missing from the cached snapshot {snapshot} "
+            f"({ESM_REPO_ID}@{ESM_REVISION}); run download-models with the Hugging Face Hub reachable "
+            "(HF_HUB_OFFLINE unset)")
+    try:
+        verify_esm_weights(weights, full_hash=True)
+        return snapshot
+    except EsmWeightsMismatchError as mismatch:
+        corrupt = mismatch
+    try:
+        hf_hub_download(repo_id=ESM_REPO_ID, filename=ESM_WEIGHTS_FILE, revision=ESM_REVISION, cache_dir=cache_dir,
+                        force_download=True)
+    except (OSError, ValueError) as e:  # offline, Hub unreachable (requests errors are OSErrors), a full disk
+        raise EsmWeightsMismatchError(f"{corrupt} Downloading it again failed ({type(e).__name__}: {e}).") from e
+    got = _sha256_once(Path(os.path.realpath(weights)))
+    if got != ESM_WEIGHTS_SHA256:
+        raise EsmWeightsMismatchError(
+            f"ESM3 weights {ESM_WEIGHTS_FILE} ({ESM_REPO_ID}@{ESM_REVISION}) have sha256 {got} after a fresh "
+            f"download, expected {ESM_WEIGHTS_SHA256}: the file at the pinned revision is not the pinned release")
+    return snapshot
+
+
 def structure_encoder(device: torch.device | str = "cpu"):
+    import torch
+    from esm.models.vqvae import StructureTokenEncoder
     with torch.device(device):
         model = StructureTokenEncoder(
             d_model=1024, n_heads=1, v_heads=128, n_layers=2, d_out=128, n_codes=4096
@@ -119,6 +167,8 @@ def structure_encoder(device: torch.device | str = "cpu"):
 
 
 def get_model_tokenizers():
+    from esm.tokenization import TokenizerCollection, EsmSequenceTokenizer, StructureTokenizer, \
+        SecondaryStructureTokenizer, SASADiscretizingTokenizer, InterProQuantizedTokenizer, ResidueAnnotationsTokenizer
 
     class CustomAnnotationsTokenizer(ResidueAnnotationsTokenizer):
         def __init__(self, csv_path: str | None = None, max_annotations: int = 16):
@@ -139,6 +189,8 @@ def get_model_tokenizers():
 
 
 def esm_open(device: torch.device | str = "cpu"):
+    import torch
+    from esm.models.esm3 import ESM3
     with torch.device(device):
         model = ESM3(
             d_model=1536,
@@ -206,6 +258,7 @@ def per_residue_embedding(model, esm_prot):
     coordinates take ESM3's path unchanged. Every call holds the model's lock, so calls on one
     model from several threads run one at a time (calls on different models do not wait).
     """
+    from esm.sdk.api import SamplingConfig
     with geometric_attention_off(model, off=esm_prot.coordinates is None):
         return model.forward_and_sample(
             model.encode(esm_prot), SamplingConfig(return_per_residue_embeddings=True)
