@@ -34,9 +34,9 @@ While the major version is `0`, breaking changes are released in a minor bump.
   build sequences`: deletes the build's intermediate embedding shards from
   `--tmp-embedding-folder` once the database is built. Off by default, so the
   shards are kept as before.
-- **Groundwork for ESM3 residue-code scoring (not usable yet).** Building
-  blocks of the coming opt-in Stage-2 scoring `esm-codes-v1`, an alternative
-  to BLOSUM62: the residue-code encoders
+- **ESM3 residue-code scoring: the building blocks.** The parts of the
+  opt-in Stage-2 scoring `esm-codes-v1`, an alternative to BLOSUM62: the
+  residue-code encoders
   (`foldmatch.model.residue_code_encoder`), which turn ESM3 per-residue
   embeddings into 8-byte residue codes and query encodings with the files of
   the Hugging Face repo `rcsb/foldmatch-esm-codes`; a native C
@@ -46,10 +46,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   convention behind the scores, including the bundle's repo, pinned revision
   and file sha256s (about 26 MB), with its E-value statistics
   (`foldmatch.search.code_statistics`). A changed value will always be a new
-  system name. Only the database build uses them so far (`--residue-codes`,
-  below); query scoring (`fm-search query sequences --scoring esm-codes`)
-  comes in a later change, and existing commands, BLOSUM62 scoring and its
-  output are unchanged. `python -m foldmatch.search.swkern` runs the kernel's
+  system name. The database build (`--residue-codes`) and the query
+  (`fm-search query sequences --scoring esm-codes`), both below, use them;
+  existing commands, BLOSUM62 scoring and its output are unchanged; and the
+  Stage-2 aligner is `foldmatch.search.code_alignment`
+  (`align_candidates_esm_codes`). `python -m foldmatch.search.swkern` runs the kernel's
   self-test (reference hash and the BLAS similarity path) and prints a JSON
   report.
 - **`fm-search build sequences --residue-codes`** (opt-in, off by default).
@@ -70,10 +71,10 @@ While the major version is `0`, breaking changes are released in a minor bump.
   the codes are checked against the sequence store, the pre-flight counts
   and the FAISS index; if a check fails, only the code store is removed, so
   the database still serves BLOSUM62 searches, and the embedding shards are
-  kept for `build residue-codes`. FASTA (sequence) databases only. These
-  databases cannot be searched with the codes yet: `query sequences
-  --scoring esm-codes` comes in a later change. Without the option the build
-  and all its files are unchanged.
+  kept for `build residue-codes`. FASTA (sequence) databases only. Such a
+  database is searched with its codes by `query sequences --scoring
+  esm-codes` (below), and with BLOSUM62 as before. Without the option the
+  build and all its files are unchanged.
 - **`fm-search build residue-codes DB_FOLDER INDEX_NAME --from-shards DIR`**
   rebuilds and validates the residue-code store of a database from the
   embedding shards its `build sequences --residue-codes` run kept in
@@ -87,6 +88,58 @@ While the major version is `0`, breaking changes are released in a minor bump.
   meanwhile), and a refused or interrupted rebuild leaves the old one as it
   was. Shards without codes, of another encoding, or whose entry count
   differs from the database's are refused before anything is changed.
+- **`fm-search query sequences --scoring esm-codes`** (opt-in; `--scoring
+  blosum62`, the BLOSUM62 Stage 2 as before, stays the default). Stage 2
+  aligns each query with its Stage-1 candidates through their ESM3 residue
+  codes, on a database built with `build sequences --residue-codes`, using
+  the scoring system its residue-code manifest names (`esm-codes-v1`). The
+  ESM3 pass that embeds the queries also computes their residue encodings;
+  the native kernel scores every candidate, the E-value of a hit is
+  calibrated against a fixed panel of 1,000 UniRef50 sequences and computed
+  over the database's residue count, and only the hits that pass
+  `--max-evalue` are traced back for the alignment columns. Hits are ranked
+  by score. One scoring per run. Under esm-codes, `--min-seq-identity` and
+  `--min-coverage` default to 0 and `--max-evalue` to `1e-3`, as under
+  BLOSUM62 (explicit values are honoured; the help gives both scorings'
+  defaults), and the BLOSUM62 options `--gap-open`, `--gap-extend`,
+  `--comp-bias-corr`, `--significance-mode`, as well as `--no-seq-identity`,
+  are refused (exit status 2). Before ESM3 is loaded, and on every rank
+  alike, the query is refused with a one-line message (exit status 1) when
+  its FASTA has duplicate ids, `<` or `>` in a sequence, or non-ASCII
+  characters; when the database was built without `--residue-codes`, or
+  its codes are a partial build; when the codes were built for a scoring
+  system this FoldMatch does not know (a database from a newer FoldMatch)
+  or do not match the system or the database's sequence store; when the
+  native kernel cannot be loaded (the message gives the command that builds
+  it); and when the scoring bundle cannot be fetched or verified (only the
+  process that starts a run downloads it). Once the index is loaded, codes
+  whose entry count differs from the FAISS index are refused. A hit is
+  inside the calibrated domain of the E-values (`ecal=1`) when the query
+  has 21 to 966 residues, the target at most 3,000, both at most 1%
+  non-standard residues and the target at least 2 distinct codes; other
+  hits are still reported, with `ecal=0`, and one warning per run gives the
+  counts. A query of one residue, or whose encoding rows are all identical,
+  reports no hits. Stage 2 runs in a pool of worker processes
+  (`--align-workers`, all CPUs by default) that load neither torch nor
+  ESM3, after ESM3 and the aggregator have been freed; its output does not
+  depend on the number of workers; a worker that is killed (for example by
+  the out-of-memory killer) stops the run with an error. The query
+  encodings are written next to the query's embedding shards in
+  `--tmp-embedding-folder` and deleted with them at the end of the run, also
+  when it fails (a process whose ESM3 pass fails deletes the shard it wrote).
+- **New `--format-output` fields `rawrev`, `q90`, `rawadj` and `ecal`**, filled
+  by `query sequences --scoring esm-codes`: the score of the reversed query,
+  the query's 0.9 quantile over the scoring panel, the adjusted score behind
+  `evalue` and `bits` (`raw - rawrev - q90`), and whether the hit is inside
+  the calibrated domain (`1`/`0`). Under esm-codes `raw` is the forward score
+  with three decimals, `evalue` is computed in log space, so it never
+  underflows, and `bits` is rounded half up (`floor(x + 0.5)`, also for a
+  negative bit score). The four fields render empty under BLOSUM62 and in
+  `query db`. BLOSUM62 columns, `bits` included, and the default columns are
+  unchanged.
+- **`fm-search download-models`**: the same command, with the same `--system`
+  option and help, as `fm-embedding download-models` and `inference
+  download-models`, since `fm-search` now uses the scoring bundle too.
 
 ### Changed
 
@@ -213,8 +266,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `pip install --no-binary foldmatch`), an editable install (`pip install -e
   .`, `uv sync`) and `hatch test`. Without a usable compiler the install still
   succeeds, with a warning, as a pure-Python package: everything works as
-  before except the coming residue-code scoring, which will refuse to run and
-  print the reinstall command, `pip install --no-cache-dir --force-reinstall
+  before except the residue-code scoring (`--scoring esm-codes`), which refuses
+  to run and prints the reinstall command, `pip install --no-cache-dir --force-reinstall
   --no-binary foldmatch foldmatch` (pip caches the pure-Python wheel, hence
   `--no-cache-dir`). Set `FOLDMATCH_REQUIRE_NATIVE=1` to make a failed compile
   an error instead; CI, the release wheels and the Docker image do. In a
@@ -230,6 +283,18 @@ While the major version is `0`, breaking changes are released in a minor bump.
   corrupted download) is downloaded again. The files go into the Hugging Face
   cache like the models, so later runs work with `HF_HUB_OFFLINE=1` and from
   a read-only cache; nothing else is written there.
+- **`download-models` downloads only.** It fetches and checks the pinned files
+  (the ESM3 snapshot, whose weights it hashes in full, the aggregator weights,
+  now pinned by sha256 too, and the esm-codes bundles) without building ESM3
+  or the aggregator, importing torch or touching a GPU. Before, it loaded both
+  models, on the GPU when one was visible, which ran out of memory on shared
+  GPU login nodes; the `CUDA_VISIBLE_DEVICES=` workaround is no longer
+  needed. A cached ESM3 or aggregator file whose content differs from its pin
+  is downloaded again, and the command prints one line per model with the
+  verified pin.
+- **The `--format-output` field list** in `fm-search query sequences --help`
+  and `fm-search query db --help` names the four new esm-codes fields
+  (`rawrev`, `q90`, `rawadj`, `ecal`); in `query db` they are always empty.
 - **Docker image.** The image is built with a regular (non-editable) install
   that must compile the kernel, runs the kernel self-test at build time and
   again in the compiler-free runtime stage, and no longer copies the source
