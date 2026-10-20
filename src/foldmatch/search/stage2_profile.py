@@ -22,7 +22,8 @@ breakdown in ``stats["profile"]`` (:meth:`Stage2Profile.summary`):
 ``workers`` per task kind (``panel`` and ``candidates`` in round 1, ``round2``): tasks, pairs, similarity cells,
             worker seconds and their split: ``prep`` (S5 query prep), ``sim`` (decode + per-pair GEMMs), ``kernel``
             (one native call per block: rowcol z + DP, and the traceback in round 2), ``paths`` (round 2: gathering
-            the paths), ``distinct`` (round 2: distinct-code counts), ``driver`` (the rest of the kernel wrapper:
+            the paths), ``distinct`` (round 2: distinct-code counts), ``metrics`` (round 2: the S12 column tallies,
+            non-standard counts and requested strings), ``driver`` (the rest of the kernel wrapper:
             block planning, buffers, ctypes) and ``other`` (the rest of the task); ns per cell for ``sim`` and
             ``kernel``.
 ``ipc``     pickled bytes of the tasks (parent) and results (worker) with the time a ``pickle.dumps`` of them took
@@ -51,7 +52,7 @@ PROFILE_ENV = "FOLDMATCH_STAGE2_PROFILE"
 IMPORT_UNIX = time.time()
 
 KINDS = ("panel", "candidates", "round2")
-_COMPONENTS = ("prep", "sim", "kernel", "paths", "distinct", "driver", "other")
+_COMPONENTS = ("prep", "sim", "kernel", "paths", "distinct", "metrics", "driver", "other")
 
 
 def profiling_enabled() -> bool:
@@ -246,10 +247,10 @@ class Stage2Profile:
             k["cells"] += rec["cells"]
             k["seconds"] += rec["seconds"]
             swk = t.get("swkern", 0.0)
-            for c in ("prep", "sim", "kernel", "paths", "distinct"):
+            for c in ("prep", "sim", "kernel", "paths", "distinct", "metrics"):
                 k[c] += t.get(c, 0.0)
             k["driver"] += swk - t.get("sim", 0.0) - t.get("kernel", 0.0) - t.get("paths", 0.0)
-            k["other"] += rec["seconds"] - swk - t.get("prep", 0.0) - t.get("distinct", 0.0)
+            k["other"] += rec["seconds"] - swk - t.get("prep", 0.0) - t.get("distinct", 0.0) - t.get("metrics", 0.0)
         for k in kinds.values():
             cells = max(k["cells"], 1)
             k["sim_ns_per_cell"] = 1e9 * k["sim"] / cells

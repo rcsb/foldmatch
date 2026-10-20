@@ -11,11 +11,14 @@ number of build ranks), :func:`align_candidates_esm_codes` runs::
     parent    S = fp64(S_f) - fp64(S_r); Q90 = quantile(panel S, 0.9) (S10); S' = S - Q90, ln E, bits (S11);
               survivors: ln E <= ln(max_evalue), or every candidate when there is no E filter
     round 2   survivors only: forward traceback of S_f (S12); its score must equal round 1's S_f bit for bit
-              (:class:`~foldmatch.errors.InternalError` otherwise); whether the target has enough distinct codes (S13)
-    parent    vectorised path metrics, ecal (S13), filters (alnlen > 0, identity, min(qcov, tcov)), sort (S14)
+              (:class:`~foldmatch.errors.InternalError` otherwise); in the worker too, the paths' vectorised S12
+              column tallies and the requested CIGAR / alignment strings, the targets' non-standard counts and
+              whether they have enough distinct codes (S13)
+    parent    identity and coverage, ecal (S13), filters (alnlen > 0, identity, min(qcov, tcov)), sort (S14)
 
-**Tasks.** A task is ``(task id, source, query memmap offset, query length, [(offset, length), ...])``: the rows of
-its targets in the panel codes or in the code store. Workers hold everything else (:func:`_init_worker`: the kernel,
+**Tasks.** A round-1 task is ``(task id, source, query memmap offset, query length, [(offset, length), ...])``: the
+rows of its targets in the panel codes or in the code store; a round-2 task also carries the query and target
+sequences and which strings the output needs. Workers hold everything else (:func:`_init_worker`: the kernel,
 the scoring npz through :meth:`~foldmatch.search.scoring_system.WorkerSpec.load_panel`, the code-store memmap, the
 query memmap and a :class:`~foldmatch.search.swkern.Workspace`) and return numpy arrays. The task size adapts to the
 batch: at most ``task_cells`` similarity cells, and small enough for at least 4 tasks per worker (but not below
@@ -350,11 +353,20 @@ def _distinct_codes(codes: np.ndarray, cap: int) -> int:
     return min(int(np.unique(v).size), int(cap))
 
 
+#: the S12 column tallies a round-2 task returns per survivor (``path_columns`` keys), in this order
+_COLUMNS = ("aln_len", "n_ident", "mismatch", "gap_open", "q_aligned", "t_aligned", "q_start", "q_end", "t_start",
+            "t_end")
+
+
 def _round2_task(task):
-    """Round 2: ``(task id, S_f float32 [k], ends int32 [k, 2], path int32 [P, 2], path_off int64 [k + 1],
-    distinct codes int64 [k] (counted up to ``target_min_distinct_codes``), skipped bool [k])``: the forward
-    traceback of survivors (profiling mode: plus the task's timing record)."""
-    tid, q_off, n, pairs = task
+    """Round 2: the forward traceback of survivors, and what the output needs from their paths, so the parent only
+    builds the hits: ``(task id, S_f float32 [k], ends int32 [k, 2], columns int64 [k, len(_COLUMNS)] (S12 tallies),
+    end_ok bool [k] (a nonempty path ends at the best cell), non-standard residues int64 [k], distinct codes int64 [k]
+    (counted up to ``target_min_distinct_codes``), skipped bool [k], strings)``; ``strings`` holds the CIGAR, qaln,
+    taln and tseq strings asked for by ``want`` (else None each). The task is ``(task id, query memmap offset,
+    query length, [(offset, length), ...], query sequence, [target sequences], want (cigar, qaln, taln, tseq))``
+    (profiling mode: plus the task's timing record)."""
+    tid, q_off, n, pairs, qseq, t_seqs, want = task
     st = _state()
     timer = _task_timer(st)
     qp = _query_prep(st, q_off, n)
@@ -367,11 +379,52 @@ def _round2_task(task):
         timer.lap("swkern")
     cap = st.init.spec.calibrated_domain.target_min_distinct_codes
     distinct = np.array([_distinct_codes(st.codes[o:o + m], cap) for o, m in pairs.tolist()], np.int64)
+    if timer is not None:
+        timer.lap("distinct")
+    columns, end_ok, nonstd, strings = _path_outputs(a, qseq, t_seqs, pairs[:, 1], want)
+    out = (tid, a.scores, a.ends, columns, end_ok, nonstd, distinct, a.skipped, strings)
     if timer is None:
-        return tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped
-    timer.lap("distinct")
-    out = (tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped)
+        return out
+    timer.lap("metrics")
     return out + (_task_record(st, timer, "round2", n, pairs, out),)
+
+
+def _path_outputs(a: "swkern.AlignResult", qseq: str, t_seqs: Sequence[str], lengths: np.ndarray, want):
+    """Round 2's per-survivor outputs of :func:`_round2_task` from the kernel's paths: the S12 column tallies
+    (:func:`path_columns` over the sanitised sequences), whether each nonempty path ends at its best cell, the
+    targets' non-standard counts (S13) and the requested strings (CIGAR, gapped query and target, sanitised
+    target), each exactly as the parent built them per hit before."""
+    want_cigar, want_qaln, want_taln, want_tseq = want
+    k = len(t_seqs)
+    q_bytes = np.frombuffer(sanitized_bytes(qseq), np.uint8)
+    t_clean = [sanitized_bytes(x) for x in t_seqs]
+    nonstd = np.array([nonstandard_count(x) for x in t_seqs], np.int64)
+    t_starts = np.zeros(k, np.int64)
+    if k > 1:
+        np.cumsum(np.asarray(lengths, np.int64)[:-1], out=t_starts[1:])
+    t_bytes = np.frombuffer(b"".join(t_clean), np.uint8)
+    path_off = np.asarray(a.path_off, np.int64)
+    cols = path_columns(a.path, path_off, q_bytes, t_bytes, t_starts)
+    columns = np.stack([cols[c] for c in _COLUMNS], axis=1) if k else np.zeros((0, len(_COLUMNS)), np.int64)
+    end_ok = np.ones(k, bool)
+    nonempty = np.flatnonzero(np.diff(path_off) > 0)
+    if nonempty.size:
+        path = np.asarray(a.path).reshape(-1, 2)
+        end_ok[nonempty] = np.all(np.asarray(a.ends)[nonempty] == path[path_off[nonempty + 1] - 1] + 1, axis=1)
+    cigars = q_alns = t_alns = t_strs = None
+    if want_cigar or want_qaln or want_taln:
+        ps = _PathStrings(a.path, path_off, q_bytes, t_bytes, t_starts, cigar=want_cigar, qaln=want_qaln,
+                          taln=want_taln)
+        bounds = list(zip(path_off[:-1].tolist(), path_off[1:].tolist()))
+        if want_cigar:
+            cigars = [ps.cigar(lo, hi) for lo, hi in bounds]
+        if want_qaln:
+            q_alns = [ps.qaln[lo:hi].decode("ascii") for lo, hi in bounds]
+        if want_taln:
+            t_alns = [ps.taln[lo:hi].decode("ascii") for lo, hi in bounds]
+    if want_tseq:
+        t_strs = [x.decode("ascii") for x in t_clean]
+    return columns, end_ok, nonstd, (cigars, q_alns, t_alns, t_strs)
 
 
 # =====================================================================================================================
@@ -881,7 +934,7 @@ class _Query:
     """One query of a batch: its encoding rows, candidates and the results of both rounds."""
     __slots__ = ("qid", "off", "n", "seq", "cand_ids", "cand_emb", "cand_off", "cand_len", "s_f", "s_r", "skipped",
                  "panel_f", "panel_r", "q90", "s", "s_prime", "lne", "bits", "surv", "parts", "inside", "r1_left",
-                 "r2_left", "sequences")
+                 "r2_left")
 
     def __init__(self, qid, off, n, seq, cand_ids, cand_emb, inside: bool):
         self.qid, self.off, self.n, self.seq = qid, off, n, seq
@@ -890,7 +943,6 @@ class _Query:
         self.q90 = None
         self.parts: list = []
         self.r1_left = self.r2_left = 0
-        self.sequences = None
 
 
 def _log_threshold(max_evalue) -> Optional[float]:
@@ -1199,8 +1251,7 @@ def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run)
 class _Batch:
     """One batch of queries in the dataflow: its round-1 task size, the queries not finished yet, its profile
     rounds."""
-    __slots__ = ("index", "queries", "target", "open", "r1_round", "r2_round", "r1_left", "r2_left", "sequences",
-                 "clean")
+    __slots__ = ("index", "queries", "target", "open", "r1_round", "r2_round", "r1_left", "r2_left", "sequences")
 
     def __init__(self, index: int, queries: List[_Query]):
         self.index, self.queries = index, queries
@@ -1209,7 +1260,6 @@ class _Batch:
         self.r1_round = self.r2_round = None
         self.r1_left = self.r2_left = 0
         self.sequences: Dict[str, str] = {}      # the batch's survivor sequences fetched so far (as one batch fetch)
-        self.clean: Dict[str, Tuple[bytes, int]] = {}   # and their sanitised bytes and non-standard counts
 
 
 class _Dataflow:
@@ -1458,7 +1508,8 @@ class _Dataflow:
             t0 = time.perf_counter()
         # the sequences of this query's survivors not fetched for the batch yet (queries of a batch share targets)
         known = b.sequences
-        wanted = {t for t in (q.cand_ids[k] for k in q.surv.tolist()) if t not in known}
+        surv_ids = [q.cand_ids[k] for k in q.surv.tolist()]
+        wanted = {t for t in surv_ids if t not in known}
         if wanted:
             fetched = self.fetch(wanted)
             missing = sorted(t for t in wanted if t not in fetched)
@@ -1467,17 +1518,25 @@ class _Dataflow:
                                  f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database "
                                  "disagree")
             known.update((t, fetched[t]) for t in wanted)
-        q.sequences = known
+        t_seqs = [known[t] for t in surv_ids]
+        ln_l = q.cand_len[q.surv].tolist()
+        bad = [t for t, x, m in zip(surv_ids, t_seqs, ln_l) if len(x) != m]
+        if bad:
+            raise ValueError(f"{len(bad)} target(s) have residue codes of another length than their stored sequence "
+                             f"(first: {', '.join(bad[:_EXAMPLES])}): the code store and the database disagree")
         if prof is not None:
             t1 = time.perf_counter()
             prof.add("fetch", t1 - t0)
-        # round-2 tasks: the survivors in chunks of the batch's task size, longest first, ahead of round 1
+        # round-2 tasks: the survivors in chunks of the batch's task size, longest first, ahead of round 1; each
+        # carries its sequences, so the worker also returns the path metrics and strings the output needs
         q.parts = []
+        needs = run.needs
+        want = (needs.cigar, needs.qaln, needs.taln, needs.tseq)
         off, ln = q.cand_off[q.surv], q.cand_len[q.surv]
         tasks, costs = [], []
-        for k0, k1 in plan_chunks(q.n, ln.tolist(), b.target):
+        for k0, k1 in plan_chunks(q.n, ln_l, b.target):
             pairs = np.column_stack((off[k0:k1], ln[k0:k1]))
-            tasks.append(((self._next_tid(), q.off, q.n, pairs), (2, b, qi, k0, k1)))
+            tasks.append(((self._next_tid(), q.off, q.n, pairs, q.seq, t_seqs[k0:k1], want), (2, b, qi, k0, k1)))
             costs.append(q.n * int(pairs[:, 1].sum()))
         q.r2_left = len(tasks)
         b.r2_left += len(tasks)
@@ -1495,7 +1554,7 @@ class _Dataflow:
         if prof is not None:
             tc = time.perf_counter()
         _kind, b, qi, k0, k1 = tag
-        tid, scores, ends, path, path_off, distinct, skipped = res
+        tid, scores, ends, columns, end_ok, nonstd, distinct, skipped, strings = res
         q = b.queries[qi]
         want = q.s_f[q.surv[k0:k1]]
         if np.any(skipped) or not np.array_equal(np.asarray(scores, np.float32).view(np.uint32),
@@ -1506,18 +1565,18 @@ class _Dataflow:
                 f"(targets {[q.cand_ids[int(q.surv[k0 + i])] for i in bad[:_EXAMPLES].tolist()]}: "
                 f"{np.asarray(scores)[bad[:_EXAMPLES]].tolist()} vs {want[bad[:_EXAMPLES]].tolist()}); the reported "
                 "raw score would not be the one behind the E-value")
-        part = (k0, np.asarray(ends), np.asarray(path), np.asarray(path_off, np.int64), np.asarray(distinct, np.int64))
+        part = (k0, np.asarray(ends), np.asarray(columns, np.int64), np.asarray(end_ok, bool),
+                np.asarray(nonstd, np.int64), np.asarray(distinct, np.int64), strings)
         q.parts.append(part)
         q.r2_left -= 1
         b.r2_left -= 1
         if prof is not None:
-            prof.round2_payload(sum(int(a.nbytes) for a in part[1:]), len(part[4]))
+            prof.round2_payload(_part_bytes(part), len(part[5]))
             prof.add("consume_r2", time.perf_counter() - tc)
         if q.r2_left == 0:
             if prof is not None:
-                held = sum(int(a.nbytes) for p in q.parts for a in p[1:])
-            self.results[q.qid] = _hits(q, run, q.sequences, b.clean)
-            q.sequences = None
+                held = sum(_part_bytes(p) for p in q.parts)
+            self.results[q.qid] = _hits(q, run)
             if prof is not None:
                 prof.round2_payload(-held, -int(q.surv.size))
             self._close_query(b)
@@ -1552,64 +1611,52 @@ def _statistics(q: _Query, run: _Run):
     run.survivors += int(q.surv.size)
 
 
+def _part_bytes(part) -> int:
+    """The round-2 payload of one task result the parent holds (arrays and strings)."""
+    n = sum(int(x.nbytes) for x in part[1:6])
+    for lst in part[6]:
+        if lst is not None:
+            n += sum(len(x) for x in lst)
+    return n
+
+
 def _assemble(q: _Query):
-    """The round-2 parts of a query in survivor order: ends [S, 2], path [P, 2], path_off [S + 1], distinct [S]."""
+    """The round-2 parts of a query in survivor order: ends [S, 2], columns [S, len(_COLUMNS)], end_ok [S],
+    non-standard counts [S], distinct [S], and the four string lists (or None)."""
     parts = sorted(q.parts, key=lambda p: p[0])
     s = int(q.surv.size)
-    if sum(len(p[4]) for p in parts) != s:
-        raise InternalError(f"esm-codes Stage 2: round 2 returned {sum(len(p[4]) for p in parts)} of {s} survivors "
+    if sum(len(p[5]) for p in parts) != s:
+        raise InternalError(f"esm-codes Stage 2: round 2 returned {sum(len(p[5]) for p in parts)} of {s} survivors "
                             f"of query {q.qid!r}")
     ends = np.concatenate([p[1] for p in parts]).reshape(-1, 2)
-    path = np.concatenate([p[2].reshape(-1, 2) for p in parts]) if parts else np.zeros((0, 2), np.int32)
-    lens = np.concatenate([np.diff(p[3]) for p in parts])
-    path_off = np.zeros(s + 1, np.int64)
-    np.cumsum(lens, out=path_off[1:])
-    distinct = np.concatenate([p[4] for p in parts])
+    columns = np.concatenate([p[2] for p in parts]).reshape(-1, len(_COLUMNS))
+    end_ok = np.concatenate([p[3] for p in parts])
+    nonstd = np.concatenate([p[4] for p in parts])
+    distinct = np.concatenate([p[5] for p in parts])
+    strings = []
+    for j in range(4):
+        lists = [p[6][j] for p in parts]
+        strings.append(None if any(x is None for x in lists) else [x for lst in lists for x in lst])
     q.parts = []
-    return ends, path, path_off, distinct
+    return ends, columns, end_ok, nonstd, distinct, strings
 
 
-def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
-          clean: Optional[Dict[str, Tuple[bytes, int]]] = None) -> List[Hit]:
-    """Metrics, ecal, filters and S14 order of one query's survivors. The per-hit values come from the vectorised
-    arrays as Python lists (``tolist`` gives the same ints and floats as ``int()`` / ``float()`` of each element), so
-    the loop only builds the objects. ``clean``: a cache of each target's sanitised bytes and non-standard count by
-    id, shared by a batch's queries."""
+def _hits(q: _Query, run: _Run) -> List[Hit]:
+    """Identity and coverage, filters, ecal (S13) and the S14 order of one query's survivors, from the column
+    tallies, string and count lists the round-2 workers returned (:func:`_path_outputs`). The per-hit values come
+    from the arrays as Python lists (``tolist`` gives the same ints and floats as ``int()`` / ``float()`` of each
+    element), so the loop only builds the objects."""
     needs, d = run.needs, run.domain
     prof = run.prof
     if prof is not None:
         t0 = time.perf_counter()
-    ends, path, path_off, distinct = _assemble(q)
+    ends, columns, end_ok, nonstd, distinct, (cig_l, qaln_l, taln_l, tseq_l) = _assemble(q)
     if prof is not None:
         t1 = time.perf_counter()
         prof.add("hits_assemble", t1 - t0)
     surv = q.surv
-    surv_l = surv.tolist()
-    q_bytes = np.frombuffer(sanitized_bytes(q.seq), np.uint8)
-    t_ids = [q.cand_ids[k] for k in surv_l]
-    t_seqs = [sequences[t] for t in t_ids]
-    if clean is None:
-        t_clean = [sanitized_bytes(s) for s in t_seqs]
-        t_ns = [nonstandard_count(s) for s in t_seqs]
-    else:
-        t_clean, t_ns = [], []
-        for t, seq in zip(t_ids, t_seqs):
-            c = clean.get(t)
-            if c is None:
-                c = clean[t] = (sanitized_bytes(seq), nonstandard_count(seq))
-            t_clean.append(c[0])
-            t_ns.append(c[1])
+    cols = {c: columns[:, j] for j, c in enumerate(_COLUMNS)}
     t_len = q.cand_len[surv]
-    t_len_l = t_len.tolist()
-    bad = [q.cand_ids[surv_l[i]] for i, b in enumerate(t_clean) if len(b) != t_len_l[i]]
-    if bad:
-        raise ValueError(f"{len(bad)} target(s) have residue codes of another length than their stored sequence "
-                         f"(first: {', '.join(bad[:_EXAMPLES])}): the code store and the database disagree")
-    t_starts = np.zeros(len(t_clean), np.int64)
-    if len(t_clean) > 1:
-        np.cumsum(t_len[:-1], out=t_starts[1:])
-    t_bytes = np.frombuffer(b"".join(t_clean), np.uint8)
-    cols = path_columns(path, path_off, q_bytes, t_bytes, t_starts)
     aln_len = cols["aln_len"]
     with np.errstate(divide="ignore", invalid="ignore"):
         identity = np.where(aln_len > 0, cols["n_ident"] / np.maximum(aln_len, 1), 0.0)
@@ -1620,20 +1667,19 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
     hits: List[Hit] = []
     if kidx.size:
         # every kept path (aln_len > 0) must end at the kernel's best cell
-        seg_lo, seg_hi = path_off[kidx], path_off[kidx + 1]
-        off_end = ~np.all(ends[kidx] == path[seg_hi - 1] + 1, axis=1)
+        off_end = ~end_ok[kidx]
         if off_end.any():
             i = int(kidx[np.flatnonzero(off_end)[0]])
-            raise InternalError(f"esm-codes Stage 2: the path of query {q.qid!r} against {q.cand_ids[surv_l[i]]!r} "
-                                f"does not end at the kernel's best cell {ends[i].tolist()}")
+            raise InternalError(f"esm-codes Stage 2: the path of query {q.qid!r} against "
+                                f"{q.cand_ids[int(surv[i])]!r} does not end at the kernel's best cell "
+                                f"{ends[i].tolist()}")
         ks = surv[kidx]
         kidx_l, ks_l, m_l = kidx.tolist(), ks.tolist(), t_len[kidx].tolist()
-        lo_l, hi_l = seg_lo.tolist(), seg_hi.tolist()
         ident_l, qcov_l, tcov_l = identity[kidx].tolist(), qcov[kidx].tolist(), tcov[kidx].tolist()
         aln_l, nid_l, mis_l, gap_l = (cols[c][kidx].tolist() for c in ("aln_len", "n_ident", "mismatch", "gap_open"))
         qs_l, qe_l, ts_l, te_l = (cols[c][kidx].tolist() for c in ("q_start", "q_end", "t_start", "t_end"))
         sf_l, sr_l, dist_l = q.s_f[ks].tolist(), q.s_r[ks].tolist(), distinct[kidx].tolist()
-
+        ns_l = nonstd[kidx].tolist()
         if run.need_panel:
             lne_l, bits_l, sp_l = q.lne[ks].tolist(), q.bits[ks].tolist(), q.s_prime[ks].tolist()
     if prof is not None:
@@ -1642,18 +1688,14 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
 
     q_inside, n = q.inside, q.n
     hd = run.hit_domain
-    q_str = q_bytes.tobytes().decode("ascii") if needs.qseq else None
+    q_str = sanitized_bytes(q.seq).decode("ascii") if needs.qseq else None
     t_max, ns_max, cap = d.target_max_length, d.max_nonstandard_fraction, d.target_min_distinct_codes
-    strings = None
-    if kidx.size and (needs.cigar or needs.qaln or needs.taln):
-        strings = _PathStrings(path, path_off, q_bytes, t_bytes, t_starts, cigar=needs.cigar, qaln=needs.qaln,
-                               taln=needs.taln)
     cand_ids, cand_emb, q90 = q.cand_ids, q.cand_emb, q.q90
     lne = evalue = bit_score = s_prime = None
     with np.errstate(over="ignore", under="ignore"):
         for j, i in enumerate(kidx_l if kidx.size else ()):
             k, m = ks_l[j], m_l[j]
-            t_nonstd = t_ns[i] / m if m else 1.0
+            t_nonstd = ns_l[j] / m if m else 1.0
             t_long, t_nonstandard = m > t_max, t_nonstd > ns_max
             t_low = dist_l[j] < cap
             ecal = q_inside and not (t_long or t_nonstandard or t_low)
@@ -1664,15 +1706,9 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
                 hd["target_long"] += int(t_long)
                 hd["target_nonstandard"] += int(t_nonstandard)
                 hd["target_low_distinct"] += int(t_low)
-            cigar = q_aln = t_aln = None
-            if strings is not None:
-                lo, hi = lo_l[j], hi_l[j]
-                if needs.cigar:
-                    cigar = strings.cigar(lo, hi)
-                if needs.qaln:
-                    q_aln = strings.qaln[lo:hi].decode("ascii")
-                if needs.taln:
-                    t_aln = strings.taln[lo:hi].decode("ascii")
+            cigar = cig_l[i] if needs.cigar else None
+            q_aln = qaln_l[i] if needs.qaln else None
+            t_aln = taln_l[i] if needs.taln else None
             if run.need_panel:
                 lne = lne_l[j]
                 evalue = float(np.exp(lne))
@@ -1684,7 +1720,7 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
                 score=sf_l[j], bit_score=bit_score, pvalue=None, evalue=evalue, query_len=n, subject_len=m,
                 n_ident=n_ident, mismatch=mis_l[j], gap_open=gap_l[j],
                 q_start=qs_l[j], q_end=qe_l[j], t_start=ts_l[j], t_end=te_l[j], cigar=cigar, q_aln=q_aln,
-                t_aln=t_aln, q_seq=q_str, t_seq=t_clean[i].decode("ascii") if needs.tseq else None,
+                t_aln=t_aln, q_seq=q_str, t_seq=tseq_l[i] if needs.tseq else None,
                 score_rev=sr_l[j], q90=q90 if run.need_panel else None, score_adj=s_prime, log_evalue=lne,
                 ecal=bool(ecal))
             hits.append(Hit(subject_id=cand_ids[k], emb_score=cand_emb[k], metrics=metrics))

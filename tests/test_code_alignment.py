@@ -463,7 +463,7 @@ class ProfileTest(_WorldCase):
         self.assertEqual(len(p["tasks"]), stats["round1_tasks"] + stats["round2_tasks"])
         for kind in ("panel", "candidates", "round2"):
             k = w[kind]
-            parts = sum(k[c] for c in ("prep", "sim", "kernel", "paths", "distinct", "driver", "other"))
+            parts = sum(k[c] for c in ("prep", "sim", "kernel", "paths", "distinct", "metrics", "driver", "other"))
             self.assertAlmostEqual(parts, k["seconds"], delta=1e-9 + 1e-9 * k["seconds"], msg=kind)
             self.assertGreater(k["sim"], 0.0, kind)
             self.assertGreater(k["kernel"], 0.0, kind)
@@ -1109,8 +1109,9 @@ class PoolAndWorkerTest(_WorldCase):
         pairs = np.array([(entries[x["tid"]].offset, entries[x["tid"]].length) for x in f1[:6]], np.int64)
         qe = world.query_index.entries[p["qid"]]
         panel = np.column_stack((_panel_offsets()[:-1], np.diff(_panel_offsets())))[:40]
+        t_seqs = [x["tseq"] for x in f1[:6]]
         return ((0, ca._CODES, qe.offset, qe.length, pairs), (1, ca._PANEL, qe.offset, qe.length, panel),
-                (2, qe.offset, qe.length, pairs))
+                (2, qe.offset, qe.length, pairs, p["qseq"], t_seqs, (True, True, True, True)))
 
     def test_workers_import_neither_torch_nor_biotite(self):
         """A subprocess with torch and biotite made unimportable initialises a worker and runs a round-1 task
@@ -1152,7 +1153,8 @@ class PoolAndWorkerTest(_WorldCase):
                     self.assertEqual(a.tobytes(), b.tobytes())
                 else:
                     self.assertEqual(a, b)
-        self.assertGreater(len(got[2][3]), 0)                       # round 2 returned paths
+        self.assertEqual(got[2][3].shape, (6, len(ca._COLUMNS)))   # round 2 returned the S12 column tallies
+        self.assertTrue(all(x for x in got[2][8][0]))              # and the CIGARs it was asked for
 
     def test_worker_initialisation_errors_are_raised_by_tasks(self):
         world = self.f1_world()
