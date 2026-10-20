@@ -232,11 +232,12 @@ def _check_status(status: int, what: str):
 # buffers
 # =====================================================================================================================
 def aligned_empty(n_floats: int) -> np.ndarray:
-    """Uninitialised float32 [n_floats] whose data starts on a 64-byte boundary."""
+    """Uninitialised float32 [n_floats] whose data starts on a 64-byte boundary, also when ``n_floats`` is 0 (an
+    empty numpy slice keeps its base's address, so the empty buffer is cut from an aligned one-float view)."""
     n_floats = int(n_floats)
     raw = np.empty(n_floats + _ALIGN_FLOATS, np.float32)
     off = (-raw.ctypes.data % ALIGN_BYTES) // 4
-    return raw[off:off + n_floats]
+    return raw[off:off + max(n_floats, 1)][:n_floats]
 
 
 def _pad(cells: int) -> int:
@@ -252,6 +253,8 @@ class Workspace:
         self._flags = np.empty(0, np.uint8)
         self._sim = aligned_empty(0)
         self._dec = np.empty(0, np.float32)
+        self._path = np.empty(0, np.int32)
+        self._poff = np.empty(0, np.int64)
 
     def kernel_floats(self, need: int) -> np.ndarray:
         if self._ws.size < need:
@@ -276,8 +279,22 @@ class Workspace:
             self._dec = np.empty(int(rows) * DIM, np.float32)
         return self._dec[:rows * DIM].reshape(rows, DIM)
 
+    def path_entries(self, entries: int) -> np.ndarray:
+        """int32 buffer of at least ``2 x entries`` values (the traceback's (i, j) path entries)."""
+        need = 2 * max(int(entries), 1)
+        if self._path.size < need:
+            self._path = np.empty(need, np.int32)
+        return self._path
+
+    def path_offsets(self, count: int) -> np.ndarray:
+        """int64 buffer of at least ``count`` values (a kernel call's path offsets)."""
+        if self._poff.size < count:
+            self._poff = np.empty(int(count), np.int64)
+        return self._poff
+
     def nbytes(self) -> int:
-        return int(self._ws.nbytes + self._flags.nbytes + self._sim.nbytes + self._dec.nbytes)
+        return int(self._ws.nbytes + self._flags.nbytes + self._sim.nbytes + self._dec.nbytes + self._path.nbytes
+                   + self._poff.nbytes)
 
 
 _TLS = threading.local()
@@ -450,8 +467,80 @@ def plan_blocks(n: int, lengths: Sequence[int], skipped: Sequence[bool], block_f
     return blocks
 
 
+class _Layout:
+    """Every block of one :func:`score_fwd_rev` / :func:`align` call, laid out once per call (vectorised) instead of
+    block by block: the blocks of :func:`plan_blocks`; per pair its float offset from its block's start
+    (``pair_off`` int64 [K]: the 64-byte-padded [n, m] matrices of a block one after another, exactly the layout of
+    :class:`_Block`) and its length as int32 (``m32``); per block its buffer size (``floats``), its decoded rows
+    (``rows``) and whether its targets are consecutive rows of the codes (``contiguous``); ``mmax`` the longest
+    scored pair. Python lists of the per-pair values save numpy scalar access in the per-pair loops."""
+    __slots__ = ("blocks", "pair_off", "m32", "floats", "rows", "contiguous", "mmax", "starts_l", "lens_l", "off_l")
+
+    def __init__(self, n: int, starts: np.ndarray, lens: np.ndarray, skipped: np.ndarray, block_floats: int):
+        K = len(lens)
+        self.blocks = plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats)
+        self.m32 = lens.astype(np.int32)
+        self.starts_l, self.lens_l = starts.tolist(), lens.tolist()
+        if not self.blocks:
+            self.pair_off = np.zeros(K, np.int64)
+            self.floats = self.rows = self.contiguous = []
+            self.off_l, self.mmax = self.pair_off.tolist(), 0
+            return
+        padded = -(-(n * lens) // _ALIGN_FLOATS) * _ALIGN_FLOATS
+        csum = np.zeros(K + 1, np.int64)
+        np.cumsum(padded, out=csum[1:])
+        rsum = np.zeros(K + 1, np.int64)
+        np.cumsum(lens, out=rsum[1:])
+        b0 = np.fromiter((b[0] for b in self.blocks), np.int64, len(self.blocks))
+        b1 = np.fromiter((b[1] for b in self.blocks), np.int64, len(self.blocks))
+        first = np.zeros(K, np.int64)                  # each pair's block start (blocks are increasing ranges)
+        first[b0] = b0
+        np.maximum.accumulate(first, out=first)
+        self.pair_off = csum[:-1] - csum[first]        # (skipped pairs belong to no block; their value is unused)
+        self.off_l = self.pair_off.tolist()
+        self.floats = (csum[b1] - csum[b0]).tolist()
+        self.rows = (rsum[b1] - rsum[b0]).tolist()
+        breaks = np.zeros(K, np.int64)
+        if K > 1:
+            np.cumsum(starts[1:] != starts[:-1] + lens[:-1], out=breaks[1:])
+        self.contiguous = (breaks[b1 - 1] == breaks[b0]).tolist()
+        self.mmax = int(lens[~skipped].max())
+
+
+def _fill_block(layout: _Layout, b: int, qp: np.ndarray, codes: np.ndarray, D: np.ndarray, D3: np.ndarray,
+                sim: np.ndarray) -> None:
+    """Block ``b`` of ``layout``: its targets decoded into ``D`` (``D3`` the [rows, 8, 8] view of the same buffer)
+    and each pair's similarity as its own fp32 GEMM (S6) into ``sim`` at the pair's offset -- the same decode, the
+    same GEMM operands and the same output layout as :class:`_Block`."""
+    k0, k1 = layout.blocks[b]
+    n = qp.shape[0]
+    starts_l, lens_l, off_l = layout.starts_l, layout.lens_l, layout.off_l
+    r = 0
+    if layout.contiguous[b]:
+        rows = layout.rows[b]
+        if rows:
+            s0 = starts_l[k0]
+            np.take(_LUT, codes[s0:s0 + rows], axis=0, out=D3[:rows], mode="clip")
+        for k in range(k0, k1):
+            m = lens_l[k]
+            if m:
+                o = off_l[k]
+                np.matmul(qp, D[r:r + m].T, out=sim[o:o + n * m].reshape(n, m))      # S6: one fp32 GEMM per pair
+                r += m
+        return
+    for k in range(k0, k1):
+        m = lens_l[k]
+        if m:
+            s, o = starts_l[k], off_l[k]
+            np.take(_LUT, codes[s:s + m], axis=0, out=D3[r:r + m], mode="clip")
+            np.matmul(qp, D[r:r + m].T, out=sim[o:o + n * m].reshape(n, m))          # S6: one fp32 GEMM per pair
+            r += m
+
+
 class _Block:
-    """One block's similarity matrices in the workspace buffer, filled by per-pair GEMMs (or ``fmsw_sim_ref``)."""
+    """One block's similarity matrices in the workspace buffer, filled by per-pair GEMMs (or ``fmsw_sim_ref``).
+    Production calls lay out all their blocks at once (:class:`_Layout`, :func:`_fill_block`: the same matrices at
+    the same offsets); this class remains for ``reference_sim`` and for the benchmark's per-stage timings."""
     __slots__ = ("sim", "pair_off", "m", "K")
 
     def __init__(self, kernel: Kernel, ws: Workspace, qp: np.ndarray, codes: np.ndarray, starts: np.ndarray,
@@ -545,21 +634,41 @@ def score_fwd_rev(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, 
     n, K = qp.shape[0], len(lens)
     s_f = np.full(K, np.nan, np.float32)
     s_r = np.full(K, np.nan, np.float32)
-    for k0, k1 in plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats):
+    if reference_sim:
+        for k0, k1 in plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats):
+            b = _Block(k, ws, qp, codes, starts, lens, k0, k1, True)
+            kw = ws.kernel_floats(k.ws_floats(n, int(b.m.max())))
+            _check_status(k.lib.fmsw_score_fwd_rev(b.sim.ctypes.data, n, b.pair_off.ctypes.data, b.m.ctypes.data,
+                                                   b.K, params.offset, params.gap_open, params.gap_extend,
+                                                   s_f[k0:].ctypes.data, s_r[k0:].ctypes.data, kw.ctypes.data,
+                                                   kw.size), "fmsw_score_fwd_rev")
+        return ScoreResult(s_f, s_r, skipped)
+    lay = _Layout(n, starts, lens, skipped, block_floats)
+    if not lay.blocks:
+        return ScoreResult(s_f, s_r, skipped)
+    # one set of buffers and pointers for the call (block k's arguments are offsets into them)
+    sim, kw = ws.sim(max(lay.floats)), ws.kernel_floats(k.ws_floats(n, lay.mmax))
+    D = ws.decoded(max(lay.rows))
+    D3 = D.reshape(-1, CODE_BYTES, 8)
+    sim_p, po_p, m_p = sim.ctypes.data, lay.pair_off.ctypes.data, lay.m32.ctypes.data
+    sf_p, sr_p, kw_p, kw_n = s_f.ctypes.data, s_r.ctypes.data, kw.ctypes.data, kw.size
+    if sim_p % ALIGN_BYTES:                                             # by construction; S6 layout guard
+        raise KernelError("similarity block buffer is not 64-byte aligned")
+    fn, off, go, ge = k.lib.fmsw_score_fwd_rev, params.offset, params.gap_open, params.gap_extend
+    for b, (k0, k1) in enumerate(lay.blocks):
         if timings is not None:
             t0 = time.perf_counter()
-        b = _Block(k, ws, qp, codes, starts, lens, k0, k1, reference_sim)
-        kw = ws.kernel_floats(k.ws_floats(n, int(b.m.max())))
+        _fill_block(lay, b, qp, codes, D, D3, sim)
         if timings is not None:
             t1 = time.perf_counter()
             _add_time(timings, "sim", t1 - t0)
-        st = k.lib.fmsw_score_fwd_rev(b.sim.ctypes.data, n, b.pair_off.ctypes.data, b.m.ctypes.data, b.K,
-                                      params.offset, params.gap_open, params.gap_extend,
-                                      s_f[k0:].ctypes.data, s_r[k0:].ctypes.data, kw.ctypes.data, kw.size)
+        st = fn(sim_p, n, po_p + 8 * k0, m_p + 4 * k0, k1 - k0, off, go, ge, sf_p + 4 * k0, sr_p + 4 * k0, kw_p,
+                kw_n)
         if timings is not None:
             _add_time(timings, "kernel", time.perf_counter() - t1)
             _add_time(timings, "blocks", 1)
-        _check_status(st, "fmsw_score_fwd_rev")
+        if st:
+            _check_status(st, "fmsw_score_fwd_rev")
     return ScoreResult(s_f, s_r, skipped)
 
 
@@ -579,8 +688,69 @@ def align(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, *, lengt
     n, K = qp.shape[0], len(lens)
     scores = np.full(K, np.nan, np.float32)
     ends = np.zeros((K, 2), np.int32)
+    if reference_sim:
+        return _align_blockwise(k, ws, qp, codes, starts, lens, skipped, params, traceback, block_floats, scores,
+                                ends, timings)
+    counts = np.zeros(K, np.int64)
+    lay = _Layout(n, starts, lens, skipped, block_floats)
+    path = np.zeros((0, 2), np.int32)
+    if lay.blocks:
+        # one set of buffers and pointers for the call; the blocks' paths go one after another into one buffer
+        sim, kw = ws.sim(max(lay.floats)), ws.kernel_floats(k.ws_floats(n, lay.mmax))
+        D = ws.decoded(max(lay.rows))
+        D3 = D.reshape(-1, CODE_BYTES, 8)
+        sim_p, po_p, m_p = sim.ctypes.data, lay.pair_off.ctypes.data, lay.m32.ctypes.data
+        sc_p, en_p, kw_p, kw_n = scores.ctypes.data, ends.ctypes.data, kw.ctypes.data, kw.size
+        if sim_p % ALIGN_BYTES:                                         # by construction; S6 layout guard
+            raise KernelError("similarity block buffer is not 64-byte aligned")
+        if traceback:
+            fl = ws.flags(k.flag_bytes(n, lay.mmax))
+            cap = int(n * int((~skipped).sum()) + int(lens[~skipped].sum()))      # each pair needs <= n + m entries
+            pbuf = ws.path_entries(cap)
+            poff = ws.path_offsets(max(k1 - k0 for k0, k1 in lay.blocks) + 1)
+            fl_p, fl_n, pb_p, pf_p = fl.ctypes.data, fl.size, pbuf.ctypes.data, poff.ctypes.data
+        else:
+            cap, fl_p, fl_n, pb_p, pf_p = 0, None, 0, None, None
+        fn, off, go, ge, tb = k.lib.fmsw_align, params.offset, params.gap_open, params.gap_extend, int(bool(traceback))
+        used = 0                                                         # path entries written so far
+        for b, (k0, k1) in enumerate(lay.blocks):
+            if timings is not None:
+                t0 = time.perf_counter()
+            _fill_block(lay, b, qp, codes, D, D3, sim)
+            if timings is not None:
+                t2 = time.perf_counter()
+                _add_time(timings, "sim", t2 - t0)
+            st = fn(sim_p, n, po_p + 8 * k0, m_p + 4 * k0, k1 - k0, off, go, ge, tb, sc_p + 4 * k0, en_p + 8 * k0,
+                    None if pb_p is None else pb_p + 8 * used, cap - used, pf_p, kw_p, kw_n, fl_p, fl_n)
+            if timings is not None:
+                _add_time(timings, "kernel", time.perf_counter() - t2)
+                _add_time(timings, "blocks", 1)
+            if st:
+                _check_status(st, "fmsw_align")
+            if traceback:
+                pb = poff[:k1 - k0 + 1]
+                counts[k0:k1] = np.diff(pb)
+                used += int(pb[-1])
+        if traceback:
+            if timings is not None:
+                t3 = time.perf_counter()
+            path = pbuf[:2 * used].reshape(-1, 2).copy()        # compact, and the workspace buffer is reused
+            if timings is not None:
+                _add_time(timings, "paths", time.perf_counter() - t3)
+    if timings is not None:
+        timings.setdefault("paths", 0.0)
+    path_off = np.zeros(K + 1, np.int64)
+    np.cumsum(counts, out=path_off[1:])
+    return AlignResult(scores, ends, path, path_off, skipped)
+
+
+def _align_blockwise(k: Kernel, ws: Workspace, qp, codes, starts, lens, skipped, params: DPParams, traceback: bool,
+                     block_floats: int, scores, ends, timings) -> AlignResult:
+    """:func:`align` block by block through :class:`_Block` (the ``reference_sim`` path)."""
+    n, K = qp.shape[0], len(lens)
     counts = np.zeros(K, np.int64)
     parts: List[Tuple[int, np.ndarray, np.ndarray]] = []
+    reference_sim = True
     for k0, k1 in plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats):
         if timings is not None:
             t0 = time.perf_counter()

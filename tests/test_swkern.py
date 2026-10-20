@@ -889,6 +889,45 @@ class WorkspaceStatusTest(unittest.TestCase):
         self.assertEqual(res.path_off.tolist()[:2], [0, 0])
         self.assertGreater(res.scores[1], 0.0)
 
+    def test_only_empty_targets_in_a_fresh_workspace(self):
+        """A call (or a first block) whose targets are all empty, in fresh workspaces: scores 0, no paths, never the
+        64-byte guard. An empty numpy slice keeps its base's address, so aligned_empty(0) took the alignment of a
+        fresh allocation (off in about 3 of 4); the allocations here are made to start 4 bytes past a 64-byte
+        boundary, so the check does not depend on the allocator."""
+        real_empty = np.empty
+
+        def shifted(shape, dtype=float, *args, **kwargs):
+            """np.empty whose data starts 4 bytes past a 64-byte boundary."""
+            dtype = np.dtype(dtype)
+            count = int(np.prod(shape))
+            raw = real_empty(count * dtype.itemsize + 2 * swkern.ALIGN_BYTES, np.uint8)
+            start = -raw.ctypes.data % swkern.ALIGN_BYTES + 4
+            return raw[start:start + count * dtype.itemsize].view(dtype).reshape(shape)
+
+        with mock.patch.object(np, "empty", shifted):
+            self.assertEqual(np.empty(3, np.float32).ctypes.data % swkern.ALIGN_BYTES, 4)
+            bufs = {n: swkern.aligned_empty(n) for n in (0, 1, 15, 16, 17)}
+            fresh = [swkern.Workspace() for _ in range(8)]
+        for n, buf in bufs.items():
+            self.assertEqual((buf.size, buf.ctypes.data % swkern.ALIGN_BYTES), (n, 0))
+        qp = swkern.query_prep(_f1()[0]["q16"])
+        codes = _f1()[0]["codes"]
+        m = len(codes)
+        for lens in ([0], [0, 0, 0], [0, 0, m], [0, m, 0]):
+            offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
+            with self.subTest(lens=lens):
+                with mock.patch.object(np, "empty", shifted):
+                    ws, ws2 = swkern.Workspace(), swkern.Workspace()     # their first buffers: shifted allocations
+                r = swkern.score_fwd_rev(qp, codes, offsets, D, workspace=ws, block_floats=1)
+                a = swkern.align(qp, codes, offsets, D, workspace=ws2, block_floats=1)
+                empty = np.asarray(lens) == 0
+                self.assertTrue(np.all(r.s_fwd[empty] == 0) and np.all(r.s_rev[empty] == 0))
+                self.assertTrue(np.all(a.scores[empty] == 0))
+                self.assertTrue(np.all(np.diff(a.path_off)[empty] == 0))
+                self.assertTrue(np.array_equal(a.scores.view(np.uint32), r.s_fwd.view(np.uint32)))
+        for ws in fresh:
+            self.assertEqual(ws.sim(0).ctypes.data % swkern.ALIGN_BYTES, 0)
+
     def test_workspace_grows_and_is_per_thread(self):
         ws = swkern.Workspace()
         a = ws.kernel_floats(10)
