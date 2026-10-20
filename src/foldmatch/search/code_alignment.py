@@ -90,6 +90,11 @@ TASKS_PER_WORKER = 4
 #: query with 100 candidates and the panel 14 workers.
 MIN_WORKER_CELLS = 1 << 23
 DEFAULT_QUERY_BATCH = 256
+#: A worker keeps its kernel buffers (:class:`~foldmatch.search.swkern.Workspace`) between tasks up to this size:
+#: after a task whose pairs needed more (a long pair: up to ``max_pair_cells`` float32 cells of similarity, about
+#: 1 GiB, plus its traceback flags) they are released, so only the workers on such a pair at the time hold that
+#: memory. 128 MiB covers the pairs of the calibrated domain (966 x 3,000 aa: 11 MiB of similarity) many times over.
+WORKSPACE_KEEP_BYTES = 128 << 20
 _BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
                      "BLIS_NUM_THREADS")
 _PANEL, _CODES = 0, 1
@@ -332,6 +337,7 @@ def _round1_task(task):
     r = swkern.score_fwd_rev(qp, codes, pairs[:, 0], st.params, lengths=pairs[:, 1],
                              block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells,
                              kernel=st.kernel, workspace=st.workspace, timings=None if timer is None else timer.t)
+    st.workspace.release(WORKSPACE_KEEP_BYTES)
     if timer is None:
         return tid, r.s_fwd, r.s_rev, r.skipped
     timer.lap("swkern")
@@ -375,6 +381,7 @@ def _round2_task(task):
     a = swkern.align(qp, st.codes, pairs[:, 0], st.params, lengths=pairs[:, 1], traceback=True,
                      block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells, kernel=st.kernel,
                      workspace=st.workspace, timings=None if timer is None else timer.t)
+    st.workspace.release(WORKSPACE_KEEP_BYTES)
     if timer is not None:
         timer.lap("swkern")
     cap = st.init.spec.calibrated_domain.target_min_distinct_codes

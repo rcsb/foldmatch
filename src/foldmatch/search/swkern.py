@@ -245,8 +245,9 @@ def _pad(cells: int) -> int:
 
 
 class Workspace:
-    """Reusable buffers of one process (one per thread via :func:`default_workspace`); grown on demand, never shrunk.
-    Not thread-safe: never share one between threads."""
+    """Reusable buffers of one process (one per thread via :func:`default_workspace`); grown on demand, and shrunk
+    only by :meth:`release` (a Stage-2 worker calls it after a task whose buffers grew past a bound, so one long pair
+    does not keep its buffers for the rest of the run). Not thread-safe: never share one between threads."""
 
     def __init__(self):
         self._ws = np.empty(0, np.float32)
@@ -295,6 +296,15 @@ class Workspace:
     def nbytes(self) -> int:
         return int(self._ws.nbytes + self._flags.nbytes + self._sim.nbytes + self._dec.nbytes + self._path.nbytes
                    + self._poff.nbytes)
+
+    def release(self, keep_bytes: int = 0) -> bool:
+        """Drop every buffer when they hold more than ``keep_bytes`` together (the next call allocates what it needs
+        again; the buffers' contents never carry from one call to the next, so the results are the same). Returns
+        whether they were dropped."""
+        if self.nbytes() <= int(keep_bytes):
+            return False
+        self.__init__()
+        return True
 
 
 _TLS = threading.local()

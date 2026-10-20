@@ -928,6 +928,23 @@ class WorkspaceStatusTest(unittest.TestCase):
         for ws in fresh:
             self.assertEqual(ws.sim(0).ctypes.data % swkern.ALIGN_BYTES, 0)
 
+    def test_release_drops_the_buffers_and_keeps_the_results(self):
+        qp = swkern.query_prep(_f1()[0]["q16"])
+        codes = _f1()[0]["codes"]
+        offsets = np.array([0, len(codes)], np.int64)
+        ws = swkern.Workspace()
+        a = swkern.align(qp, codes, offsets, D, workspace=ws)
+        size = ws.nbytes()
+        self.assertGreater(size, 0)
+        self.assertFalse(ws.release(size))
+        self.assertEqual(ws.nbytes(), size)
+        self.assertTrue(ws.release(size - 1))
+        self.assertEqual(ws.nbytes(), 0)
+        b = swkern.align(qp, codes, offsets, D, workspace=ws)
+        for x, y in ((a.scores, b.scores), (a.ends, b.ends), (a.path, b.path), (a.path_off, b.path_off)):
+            self.assertTrue(np.array_equal(x, y))
+        self.assertEqual(a.scores.view(np.uint32).tolist(), b.scores.view(np.uint32).tolist())
+
     def test_workspace_grows_and_is_per_thread(self):
         ws = swkern.Workspace()
         a = ws.kernel_floats(10)

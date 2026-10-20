@@ -1429,6 +1429,34 @@ class PoolAndWorkerTest(_WorldCase):
         ref, _ = world.align({**small, **big}, None, max_evalue=None, panel_policy="never")
         self.assertEqual(_signature(ref), _signature(got))
 
+    def test_a_worker_releases_its_buffers_after_a_long_pair(self):
+        """After a task whose kernel buffers grew past WORKSPACE_KEEP_BYTES the worker drops them: here, with the bound
+        at 1 KiB, after every round-1 and round-2 task (checked in-process after each one); the hits do not
+        change. With the default bound the F1 buffers are kept."""
+        world = self.f1_world()
+        pre = self.__class__._mixed
+        with ca.CodeAlignmentPool(0) as pool:
+            ref, _ = world.align(pre, pool, max_evalue=None, panel_policy="never")
+            kept = ca._STATE.workspace.nbytes()
+            self.assertGreater(kept, 0)
+            self.assertLessEqual(kept, ca.WORKSPACE_KEEP_BYTES)
+        seen = []
+
+        def after(fn):
+            def run(task):
+                out = fn(task)
+                seen.append((fn.__name__, ca._STATE.workspace.nbytes()))
+                return out
+            return run
+
+        with mock.patch.object(ca, "WORKSPACE_KEEP_BYTES", 1024), \
+                mock.patch.object(ca, "_round1_task", after(ca._round1_task)), \
+                mock.patch.object(ca, "_round2_task", after(ca._round2_task)), ca.CodeAlignmentPool(0) as pool:
+            got, _ = world.align(pre, pool, max_evalue=None, panel_policy="never")
+        self.assertEqual({name for name, _ in seen}, {"_round1_task", "_round2_task"})
+        self.assertEqual({nbytes for _, nbytes in seen}, {0}, seen)
+        self.assertEqual(_signature(ref), _signature(got))
+
     def test_serial_pool_releases_its_in_process_state(self):
         world = self.f1_world()
         pool = ca.CodeAlignmentPool(0)
