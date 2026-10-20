@@ -374,6 +374,16 @@ def signature(results, fields=None) -> str:
     return h.hexdigest()
 
 
+def _pool_size(W: int):
+    """--workers value -> CodeAlignmentPool num_workers: -1 is the default pool (None: sized by the work, up to every
+    CPU), 0 / 1 serial, N > 1 N workers."""
+    return None if W < 0 else max(W, 1)
+
+
+def _pool_label(W: int) -> str:
+    return "default" if W < 0 else str(W)
+
+
 def _counts(stats):
     keys = ("queries", "candidate_pairs", "panel_pairs", "survivors", "hits", "round1_tasks", "round2_tasks",
             "workers", "batches", "skipped_pairs")
@@ -846,19 +856,19 @@ def panel_mode(a) -> dict:
         res["pool"]["query"] = src
         res["pool"]["serial"] = dict(wall=m1, walls=ts1)
         for W in a.workers:
-            if W <= 1:
+            if 0 <= W <= 1:
                 continue
-            with ca.CodeAlignmentPool(W) as pool:
+            with ca.CodeAlignmentPool(_pool_size(W)) as pool:
                 _r, st0, cold = world.align(pf1, pool, max_evalue=1e-3)
                 mW, tsW = median_rounds(lambda: world.align(pf1, pool, max_evalue=1e-3), a.rounds, warmup=False)
                 _r, pst, pwall = world.align(pf1, pool, max_evalue=1e-3, profile=True)
             prof = _profile_brief(pst["profile"])
-            res["pool"][str(W)] = dict(cold_first_call=cold, warm=mW, warm_walls=tsW, speedup_warm=m1 / mW,
-                                       speedup_cold=m1 / cold, tasks=st0.get("round1_tasks"),
-                                       workers=st0.get("workers"), profile=prof)
-            print(f"panel wall, one {len(seq)}-aa query: serial {m1:.4f}s; {W} workers warm {mW:.4f}s "
+            res["pool"][_pool_label(W)] = dict(cold_first_call=cold, warm=mW, warm_walls=tsW, speedup_warm=m1 / mW,
+                                               speedup_cold=m1 / cold, tasks=st0.get("round1_tasks"),
+                                               workers=st0.get("workers"), profile=prof)
+            print(f"panel wall, one {len(seq)}-aa query: serial {m1:.4f}s; {_pool_label(W)} workers warm {mW:.4f}s "
                   f"({m1 / mW:.2f}x), cold first call {cold:.4f}s ({m1 / cold:.2f}x); {st0.get('round1_tasks')} "
-                  f"round-1 tasks", flush=True)
+                  f"round-1 tasks, {st0.get('workers')} worker processes", flush=True)
     finally:
         serial.close()
         world.close()
@@ -881,7 +891,7 @@ def perquery_mode(a) -> dict:
     try:
         pools = {}
         for W in a.workers:
-            pools[W] = ca.CodeAlignmentPool(max(W, 1))
+            pools[W] = ca.CodeAlignmentPool(_pool_size(W))
             world.align({queries[0][0]: (cs.cand_ids[:K], [0.9] * K)}, pools[W], max_evalue=1e-3)  # start
         for j, (qid, seq, q16, src) in enumerate(queries):
             pf = {qid: (cs.slice_ids(j, K), [float(x) for x in np.linspace(0.99, 0.5, K)])}
@@ -890,8 +900,8 @@ def perquery_mode(a) -> dict:
                 pool = pools.get(W)
                 m, ts = median_rounds(lambda: world.align(pf, pool, max_evalue=1e-3), a.rounds)
                 _r, st, _w = world.align(pf, pool, max_evalue=1e-3)
-                row["code"][str(W)] = dict(wall=m, walls=ts, counts=_counts(st))
-                if W <= 1 or a.blosum_pool:
+                row["code"][_pool_label(W)] = dict(wall=m, walls=ts, counts=_counts(st))
+                if 0 <= W <= 1 or (a.blosum_pool and W > 1):
                     mb, tb = median_rounds(lambda: world.blosum(pf, max(W, 1)), a.blosum_rounds)
                     row["blosum62"][str(W)] = dict(wall=mb, walls=tb)
             res["results"].append(row)
@@ -994,6 +1004,8 @@ def sweep_mode(a) -> dict:
                 res.setdefault("pool_workers", {})[str(W)] = pool.workers
                 for e in a.block_exps:
                     walls, sig = [], None
+                    # a block size is part of the worker setup: the pool restarts at this first, untimed call
+                    world.align(pf, pool, max_evalue=1e-3, block_floats=1 << e)
                     for _ in range(a.rounds):
                         r_, st, w = world.align(pf, pool, max_evalue=1e-3, block_floats=1 << e)
                         walls.append(w)
@@ -1004,6 +1016,7 @@ def sweep_mode(a) -> dict:
                                                              signature=sig, pairs_per_s=info["candidate_pairs"] / m)
                     print(f"sweep W={W} block_floats 2^{e}: {m:.3f}s {info['candidate_pairs'] / m:,.0f} pairs/s "
                           f"sig {sig[:12]}", flush=True)
+                world.align(pf, pool)          # back to the default block size (a restart), untimed
                 for e in a.task_exps:
                     walls, sig, st = [], None, None
                     for _ in range(a.rounds):
@@ -1362,7 +1375,8 @@ def main():
     ap.add_argument("--ks", type=int, nargs="+", default=[100, 1000, 10000])
     ap.add_argument("--nq", type=int, default=None, help="queries (default 64; perquery: 0 extra real queries)")
     ap.add_argument("--query-set", default="real", help="real | fixed:<Lq> | chain:<Lq>")
-    ap.add_argument("--workers", type=int, nargs="+", default=[1])
+    ap.add_argument("--workers", type=int, nargs="+", default=[1],
+                    help="worker counts; panel / perquery: -1 is the default pool (num_workers=None)")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--blosum-rounds", type=int, default=3)
     ap.add_argument("--blosum-pool", action="store_true", help="perquery: also BLOSUM62 with each worker count")
