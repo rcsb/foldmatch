@@ -883,6 +883,8 @@ def query_database_from_fasta(
         f"--seq-identity requires a database built from FASTA (fm-search build sequences).",
     )
     if run_stage2:
+        # The Stage-2 columns, refused (exit status 2) before ESM3, as under esm-codes.
+        _output_fields(format_output)
         _check_stage2_stores(subject_store, max_evalue)
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
@@ -1757,8 +1759,9 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
     return QueryStage2Options(scoring=scoring, **values)
 
 
-def _esm_codes_output_fields(format_output: str) -> List[str]:
-    """The ``--format-output`` fields of an esm-codes query, refused (exit status 2) before anything is read."""
+def _output_fields(format_output: str) -> List[str]:
+    """The ``--format-output`` fields of a ``query sequences`` Stage 2, parsed before ESM3: an empty list or an
+    unknown field is refused with ``typer.BadParameter`` (exit status 2)."""
     from foldmatch.search import output
     try:
         return output.parse_format_output(format_output)
@@ -1925,7 +1928,7 @@ def _query_sequences_esm_codes(*, db_path: str, fasta_file: Path, tmp_embedding_
     """
     if align_workers is not None and align_workers < 0:
         raise typer.BadParameter(f"must be >= 0, got {align_workers}.", param_hint="--align-workers")
-    output_fields = _esm_codes_output_fields(format_output)
+    output_fields = _output_fields(format_output)
     with _refusals():
         preflight = _fasta_preflight(fasta_file, min_res_n, strict=True)
     database = resolve_esm_codes_database(db_path, stage2.max_evalue, num_nodes=num_nodes)

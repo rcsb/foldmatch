@@ -373,6 +373,25 @@ class RefusedOptionsCliTest(_Case):
             with self.subTest(extra=extra):
                 self.usage_error(self.run_esm(*extra), text)
 
+    def test_format_output_under_blosum62_is_checked_before_esm3(self):
+        """P7.0c: under blosum62 too, an unknown or empty --format-output is a usage error (exit status 2) before the
+        query's ESM3 pass, whenever Stage 2 runs (the sequence store found, or --seq-identity)."""
+        db = self.tmp / "plain" / "db"
+        db.parent.mkdir()
+        from foldmatch.search.sequence_store import SequenceStore
+        with mock.patch.object(SequenceStore, "exists", return_value=True), \
+                mock.patch.object(search, "_check_stage2_stores") as stores:
+            for extra, text in ((("--format-output", "query,target,not_a_field"), "not_a_field"),
+                                (("--format-output", ","), "Empty --format-output"),
+                                (("--seq-identity", "--format-output", "query,bogus"), "bogus")):
+                with self.subTest(extra=extra), _esm3_spy() as esm3, _no_pass() as predict:
+                    result = invoke(*_query_args(db, _FASTA, self.qshards, self.tmp / "o.tsv", *extra))
+                    self.usage_error(result, text, "--format-output")
+                    esm3.assert_not_called()
+                    predict.assert_not_called()
+        stores.assert_not_called()
+        self.assertFalse((self.tmp / "o.tsv").exists())
+
     def test_seq_identity_on_is_accepted(self):
         """--seq-identity (Stage 2 on) is what esm-codes does anyway: it reaches the database resolution."""
         with mock.patch.object(search, "resolve_esm_codes_database",
@@ -696,6 +715,14 @@ class QueryTest(_DbCase):
         self.assertIsInstance(result.exception, ValueError)
         self.assertIn("--comp-bias-corr-scale must be between 0 and 1", str(result.exception))
         preflight.assert_not_called()
+
+    def test_an_embedding_only_search_ignores_format_output(self):
+        """P7.0c: without Stage 2 (--no-seq-identity) --format-output is not used, and an unknown field is ignored as
+        before: the query/target/embscore rows."""
+        result, out = self.query(self.database("plain"), "--no-seq-identity", "--format-output", "query,not_a_field")
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        rows = _rows(out, output.EMBEDDING_OUTPUT_FIELDS)
+        self.assertEqual({row["query"] for row in rows}, {"1acb_E", "2uzi_A"})
 
     def test_explicit_values_are_honoured(self):
         db = self.database("codes")

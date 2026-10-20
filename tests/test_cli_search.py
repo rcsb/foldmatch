@@ -629,7 +629,10 @@ class TestCliSearch(unittest.TestCase):
             self.assertEqual(cigar_len, int(alnlen))
 
     def test_26_stage2_rejects_unknown_format_field(self):
-        """An unknown --format-output field fails with a clear error."""
+        """An unknown --format-output field fails with a clear error (a usage error, exit status 2), before the
+        query's ESM3 pass (P7.0c)."""
+        from unittest import mock
+        import typer
         from foldmatch.cli.search import (
             build_database_from_fasta,
             query_database_from_fasta,
@@ -644,7 +647,9 @@ class TestCliSearch(unittest.TestCase):
             accelerator=Accelerator.cpu,
             use_gpu_index=False,
         )
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(typer.BadParameter) as ctx, \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict",
+                           side_effect=AssertionError("the query's ESM3 pass was reached")):
             query_database_from_fasta(
                 db_path=subject_db,
                 fasta_file=fasta_file,
