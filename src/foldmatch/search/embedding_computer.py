@@ -2,7 +2,7 @@ import glob
 import logging
 import re
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Dict, Iterator, List, Mapping, Optional, TypeVar
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -19,9 +19,12 @@ from foldmatch.types.api_types import (
 from foldmatch.search.query_encodings import QueryEncodingIndex
 from foldmatch.search.residue_shards import ResidueCodeBatch, check_residue_output, iter_residue_codes
 from foldmatch.utils.dist import RUN_ID_ENV, exported_run_id, is_run_id, run_id
-from foldmatch.utils.sequence import FastaPreflight, preflight_fasta
+from foldmatch.utils.fasta import read_id_at, read_record_at
+from foldmatch.utils.sequence import FastaPreflight, normalize_sequence, preflight_fasta
 
 logger = logging.getLogger(__name__)
+
+_V = TypeVar("_V")
 
 # A run's shards are {embedding folder}/emb_{run id}-{rank}.parquet. Run ids may contain '-' (utils.dist), so the
 # rank is the last '-'-separated field.
@@ -79,6 +82,8 @@ class EmbeddingComputer:
         self.out_name = f"{_SHARD_PREFIX}{self.run_id}"
         # Number of embeddings rank 0 must find in the shards; known for FASTA input.
         self.expected_count: Optional[int] = None
+        # The pre-flight of the FASTA pass (its kept records, in input order); None for structure input.
+        self.preflight: Optional[FastaPreflight] = None
 
     def compute_from_structures(
             self,
@@ -194,6 +199,7 @@ class EmbeddingComputer:
             )
         # One embedding per kept entry; rank 0 checks the shards against it after the pass.
         self.expected_count = preflight.entries_kept
+        self.preflight = preflight
         self.refuse_existing_shards()
         # Only a residue pass gets the residue keywords: a plain pass is called exactly as before.
         residue = {} if residue_output is None else {
@@ -273,16 +279,22 @@ class EmbeddingComputer:
         for path in self.shard_files():
             path.unlink(missing_ok=True)
 
-    def get_embedding_batches(self, load_batch_size: int = 32768) -> Iterator[tuple[list[str], np.ndarray]]:
+    def get_embedding_batches(self, load_batch_size: int = 32768, *,
+                              rows: bool = False) -> Iterator[tuple[list, np.ndarray]]:
         """Stream (ids, [B, D] float32) batches from all per-rank Parquet shards. Rank-0 only.
 
         Checks the embedding count first (:meth:`check_embedding_count`), so a
         mismatch fails before anything is built from the batches.
+
+        With ``rows`` each batch is keyed by the rows' numbers in this read order
+        (0, 1, ...) instead of their ids, so that a repeated id is still two rows:
+        what :meth:`in_input_order` takes.
         """
 
         self.check_embedding_count()
         parquet_files = self.shard_files()
         logging.info(f"Streaming embeddings from {len(parquet_files)} Parquet shard(s) in {self.embedding_folder}/{self.out_name}-*.parquet")
+        row = 0
         for parquet_file in parquet_files:
             logging.info(f"   Parquet file {parquet_file}")
             pf = pq.ParquetFile(parquet_file)
@@ -292,7 +304,110 @@ class EmbeddingComputer:
                 arr = np.ascontiguousarray(
                     flat.reshape(len(record), -1).astype(np.float32, copy=False)
                 )
-                yield ids, arr
+                if rows:
+                    yield list(range(row, row + len(ids))), arr
+                    row += len(ids)
+                else:
+                    yield ids, arr
+
+    def input_ids(self) -> List[str]:
+        """The ids of the kept records of the FASTA pass, in input order (duplicates included): the order of a
+        1-rank run's shard. Read from the FASTA at the pre-flight's offsets, as the pass's dataset reads them."""
+        preflight = self._fasta_preflight()
+        with open(preflight.path, "r") as fh:
+            return [read_id_at(fh, offset) for offset in preflight.offsets.tolist()]
+
+    def input_sequences(self) -> Dict[str, str]:
+        """``{id: sequence}`` of the kept records of the FASTA pass, in input order: each sequence normalised exactly
+        as the pass's dataset gives it to ESM3, and a repeated id's the one of its last kept record, the record whose
+        embedding a search keeps (:meth:`in_input_order`). Records the pass did not embed (below ``min_res_n``) are
+        not in it, so Stage 2 aligns the sequence behind each query's Stage-1 hits."""
+        preflight = self._fasta_preflight()
+        out: Dict[str, str] = {}
+        with open(preflight.path, "r") as fh:
+            for offset in preflight.offsets.tolist():
+                name, sequence = read_record_at(fh, offset)
+                out[name] = normalize_sequence(sequence, allow_non_ascii=True)
+        return out
+
+    def _fasta_preflight(self) -> FastaPreflight:
+        if self.preflight is None:
+            raise ValueError("the input order is known only after a FASTA pass (compute_from_fasta)")
+        return self.preflight
+
+    def _row_positions(self, names: List[str]) -> np.ndarray:
+        """The input position (index in ``names``, :meth:`input_ids`) of every shard row, in the order
+        :meth:`get_embedding_batches` reads the rows.
+
+        A rank's shard holds its entries in the order the distributed sampler dealt them, round robin: row ``i`` of
+        rank ``r``'s shard (``emb_{run id}-{r}``) is entry ``r + i * world_size``, and a 1-rank shard is in input
+        order. Checked against the ids: when every row's id is the input's at that position, the positions are
+        exact, a repeated id included. Otherwise (shards not dealt that way: never by Lightning's predict sampler)
+        an id is placed by its own position, which is exact for an id that occurs once; a repeated id's rows then
+        take its positions in read order, with a warning. An id that is not in the input raises ``ValueError``
+        (shards of another run mixed in)."""
+        shards = self.shard_files()
+        prefix = f"{self.out_name}-"
+        ranks = [int(path.name[len(prefix):-len(".parquet")]) for path in shards]
+        row_ids = [pq.ParquetFile(path).read(columns=["id"]).column("id").to_pylist() for path in shards]
+        first: Dict[str, int] = {}
+        for k, name in enumerate(names):
+            first.setdefault(name, k)
+        unknown = [qid for ids in row_ids for qid in ids if qid not in first]
+        if unknown:
+            raise ValueError(
+                f"{len(unknown)} query id(s) from the embedding shards of run {self.run_id} are not in "
+                f"{self.preflight.path} (e.g. {', '.join(map(repr, unknown[:3]))}): shards of another run are "
+                f"mixed in. Remove them or use another --tmp-embedding-folder.")
+        total, world = len(names), len(shards)
+        if sorted(ranks) == list(range(world)):
+            dealt = [np.arange(rank, total, world, dtype=np.int64) for rank in ranks]
+            if all(len(pos) == len(ids) and all(names[p] == qid for p, qid in zip(pos.tolist(), ids))
+                   for pos, ids in zip(dealt, row_ids)):
+                return np.concatenate(dealt) if dealt else np.zeros(0, np.int64)
+        repeated = len(first) < total
+        if repeated:
+            logger.warning(
+                f"The embedding shards of run {self.run_id} are not in the order the distributed sampler deals the "
+                f"entries; a query id that occurs more than once in {self.preflight.path} may be reported with the "
+                f"embedding of another of its records.")
+        later: Dict[str, List[int]] = {}
+        for k, name in enumerate(names):
+            later.setdefault(name, []).append(k)
+        for positions in later.values():
+            positions.reverse()                      # pop() gives an id's positions in input order
+        out = []
+        for ids in row_ids:
+            for qid in ids:
+                positions = later[qid]
+                out.append(positions.pop() if positions else first[qid])
+        return np.asarray(out, dtype=np.int64)
+
+    def in_input_order(self, results: Mapping[int, _V]) -> Dict[str, _V]:
+        """``results`` of a search keyed by shard row (as built from :meth:`get_embedding_batches` with ``rows``),
+        keyed by query id in the input FASTA's order, with the values a 1-rank run gives. Rank-0 only, after a
+        FASTA pass.
+
+        Rank 0 reads the shards rank by rank, and the distributed sampler deals the entries round-robin, so in a
+        multi-rank run the rows come in rank order (rank 0's first). Put back in input order
+        (:meth:`_row_positions`), a multi-rank run writes the queries of a 1-rank run, whose shard is already in
+        input order: each id at its first kept record, and a repeated id (duplicate ids, which only an embedding
+        search and BLOSUM62 accept) with the value of its last kept record, as a 1-rank run's search (a dict, the
+        later record replacing the earlier) gives it. Values are never changed. A row that is not in ``results``
+        (a filtered subset) is left out.
+        """
+        names = self.input_ids()
+        positions = self._row_positions(names)
+        by_position: Dict[int, _V] = {}
+        for row, value in results.items():
+            if not 0 <= row < len(positions):
+                raise ValueError(f"row {row!r} is not a row of the embedding shards of run {self.run_id} "
+                                 f"({len(positions)} rows)")
+            by_position[int(positions[row])] = value
+        last: Dict[str, int] = {}
+        for position in sorted(by_position):
+            last[names[position]] = position          # dict order: each id at its first position
+        return {name: by_position[position] for name, position in last.items()}
 
     def iter_residue_codes(self, system, load_batch_size: int = 32768) -> Iterator[ResidueCodeBatch]:
         """Stream this run's residue codes, one shard at a time in shard order. Rank-0 only.

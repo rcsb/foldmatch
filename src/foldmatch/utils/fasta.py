@@ -77,6 +77,14 @@ def iter_fasta_offsets(fasta_file: Path) -> Iterator[Tuple[int, str, int]]:
             yield header_offset, name, length
 
 
+def read_id_at(fh: IO, offset: int) -> str:
+    """The id of the record whose header (``>``) line starts at ``offset`` of an open handle: the first token of
+    the header, as :func:`read_record_at` reads it. Leaves ``fh`` just after the header line."""
+    fh.seek(offset)
+    header = fh.readline().strip()
+    return header[1:].split()[0]
+
+
 def read_record_at(fh: IO, offset: int) -> Tuple[str, str]:
     """Read a single ``(id, sequence)`` record from an open handle at ``offset``.
 
@@ -85,9 +93,7 @@ def read_record_at(fh: IO, offset: int) -> Tuple[str, str]:
     The caller owns ``fh`` (it is re-``seek``-ed on each call, so the trailing
     header that terminates the record need not be consumed).
     """
-    fh.seek(offset)
-    header = fh.readline().strip()
-    name = header[1:].split()[0]
+    name = read_id_at(fh, offset)
     chunks: list = []
     while True:
         line = fh.readline()

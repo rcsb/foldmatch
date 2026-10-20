@@ -909,22 +909,21 @@ def query_database_from_fasta(
     )
     embedding_db.load(nprobe=nprobe)
     results = embedding_db.search_by_embeddings(
-        embedding_batches=embedding_computer.get_embedding_batches(),
+        embedding_batches=embedding_computer.get_embedding_batches(rows=True),
         top_k=top_k
     )
+    # The shards are read rank by rank: the queries are written in input order, and a repeated id keeps its last
+    # record's hits, as by a 1-rank run.
+    results = embedding_computer.in_input_order(results)
     # The query embeddings are only needed for this search.
     embedding_computer.remove_shards()
     logging.info(f"Searched {len(results)} sequence(s)")
     results = _filter_results_by_threshold(results, threshold)
 
     if run_stage2:
-        from foldmatch.utils.fasta import iter_fasta
-        from foldmatch.utils.sequence import normalize_sequence
-        # Align the sequences ESM3 embedded, normalised like the stored subjects.
-        query_sequences = {
-            name: normalize_sequence(sequence, allow_non_ascii=True)
-            for name, sequence in iter_fasta(fasta_file)
-        }
+        # Align the sequences ESM3 embedded (each query's last kept record, the one behind its Stage-1 hits),
+        # normalised like the stored subjects.
+        query_sequences = embedding_computer.input_sequences()
         _stage2_align_and_report(
             embedding_db=embedding_db,
             prefilter_results=results,
@@ -1962,9 +1961,11 @@ def _query_sequences_esm_codes(*, db_path: str, fasta_file: Path, tmp_embedding_
         logging.info(f"Query encodings of {len(query_index)} sequence(s) ({query_index.rows} residues) in "
                      f"{encodings_path}")
         results = embedding_db.search_by_embeddings(
-            embedding_batches=embedding_computer.get_embedding_batches(),
+            embedding_batches=embedding_computer.get_embedding_batches(rows=True),
             top_k=top_k
         )
+        # The shards are read rank by rank: the queries are aligned and written in input order, as by a 1-rank run.
+        results = embedding_computer.in_input_order(results)
         # The query embeddings are only needed for this search.
         embedding_computer.remove_shards()
         logging.info(f"Searched {len(results)} sequence(s)")
@@ -1972,11 +1973,9 @@ def _query_sequences_esm_codes(*, db_path: str, fasta_file: Path, tmp_embedding_
 
         from foldmatch.search import output
         from foldmatch.search.code_alignment import CodeAlignmentPool, align_candidates_esm_codes
-        from foldmatch.utils.fasta import iter_fasta
-        from foldmatch.utils.sequence import normalize_sequence
         # The sequences ESM3 encoded (the strict pre-flight refused non-ASCII ones), normalised like the stored
         # subjects; Stage 2 checks each against its encoding's length and seq_sha1.
-        query_sequences = {name: normalize_sequence(sequence) for name, sequence in iter_fasta(fasta_file)
+        query_sequences = {name: sequence for name, sequence in embedding_computer.input_sequences().items()
                            if name in results}
         logging.info("Computing esm-codes alignments (Stage 2)...")
         with CodeAlignmentPool(align_workers) as pool:

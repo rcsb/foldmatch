@@ -5,6 +5,8 @@ with the F2c reference codes (builds) and query encodings (queries) of the fixtu
 orchestration, the refusals, the query-encoding memmap and the real esm-codes Stage 2 (kernel, registry bundle) run
 without ESM3. ``RealEsm3SmokeTest`` is the end-to-end smoke of the plan (CPU, ESM3 from the cache) and
 ``RealEsm3DegenerateTest`` runs the real-ESM3 F-deg items through the command line (D14, S13, S13b).
+P7.0a: ``MultiRankOrderTest`` (fake pass on two simulated ranks) and the slow ``TwoRankQuerySmoke`` (real ESM3, two
+gloo ranks) check that a multi-rank query writes the bytes of a 1-rank query, under both scorings.
 """
 import dataclasses
 import gc
@@ -14,6 +16,7 @@ import logging
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -38,8 +41,8 @@ from foldmatch.search.residue_code_store import (
 )
 from foldmatch.types.api_types import ScoringChoice, SignificanceMode
 from foldmatch.utils.sequence import STANDARD_AMINO_ACIDS
-from test_cli_residue_codes import _build_args, _esm3_spy, _f2c, _sha1, _sha256, _write, fake_chain_predict, \
-    invoke, launch_env
+from test_cli_residue_codes import _DDP_ENV, _DDP_ENV_PREFIXES, _LAUNCH_ENV, _SRC, _build_args, _esm3_spy, _f2c, \
+    _sha1, _sha256, _write, fake_chain_predict, invoke, launch_env
 
 _TEST_PATH = Path(__file__).parent
 _FASTA = _TEST_PATH / "resources" / "fasta" / "test_sequences.fasta"
@@ -802,6 +805,139 @@ class QueryTest(_DbCase):
 
 
 # =====================================================================================================================
+# P7.0a: a multi-rank query writes the queries in input order
+# =====================================================================================================================
+def _order_fasta(path: Path) -> Path:
+    """Five queries cut from the fixture's two chains: two ranks deal them 0, 2, 4 | 1, 3 (DDP's round robin), so
+    rank order (qA, qB, qC, 1acb_E, 2uzi_A) is not input order."""
+    seqs = dict(_fasta_records(_FASTA))
+    a, b = seqs["1acb_E"], seqs["2uzi_A"]
+    records = (("qA", a[:120]), ("1acb_E", a), ("qB", b[4:]), ("2uzi_A", b), ("qC", a[100:]))
+    path.write_text("".join(f">{name}\n{seq}\n" for name, seq in records))
+    return path
+
+
+#: The query order of :func:`_order_fasta`: input order, and the order two ranks write without the fix.
+_INPUT_ORDER = ["qA", "1acb_E", "qB", "2uzi_A", "qC"]
+_RANK_ORDER = ["qA", "qB", "qC", "1acb_E", "2uzi_A"]
+#: Options that give every query rows: every candidate (``--threshold -1``), no identity, coverage or E-value filter.
+_EVERY_ROW = ("--threshold", "-1", "--min-seq-identity", "0", "--min-coverage", "0", "--max-evalue", "inf")
+_ORDER_CASES = {
+    "blosum62": (*_EVERY_ROW, "--format-output", ALL_FIELDS),
+    "blosum62-embedding-only": ("--threshold", "-1", "--no-seq-identity"),
+    "esm-codes": _esm(*_EVERY_ROW, "--format-output", ALL_FIELDS, "--align-workers", "0"),
+}
+
+
+class MultiRankOrderTest(_DbCase):
+    """P7.0a: a 2-rank ``query sequences`` (the fake pass deals the queries round-robin to two shards, as DDP's sampler
+    does) writes the same bytes as a 1-rank one, under blosum62 (Stage 2, and embedding-only) and esm-codes; each
+    query keeps its hits. Without the reordering the 2-rank file lists rank 0's queries first."""
+
+    def setUp(self):
+        super().setUp()
+        self.fasta = _order_fasta(self.tmp / "order.fasta")
+
+    def run_query(self, case, ranks, tag):
+        result, out = self.query(self.database("codes"), *_ORDER_CASES[case], fasta=self.fasta,
+                                 out=self.tmp / f"{case}-{tag}.tsv", run_id=f"o-{tag}",
+                                 predict=fake_chain_predict(payload=_fake_q, ranks=ranks))
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        self.assertEqual(list(self.qshards.iterdir()), [])
+        return out
+
+    @staticmethod
+    def query_order(out):
+        return list(dict.fromkeys(line.split("\t")[0] for line in out.read_text().splitlines()))
+
+    def test_two_ranks_write_the_bytes_of_one(self):
+        for case in _ORDER_CASES:
+            with self.subTest(case=case):
+                one, two = self.run_query(case, 1, "1"), self.run_query(case, 2, "2")
+                self.assertEqual(self.query_order(one), _INPUT_ORDER)       # every query has rows
+                self.assertEqual(_sha256(two), _sha256(one))
+                if case != "blosum62-embedding-only":
+                    rows = _rows(one, output.SUPPORTED_OUTPUT_FIELDS)
+                    self.assertEqual(len(rows), 10)                          # 5 queries x 2 targets
+                    blank = [row["rawrev"] == "" for row in rows]
+                    self.assertEqual(set(blank), {case == "blosum62"})
+
+    def test_without_the_reordering_two_ranks_write_rank_order(self):
+        """The control: with ``in_input_order`` bypassed (the rows keyed by their ids in read order), the 2-rank file
+        has the same rows per query, in rank order."""
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+
+        def read_order(self_, results):
+            ids = [qid for batch, _ in self_.get_embedding_batches() for qid in batch]
+            return {ids[row]: value for row, value in results.items()}
+
+        for case in _ORDER_CASES:
+            with self.subTest(case=case):
+                one = self.run_query(case, 1, "1")
+                with mock.patch.object(EmbeddingComputer, "in_input_order", read_order):
+                    two = self.run_query(case, 2, "2")
+                self.assertEqual(self.query_order(two), _RANK_ORDER)
+                self.assertNotEqual(_sha256(two), _sha256(one))
+                self.assertEqual(sorted(two.read_text().splitlines()), sorted(one.read_text().splitlines()))
+
+
+def _dup_fasta(path: Path, last=None) -> Path:
+    """A repeated query id (accepted, with a warning, under blosum62): p0, x(1acb_E), x(``last``, default 2uzi_A),
+    p3. Two ranks deal p0, x(last) | x(1acb_E), p3, so rank 0's shard, read first, holds the later x."""
+    seqs = dict(_fasta_records(_FASTA))
+    a, b = seqs["1acb_E"], seqs["2uzi_A"]
+    path.write_text(f">p0\n{a[:120]}\n>x\n{a}\n>x\n{b if last is None else last}\n>p3\n{b[4:]}\n")
+    return path
+
+
+class RepeatedIdMultiRankTest(_DbCase):
+    """P7.0a (review): a repeated query id under blosum62. The fake pass fixes each embedding by its sequence, as
+    ESM3 does, so the two x records have different embeddings: a 2-rank run writes the bytes of a 1-rank run, whose
+    x is its last record for Stage 1 (the embedding a search keeps) and for Stage 2 (the sequence aligned)."""
+
+    _CASES = {"embedding-only": ("--no-seq-identity",),
+              "stage-2": ("--max-evalue", "inf", "--min-seq-identity", "0", "--min-coverage", "0",
+                          "--format-output", ALL_FIELDS)}
+
+    def run_query(self, fasta, case, ranks, *extra):
+        result, out = self.query(self.database("plain"), "--threshold", "-1", *self._CASES[case], *extra,
+                                 fasta=fasta, out=self.tmp / f"dup-{case}-{ranks}.tsv", run_id=f"dup-{ranks}",
+                                 predict=fake_chain_predict(ranks=ranks, by_sequence=True))
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        self.assertEqual(list(self.qshards.iterdir()), [])
+        return out
+
+    def test_two_ranks_write_the_bytes_of_one(self):
+        fasta = _dup_fasta(self.tmp / "dup.fasta")
+        single = _dup_fasta(self.tmp / "single.fasta").read_text().replace(
+            f">x\n{dict(_fasta_records(_FASTA))['1acb_E']}\n", "")
+        (self.tmp / "single.fasta").write_text(single)           # p0, x(2uzi_A), p3: x's last record only
+        for case in self._CASES:
+            with self.subTest(case=case):
+                one, two = self.run_query(fasta, case, 1), self.run_query(fasta, case, 2)
+                self.assertEqual(_sha256(two), _sha256(one))
+                lines = one.read_text().splitlines()
+                self.assertEqual(list(dict.fromkeys(line.split("\t")[0] for line in lines)), ["p0", "x", "p3"])
+                # x's rows are those of a FASTA holding only its last record
+                last = self.run_query(self.tmp / "single.fasta", case, 1)
+                x_rows = [line for line in lines if line.startswith("x\t")]
+                self.assertEqual(x_rows, [line for line in last.read_text().splitlines() if line.startswith("x\t")])
+
+    def test_stage_2_aligns_the_record_stage_1_searched(self):
+        """The last x record is shorter than --min-res-n, so the pass embeds the earlier one: Stage 2 aligns that
+        record's sequence too (before, it aligned the last record's, whose embedding was never computed)."""
+        a = dict(_fasta_records(_FASTA))["1acb_E"]
+        fasta = _dup_fasta(self.tmp / "short.fasta", last="ACDEFG")
+        for ranks in (1, 2):
+            with self.subTest(ranks=ranks):
+                out = self.run_query(fasta, "stage-2", ranks, "--min-res-n", "20")
+                rows = [row for row in _rows(out, output.SUPPORTED_OUTPUT_FIELDS) if row["query"] == "x"]
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["qseq"] == a for row in rows), rows)
+                self.assertEqual({row["qlen"] for row in rows}, {str(len(a))})
+
+
+# =====================================================================================================================
 # real ESM3 (CPU): the end-to-end smoke and the F-deg items through the command line
 # =====================================================================================================================
 def _track_models():
@@ -1045,6 +1181,77 @@ class RealEsm3DegenerateTest(unittest.TestCase):
         # The other queries' hits are those of the real run.
         real = [row for row in self.rows("real") if row["query"] != "polyA50"]
         self.assertEqual([row for row in self.rows("identical")], real)
+
+
+@unittest.skipUnless(os.environ.get("FOLDMATCH_SLOW_TESTS") == "1",
+                     "slow: real ESM3 on one and on two CPU ranks; set FOLDMATCH_SLOW_TESTS=1 to run")
+@pytest.mark.usefixtures("fmsw_libs")
+class TwoRankQuerySmoke(unittest.TestCase):
+    """P7.0a with real ESM3 (CPU, gloo): ``query sequences --devices 2``, which Lightning re-runs for rank 1, writes
+    the same bytes as ``--devices 1``, under blosum62 and esm-codes, on a database of the fixture built with
+    --residue-codes. Every command runs as a subprocess with the same environment, the torch thread count included
+    (Lightning would otherwise give each of the two ranks half the cores), so the runs' ESM3 numbers agree."""
+
+    CASES = ("blosum62", "esm-codes")
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        esm_codes_bundle.registry_files()
+        swkern.load()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = tmp = Path(cls._tmp.name)
+        fasta = _order_fasta(tmp / "order.fasta")
+        for folder in ("db", "bshards", "qshards"):
+            (tmp / folder).mkdir()
+        env = {k: v for k, v in os.environ.items()
+               if k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+        env["PYTHONPATH"] = os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p])
+        # One torch thread in every run: Lightning gives each DDP rank cpu_count // 2 unless OMP_NUM_THREADS is set,
+        # and on macOS a value above 1 set at start can deadlock the FAISS flat search (torch and FAISS each bring
+        # an OpenMP runtime).
+        env["OMP_NUM_THREADS"] = "1"
+        cls.runs, cls.seconds = {}, {}
+
+        def run(name, args):
+            t0 = time.perf_counter()
+            cls.runs[name] = subprocess.run([sys.executable, "-m", "foldmatch.cli.search", *map(str, args)], env=env,
+                                            capture_output=True, text=True, timeout=1200)
+            cls.seconds[name] = time.perf_counter() - t0
+
+        run("build", _build_args(_FASTA, tmp / "db" / "db", tmp / "bshards", "--residue-codes"))
+        for case in cls.CASES:
+            for devices in (1, 2):
+                args = list(_query_args(tmp / "db" / "db", fasta, tmp / "qshards", tmp / f"{case}-{devices}.tsv",
+                                        *_ORDER_CASES[case]))
+                args[args.index("--devices") + 1] = devices
+                run(f"{case} {devices}", args)
+        print("\nP7.0a two-rank smoke wall times (s): " + ", ".join(f"{k} {v:.1f}" for k, v in cls.seconds.items()),
+              file=sys.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def setUp(self):
+        for name, run in self.runs.items():
+            self.assertEqual(run.returncode, 0, f"{name}: {run.stderr[-4000:]}")
+
+    def test_two_ranks_write_the_bytes_of_one(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                one, two = self.tmp / f"{case}-1.tsv", self.tmp / f"{case}-2.tsv"
+                self.assertEqual(MultiRankOrderTest.query_order(one), _INPUT_ORDER)
+                self.assertEqual(len(one.read_text().splitlines()), 10)
+                self.assertEqual(_sha256(two), _sha256(one))
+
+    def test_the_second_run_had_two_ranks(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                self.assertIn("Streaming embeddings from 1 Parquet shard(s)", self.runs[f"{case} 1"].stderr)
+                self.assertIn("Streaming embeddings from 2 Parquet shard(s)", self.runs[f"{case} 2"].stderr)
+        self.assertEqual(list((self.tmp / "qshards").iterdir()), [])
 
 
 class _Records(logging.Handler):

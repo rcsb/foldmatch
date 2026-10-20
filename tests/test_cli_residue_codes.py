@@ -107,12 +107,13 @@ def _fake_codes(name: str, sequence: str) -> np.ndarray:
     return np.random.default_rng(zlib.crc32(name.encode())).integers(0, 256, (len(sequence), 8), dtype=np.uint8)
 
 
-def fake_chain_predict(calls=None, payload=_fake_codes, system=None, ranks=1, device="cpu"):
+def fake_chain_predict(calls=None, payload=_fake_codes, system=None, ranks=1, device="cpu", by_sequence=False):
     """Stand-in for ``chain_complete_inference.predict``: the shards the pass writes, from the same dataset and
     writer (with the writer's start-of-pass hook, which records the pass), with an 8-d chain embedding fixed per id
-    and, for a residue pass, ``payload(name, sequence)`` as the residue codes (``system`` overrides the scoring system
-    the shards are written for). With ``ranks`` > 1 the entries go round-robin to that many rank shards, as DDP's
-    sampler deals them; ``device`` is the device type the module 'runs' on."""
+    (``by_sequence``: per sequence, as ESM3 gives it, so two records with one id differ) and, for a residue pass,
+    ``payload(name, sequence)`` as the residue codes (``system`` overrides the scoring system the shards are written
+    for). With ``ranks`` > 1 the entries go round-robin to that many rank shards, as DDP's sampler deals them;
+    ``device`` is the device type the module 'runs' on."""
     def predict(**kwargs):
         from foldmatch.dataset.esm_prot_from_fasta import EsmProtFromFasta
         from foldmatch.inference.chain_complete_inference import residue_shard_writer
@@ -124,8 +125,9 @@ def fake_chain_predict(calls=None, payload=_fake_codes, system=None, ranks=1, de
         for rank in range(ranks):
             items = [dataset[i] for i in range(rank, len(dataset), ranks)]
             names = tuple(name for _, name in items)
-            embeddings = [torch.from_numpy(np.random.default_rng(zlib.crc32(name.encode())).normal(size=8)
-                                           .astype(np.float32)) for name in names]
+            keys = [prot.sequence for prot, _ in items] if by_sequence else names
+            embeddings = [torch.from_numpy(np.random.default_rng(zlib.crc32(key.encode())).normal(size=8)
+                                           .astype(np.float32)) for key in keys]
             trainer = SimpleNamespace(global_rank=rank, world_size=ranks)
             if residue_output is None:
                 writer = ParquetBatchWriter(kwargs["out_folder"], kwargs["out_name"])

@@ -70,30 +70,36 @@ def _embedding(name, dim=8):
     return torch.from_numpy(vec / np.linalg.norm(vec))
 
 
-def _write_shard(folder, out_name, rank, names):
-    """Write one rank's shard exactly as the Lightning writer callback does."""
+def _write_shard(folder, out_name, rank, names, keys=None):
+    """Write one rank's shard exactly as the Lightning writer callback does; each row's embedding is fixed by its
+    entry of ``keys`` (default: its id)."""
     from foldmatch.writer.batch_writer import ParquetBatchWriter
     writer = ParquetBatchWriter(folder, out_name)
     trainer = SimpleNamespace(global_rank=rank)
-    writer.write_on_batch_end(trainer, None, ([_embedding(n) for n in names], tuple(names)),
+    writer.write_on_batch_end(trainer, None, ([_embedding(k) for k in (keys or names)], tuple(names)),
                               None, None, 0, 0)
     writer.on_predict_end(trainer, None)
 
 
-def fake_chain_predict(world_size=1, drop=()):
+def fake_chain_predict(world_size=1, drop=(), by_sequence=False):
     """Stand-in for chain_complete_inference.predict on FASTA input.
 
     Splits the entries over ``world_size`` simulated ranks the way the
     distributed sampler does and writes one shard per rank; ``drop`` loses
-    entries, like a rank whose shard never reaches rank 0.
+    entries, like a rank whose shard never reaches rank 0. With
+    ``by_sequence`` a row's embedding is fixed by the sequence the dataset
+    gives (as with ESM3) instead of by its id, so two records with one id
+    have different embeddings.
     """
     def predict(**kwargs):
         from foldmatch.dataset.esm_prot_from_fasta import EsmProtFromFasta
         dataset = EsmProtFromFasta(kwargs["src_stream"], min_res_n=kwargs["min_res_n"])
-        names = [dataset[i][1] for i in range(len(dataset))]
-        names = [n for n in names if n not in drop]
+        items = [dataset[i] for i in range(len(dataset))]
+        items = [(prot, n) for prot, n in items if n not in drop]
         for rank in range(world_size):
-            _write_shard(kwargs["out_folder"], kwargs["out_name"], rank, names[rank::world_size])
+            dealt = items[rank::world_size]
+            _write_shard(kwargs["out_folder"], kwargs["out_name"], rank, [n for _, n in dealt],
+                         keys=[prot.sequence for prot, _ in dealt] if by_sequence else None)
     return predict
 
 
@@ -300,6 +306,162 @@ class ShardIsolationTest(unittest.TestCase):
         mine.remove_shards()
         self.assertEqual(mine.shard_files(), [])
         self.assertEqual(_ids(other), ["c"])
+
+
+class InputOrderTest(unittest.TestCase):
+    """P7.0a: :meth:`EmbeddingComputer.in_input_order` puts a multi-rank run's search results (rank 0 reads the shards
+    rank by rank) back in input order, with the values of a 1-rank run, a repeated id included; values are never
+    changed. The fake pass fixes each row's embedding by its sequence, as ESM3 does, so two records with one id
+    differ."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(launch_env(FOLDMATCH_RUN_ID="order"))
+
+    def _pass(self, records, world_size, min_res_n=0):
+        """A FASTA pass over ``records`` with the fake pass on ``world_size`` ranks; returns the computer and
+        ``{row: embedding}`` as rank 0 reads it from the shards (the dict a search builds with ``rows=True``)."""
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        fasta = self.tmp / "q.fasta"
+        fasta.write_text("".join(f">{name} some description\n{seq}\n\n" for name, seq in records))
+        computer = EmbeddingComputer(self.tmp)
+        with patch("foldmatch.search.embedding_computer.chain_predict",
+                   fake_chain_predict(world_size=world_size, by_sequence=True)):
+            computer.compute_from_fasta(fasta, min_res_n=min_res_n, accelerator=Accelerator.cpu)
+        results = {}
+        for rows, embeddings in computer.get_embedding_batches(rows=True):
+            for row, embedding in zip(rows, embeddings):
+                results[row] = embedding
+        return computer, results
+
+    def _finish(self, computer):
+        computer.remove_shards()
+
+    @staticmethod
+    def _one_rank(records, min_res_n=0):
+        """What a 1-rank search's dict holds: ``{id: embedding of its last kept record}``, each id at its first."""
+        out = {}
+        for name, seq in records:
+            if len(seq) >= min_res_n:
+                out[name] = _embedding(seq).numpy()
+        return out
+
+    def assertSameResults(self, got, want):
+        self.assertEqual(list(got), list(want))
+        for name in want:
+            np.testing.assert_array_equal(got[name], want[name], err_msg=name)
+
+    def test_two_ranks_are_put_back_in_input_order(self):
+        records = [(f"q{k}", "ACDEFGHIKL" * (k + 1)) for k in range(7)]
+        names = [name for name, _ in records]
+        for world_size in (2, 3):
+            with self.subTest(world_size=world_size):
+                computer, results = self._pass(records, world_size)
+                read = [i for ids, _ in computer.get_embedding_batches() for i in ids]
+                self.assertNotEqual(read, names)            # rank order: rank 0's queries first
+                ordered = computer.in_input_order(results)
+                self.assertSameResults(ordered, self._one_rank(records))
+                values = {id(v) for v in results.values()}
+                self.assertTrue(all(id(v) in values for v in ordered.values()))   # the values, not copies
+                self.assertEqual(computer.input_ids(), names)
+                self._finish(computer)
+
+    def test_one_rank_keeps_the_input_order(self):
+        records = [(f"q{k}", "ACDEFGHIKL" * k) for k in (3, 1, 2)]
+        computer, results = self._pass(records, 1)
+        ordered = computer.in_input_order(results)
+        self.assertEqual(list(ordered), ["q3", "q1", "q2"])
+        for row, name in enumerate(["q3", "q1", "q2"]):
+            self.assertIs(ordered[name], results[row])
+
+    def test_only_the_kept_records_count(self):
+        """``min_res_n`` drops records before the pass; the order is that of the kept ones, and a subset of the
+        results (a filtered dict) keeps that order."""
+        records = [("short", "ACD"), ("b", "ACDEFGHIKL"), ("a", "ACDEFGHIKLM"), ("c", "ACDEFGHIKLMN")]
+        computer, results = self._pass(records, 2, min_res_n=5)
+        self.assertEqual(computer.input_ids(), ["b", "a", "c"])
+        self.assertEqual([i for ids, _ in computer.get_embedding_batches() for i in ids], ["b", "c", "a"])
+        self.assertSameResults(computer.in_input_order(results), self._one_rank(records, 5))
+        self.assertEqual(list(computer.in_input_order({1: "c", 0: "b"})), ["b", "c"])
+        self.assertEqual(computer.input_sequences(), {"b": "ACDEFGHIKL", "a": "ACDEFGHIKLM", "c": "ACDEFGHIKLMN"})
+
+    def test_a_repeated_id_takes_its_last_kept_record(self):
+        """Duplicate ids (accepted by a plain pass): one key, at its first kept record, with the embedding of its
+        last kept record, as in a 1-rank run, whatever the ranks; and the sequence Stage 2 aligns is that record's
+        too. Two ranks deal x(1), z | y, x(2): rank 0's shard, read first, holds the earlier x."""
+        x1, x2 = "ACDEFGHIKL", "KLMNPQRSTVWY"
+        records = [("x", x1), ("y", "ACDEFGHIKLM"), ("z", "ACDEFGHIKLMN"), ("x", x2)]
+        for world_size in (1, 2, 3):
+            with self.subTest(world_size=world_size):
+                computer, results = self._pass(records, world_size)
+                self.assertEqual(computer.input_ids(), ["x", "y", "z", "x"])
+                ordered = computer.in_input_order(results)
+                self.assertSameResults(ordered, self._one_rank(records))
+                np.testing.assert_array_equal(ordered["x"], _embedding(x2).numpy())
+                self.assertEqual(computer.input_sequences()["x"], x2)
+                self._finish(computer)
+        # the last record is too short for the pass: the earlier one is the query, for Stage 1 and Stage 2 alike
+        short = [("x", x1 * 2), ("y", "ACDEFGHIKLM"), ("x", "ACD")]
+        for world_size in (1, 2):
+            with self.subTest(world_size=world_size, min_res_n=5):
+                computer, results = self._pass(short, world_size, min_res_n=5)
+                ordered = computer.in_input_order(results)
+                self.assertSameResults(ordered, self._one_rank(short, 5))
+                self.assertEqual(computer.input_sequences(), {"x": x1 * 2, "y": "ACDEFGHIKLM"})
+                self._finish(computer)
+
+    def test_shards_not_dealt_round_robin(self):
+        """Shards that are not the sampler's round robin (never from Lightning's predict): an id that occurs once is
+        still placed exactly; a repeated id takes its positions in read order, with a warning."""
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        for records, warned in (([("a", "AC"), ("b", "DE"), ("c", "FG"), ("d", "HI")], False),
+                                ([("x", "AC"), ("b", "DE"), ("x", "FG"), ("d", "HI")], True)):
+            with self.subTest(warned=warned):
+                fasta = self.tmp / "q.fasta"
+                fasta.write_text("".join(f">{name}\n{seq}\n" for name, seq in records))
+
+                def contiguous(**kwargs):
+                    half = [records[:2], records[2:]]
+                    for rank, part in enumerate(half):
+                        _write_shard(kwargs["out_folder"], kwargs["out_name"], rank, [n for n, _ in part],
+                                     keys=[seq for _, seq in part])
+
+                computer = EmbeddingComputer(self.tmp)
+                with patch("foldmatch.search.embedding_computer.chain_predict", contiguous):
+                    computer.compute_from_fasta(fasta, accelerator=Accelerator.cpu)
+                results = {row: e for rows, embs in computer.get_embedding_batches(rows=True)
+                           for row, e in zip(rows, embs)}
+                with self.assertLogs("foldmatch.search.embedding_computer", level="WARNING") if warned else \
+                        _no_warning(self, "foldmatch.search.embedding_computer"):
+                    ordered = computer.in_input_order(results)
+                self.assertSameResults(ordered, self._one_rank(records))
+                self._finish(computer)
+
+    def test_an_id_not_in_the_input_is_an_error(self):
+        computer, results = self._pass([("a", "ACDEFGHIKL"), ("b", "ACDEFGHIKLM")], 2)
+        _write_shard(self.tmp, computer.out_name, 2, ["stale"])
+        with self.assertRaises(ValueError) as ctx:
+            computer.in_input_order(results)
+        self.assertIn("'stale'", str(ctx.exception))
+        self.assertIn("shards of another run", str(ctx.exception))
+        (self.tmp / f"{computer.out_name}-2.parquet").unlink()
+        self.assertEqual(list(computer.in_input_order(results)), ["a", "b"])
+        with self.assertRaises(ValueError) as ctx:
+            computer.in_input_order({99: None})
+        self.assertIn("not a row", str(ctx.exception))
+
+    def test_only_after_a_fasta_pass(self):
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        for method in ("in_input_order", "input_sequences"):
+            with self.subTest(method=method), self.assertRaises(ValueError):
+                getattr(EmbeddingComputer(self.tmp), method)(*(({},) if method == "in_input_order" else ()))
+
+
+@contextmanager
+def _no_warning(case, logger_name):
+    """``assertNoLogs`` at WARNING."""
+    with case.assertNoLogs(logger_name, level="WARNING"):
+        yield
 
 
 # A simulated rank > 0: it re-runs the command, so it derives its own run id,
