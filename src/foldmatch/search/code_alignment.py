@@ -213,6 +213,32 @@ def _limit_blas_threads():
     return threadpoolctl.threadpool_limits(limits=1, user_api="blas")
 
 
+_BLAS_CONTROL_NOTED = False
+
+
+def _blas_controllable() -> bool:
+    """Whether threadpoolctl finds a BLAS it can limit in this process. It cannot see every BLAS: Apple Accelerate
+    (numpy's BLAS on macOS) is not one it supports, so a limit there has no effect."""
+    try:
+        import threadpoolctl
+    except ImportError:
+        return False
+    return any(info.get("user_api") == "blas" for info in threadpoolctl.threadpool_info())
+
+
+def _note_uncontrolled_blas() -> None:
+    """Once per process, when in-process tasks start: say so if threadpoolctl cannot limit this BLAS (they then run
+    with its own thread count, like a run without threadpoolctl)."""
+    global _BLAS_CONTROL_NOTED
+    if _BLAS_CONTROL_NOTED:
+        return
+    _BLAS_CONTROL_NOTED = True
+    if not _blas_controllable():
+        logger.info("esm-codes Stage 2 runs in-process and threadpoolctl cannot limit this BLAS (for example Apple "
+                    "Accelerate): it keeps its own thread count (set OMP/OPENBLAS/MKL/VECLIB_*_NUM_THREADS=1 for "
+                    "the bits of a worker pool; S16 holds either way)")
+
+
 def _init_worker(init: _WorkerInit, raise_errors: bool = False) -> None:
     """Load what every task needs, once per process. In a pool worker an error is kept and raised by every task
     instead (a failing initializer would only report a broken pool)."""
@@ -313,6 +339,8 @@ def _single_threaded_blas_env():
 @contextmanager
 def _blas_one_thread_here():
     limiter = _limit_blas_threads()
+    if limiter is not None:
+        _note_uncontrolled_blas()
     try:
         yield
     finally:

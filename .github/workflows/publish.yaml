@@ -84,7 +84,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl importlib-metadata==8.7.1
+        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl==3.6.0 importlib-metadata==8.7.1
 
       - name: Compiler version
         run: $CC --version
@@ -130,7 +130,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl importlib-metadata==8.7.1
+        run: pip install "numpy>=2,<3" pytest==9.0.2 threadpoolctl==3.6.0 importlib-metadata==8.7.1
 
       - name: Build the libraries with ASan and UBSan
         run: |

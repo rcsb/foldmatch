@@ -182,6 +182,27 @@ class EsmWeightsPinTest(unittest.TestCase):
             self.assertEqual(loaders.verify_esm_weights(cached), "blob-name")
 
 
+class DependencyPinsTest(unittest.TestCase):
+    """The runtime dependencies in pyproject.toml are exact pins; threadpoolctl is one of them (P7.0d: the esm-codes
+    Stage 2 checks and limits its BLAS threads with it, S6/S16)."""
+
+    def setUp(self):
+        path = _PACKAGE.parent.parent / "pyproject.toml"
+        if not path.is_file():
+            self.skipTest(f"no pyproject.toml next to the package ({path}): not a source tree")
+        import tomllib
+        self.dependencies = tomllib.loads(path.read_text())["project"]["dependencies"]
+
+    def test_every_dependency_is_an_exact_pin(self):
+        self.assertGreaterEqual(len(self.dependencies), 13)
+        for requirement in self.dependencies:
+            with self.subTest(requirement=requirement):
+                self.assertRegex(requirement, r"^[A-Za-z0-9][A-Za-z0-9._-]*==[0-9][0-9A-Za-z.+!]*$")
+
+    def test_threadpoolctl_is_declared(self):
+        self.assertIn("threadpoolctl==3.6.0", self.dependencies)
+
+
 class _NotAWeight:
     pass
 
