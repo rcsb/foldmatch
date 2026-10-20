@@ -651,6 +651,21 @@ class PathMetricsTest(unittest.TestCase):
         self.assertEqual(ca.nonstandard_count("ACDXBZ*_-"), 6)
         self.assertEqual(ca.nonstandard_count(STANDARD_AMINO_ACIDS), 0)
 
+    def test_distinct_codes_are_counted_up_to_the_s13_minimum(self):
+        """The round-2 distinct-code count is min(distinct codes, cap), so 'fewer than cap' is decided exactly."""
+        rng = np.random.default_rng(12)
+        pool = rng.integers(0, 256, (5, 8), dtype=np.uint8)
+        cases = [np.zeros((0, 8), np.uint8), pool[:1], np.repeat(pool[:1], 9, axis=0), _f1()[0]["codes"]]
+        for size in (2, 3, 7, 40):
+            cases.append(pool[rng.integers(0, len(pool), size)])
+            cases.append(np.repeat(pool[rng.integers(0, len(pool), 1)], size, axis=0))
+        for codes in cases:
+            exact = len(np.unique(codes.view(np.uint64))) if len(codes) else 0
+            for cap in (1, 2, 3, 5):
+                got = ca._distinct_codes(codes, cap)
+                self.assertEqual(got, min(exact, cap), (len(codes), exact, cap))
+                self.assertEqual(got < cap, exact < cap)
+
 
 @pytest.mark.usefixtures("fmsw_libs")
 class HitFieldsTest(_WorldCase):

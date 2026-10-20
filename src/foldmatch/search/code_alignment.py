@@ -11,7 +11,7 @@ number of build ranks), :func:`align_candidates_esm_codes` runs::
     parent    S = fp64(S_f) - fp64(S_r); Q90 = quantile(panel S, 0.9) (S10); S' = S - Q90, ln E, bits (S11);
               survivors: ln E <= ln(max_evalue), or every candidate when there is no E filter
     round 2   survivors only: forward traceback of S_f (S12); its score must equal round 1's S_f bit for bit
-              (:class:`~foldmatch.errors.InternalError` otherwise); the target's distinct-code count (S13)
+              (:class:`~foldmatch.errors.InternalError` otherwise); whether the target has enough distinct codes (S13)
     parent    vectorised path metrics, ecal (S13), filters (alnlen > 0, identity, min(qcov, tcov)), sort (S14)
 
 **Tasks.** A task is ``(task id, source, query memmap offset, query length, [(offset, length), ...])``: the rows of
@@ -323,16 +323,24 @@ def _round1_task(task):
     return out + (_task_record(st, timer, "panel" if source == _PANEL else "candidates", n, pairs, out),)
 
 
-def _distinct_codes(codes: np.ndarray) -> int:
+def _distinct_codes(codes: np.ndarray, cap: int) -> int:
+    """``min(distinct codes, cap)``: S13 only asks whether a target has at least ``cap``
+    (``target_min_distinct_codes``) distinct codes, so the count stops there. For ``cap <= 2`` (esm-codes-v1: 2)
+    that is one comparison of every code with the first instead of a sort."""
     if len(codes) == 0:
         return 0
-    return int(np.unique(np.ascontiguousarray(codes).view(np.uint64).ravel()).size)
+    v = np.ascontiguousarray(codes).view(np.uint64).ravel()
+    if cap <= 1:
+        return 1
+    if cap == 2:
+        return 2 if bool((v != v[0]).any()) else 1
+    return min(int(np.unique(v).size), int(cap))
 
 
 def _round2_task(task):
     """Round 2: ``(task id, S_f float32 [k], ends int32 [k, 2], path int32 [P, 2], path_off int64 [k + 1],
-    distinct codes int64 [k], skipped bool [k])``: the forward traceback of survivors (profiling mode: plus the task's
-    timing record)."""
+    distinct codes int64 [k] (counted up to ``target_min_distinct_codes``), skipped bool [k])``: the forward
+    traceback of survivors (profiling mode: plus the task's timing record)."""
     tid, q_off, n, pairs = task
     st = _state()
     timer = _task_timer(st)
@@ -344,7 +352,8 @@ def _round2_task(task):
                      workspace=st.workspace, timings=None if timer is None else timer.t)
     if timer is not None:
         timer.lap("swkern")
-    distinct = np.array([_distinct_codes(st.codes[o:o + m]) for o, m in pairs.tolist()], np.int64)
+    cap = st.init.spec.calibrated_domain.target_min_distinct_codes
+    distinct = np.array([_distinct_codes(st.codes[o:o + m], cap) for o, m in pairs.tolist()], np.int64)
     if timer is None:
         return tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped
     timer.lap("distinct")
