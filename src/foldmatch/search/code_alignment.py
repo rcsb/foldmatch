@@ -57,6 +57,7 @@ import numpy as np
 
 from foldmatch.errors import InternalError
 from foldmatch.search import code_statistics as cs
+from foldmatch.search import stage2_profile
 from foldmatch.search import swkern
 from foldmatch.search.alignment import (
     _BIOTITE_ALPHABET, AlignmentMetrics, Hit, _available_cpus, _expand_cpu_affinity,
@@ -173,16 +174,19 @@ class _WorkerInit:
     queries: Tuple[str, int, int]     # query encodings, rows, width
     block_floats: int
     max_pair_cells: int
+    profile: bool = False             # profiling mode (stage2_profile): tasks also return their timing record
 
 
 class _WorkerState:
-    __slots__ = ("init", "kernel", "params", "panel_codes", "codes", "queries", "workspace", "blas_limit", "error")
+    __slots__ = ("init", "kernel", "params", "panel_codes", "codes", "queries", "workspace", "blas_limit", "error",
+                 "init_record")
 
     def __init__(self, init: _WorkerInit, error: Optional[BaseException] = None):
         self.init = init
         self.error = error
         self.kernel = self.params = self.panel_codes = self.codes = self.queries = self.workspace = None
         self.blas_limit = None
+        self.init_record = None       # profiling: this process's start-up, sent with its first task
 
 
 _STATE: Optional[_WorkerState] = None
@@ -244,6 +248,8 @@ def _init_worker(init: _WorkerInit, raise_errors: bool = False) -> None:
     instead (a failing initializer would only report a broken pool)."""
     global _STATE
     _STATE = None
+    if init.profile:
+        t_unix, t0 = time.time(), time.perf_counter()
     try:
         st = _WorkerState(init)
         st.kernel = swkern.load(init.isa)
@@ -254,6 +260,8 @@ def _init_worker(init: _WorkerInit, raise_errors: bool = False) -> None:
         st.workspace = swkern.Workspace()
         if not raise_errors:
             st.blas_limit = _limit_blas_threads()
+        if init.profile:
+            st.init_record = stage2_profile.init_record(t_unix, time.perf_counter() - t0)
         _STATE = st
     except BaseException as e:  # noqa: BLE001  (re-raised by every task of this worker)
         if raise_errors:
@@ -286,17 +294,33 @@ def _query_prep(st: _WorkerState, q_off: int, n: int) -> np.ndarray:
     return swkern.query_prep(np.asarray(st.queries[q_off:q_off + n]), st.kernel)
 
 
+def _task_timer(st: _WorkerState) -> Optional[stage2_profile.TaskTimer]:
+    return stage2_profile.TaskTimer() if st.init.profile else None
+
+
+def _task_record(st: _WorkerState, timer: stage2_profile.TaskTimer, kind: str, n: int, pairs, result: tuple) -> dict:
+    init, st.init_record = st.init_record, None
+    return timer.record(kind, n, pairs, result, init)
+
+
 def _round1_task(task):
     """Round 1: ``(task id, S_f float32 [k], S_r float32 [k], skipped bool [k])`` of one query against a chunk of
-    panel members or candidates."""
+    panel members or candidates (profiling mode: plus the task's timing record)."""
     tid, source, q_off, n, pairs = task
     st = _state()
+    timer = _task_timer(st)
     qp = _query_prep(st, q_off, n)
+    if timer is not None:
+        timer.lap("prep")
     codes = st.panel_codes if source == _PANEL else st.codes
     r = swkern.score_fwd_rev(qp, codes, pairs[:, 0], st.params, lengths=pairs[:, 1],
                              block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells,
-                             kernel=st.kernel, workspace=st.workspace)
-    return tid, r.s_fwd, r.s_rev, r.skipped
+                             kernel=st.kernel, workspace=st.workspace, timings=None if timer is None else timer.t)
+    if timer is None:
+        return tid, r.s_fwd, r.s_rev, r.skipped
+    timer.lap("swkern")
+    out = (tid, r.s_fwd, r.s_rev, r.skipped)
+    return out + (_task_record(st, timer, "panel" if source == _PANEL else "candidates", n, pairs, out),)
 
 
 def _distinct_codes(codes: np.ndarray) -> int:
@@ -307,15 +331,25 @@ def _distinct_codes(codes: np.ndarray) -> int:
 
 def _round2_task(task):
     """Round 2: ``(task id, S_f float32 [k], ends int32 [k, 2], path int32 [P, 2], path_off int64 [k + 1],
-    distinct codes int64 [k], skipped bool [k])``: the forward traceback of survivors."""
+    distinct codes int64 [k], skipped bool [k])``: the forward traceback of survivors (profiling mode: plus the task's
+    timing record)."""
     tid, q_off, n, pairs = task
     st = _state()
+    timer = _task_timer(st)
     qp = _query_prep(st, q_off, n)
+    if timer is not None:
+        timer.lap("prep")
     a = swkern.align(qp, st.codes, pairs[:, 0], st.params, lengths=pairs[:, 1], traceback=True,
                      block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells, kernel=st.kernel,
-                     workspace=st.workspace)
+                     workspace=st.workspace, timings=None if timer is None else timer.t)
+    if timer is not None:
+        timer.lap("swkern")
     distinct = np.array([_distinct_codes(st.codes[o:o + m]) for o, m in pairs.tolist()], np.int64)
-    return tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped
+    if timer is None:
+        return tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped
+    timer.lap("distinct")
+    out = (tid, a.scores, a.ends, a.path, a.path_off, distinct, a.skipped)
+    return out + (_task_record(st, timer, "round2", n, pairs, out),)
 
 
 # =====================================================================================================================
@@ -439,8 +473,10 @@ class CodeAlignmentPool:
             self._requested = max(1, _available_cpus() if self.num_workers is None else int(self.num_workers))
         return self._requested
 
-    def run(self, fn, tasks: list, init: _WorkerInit) -> Iterator:
-        """The results of ``fn`` over ``tasks``, in completion order."""
+    def run(self, fn, tasks: list, init: _WorkerInit, profile: Optional[stage2_profile.Stage2Profile] = None
+            ) -> Iterator:
+        """The results of ``fn`` over ``tasks``, in completion order. ``profile`` (profiling mode) receives the
+        executor start-up and each task's submit time."""
         if not tasks:
             return
         if self._pool is not None and self._init != init:
@@ -451,8 +487,8 @@ class CodeAlignmentPool:
             if self.serial or (workers <= 1 and _blas_limit_available()):
                 yield from self._run_here(fn, tasks, init)
                 return
-            self._start(init, max(1, workers))
-        yield from self._run_in_pool(fn, tasks)
+            self._start(init, max(1, workers), profile)
+        yield from self._run_in_pool(fn, tasks, profile)
 
     def _run_here(self, fn, tasks, init):
         if _STATE is None or _STATE.init != init or _STATE.error is not None:
@@ -466,7 +502,7 @@ class CodeAlignmentPool:
             for task in tasks:
                 yield fn(task)
 
-    def _run_in_pool(self, fn, tasks):
+    def _run_in_pool(self, fn, tasks, profile=None):
         """Submit every task (longest first: the caller's order), then yield the results as they complete. Tasks not
         started yet are cancelled when the caller stops early (an error); a lost worker raises
         :class:`WorkerPoolError`."""
@@ -476,6 +512,8 @@ class CodeAlignmentPool:
                 # The executor spawns its workers as tasks are submitted: they inherit *_NUM_THREADS=1 from here.
                 with _single_threaded_blas_env():
                     for task in tasks:
+                        if profile is not None:
+                            profile.submitted(task)
                         futures.append(self._pool.submit(fn, task))
                 for future in as_completed(futures):
                     yield future.result()
@@ -486,12 +524,15 @@ class CodeAlignmentPool:
             for future in futures:
                 future.cancel()
 
-    def _start(self, init: _WorkerInit, workers: int):
+    def _start(self, init: _WorkerInit, workers: int, profile=None):
+        t0 = time.perf_counter()
         ctx = mp.get_context(self.start_method)
         self._pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_init_pool_worker,
                                          initargs=(init,))
         self._init, self.workers = init, workers
         self.starts += 1
+        if profile is not None:
+            profile.executor_created(time.perf_counter() - t0, workers)
         logger.info(f"esm-codes Stage 2: a pool of {workers} {self.start_method} workers")
 
     def close(self, terminate: bool = False) -> None:
@@ -702,9 +743,12 @@ def align_candidates_esm_codes(
             evalue / bits / q90 / rawadj column: hits are still ranked by S, and those columns render empty;
             ``"always"`` runs it; ``"never"`` skips it and refuses a finite ``max_evalue``.
         stats: a dict to receive the run's counters (also logged once at INFO): pairs, survivors, tasks, workers,
-            the per-query Q90, the fully degenerate queries (S13b) and the calibrated-domain counts (S13).
+            the per-query Q90, the fully degenerate queries (S13b) and the calibrated-domain counts (S13); in the
+            profiling mode (``FOLDMATCH_STAGE2_PROFILE=1``, :mod:`~foldmatch.search.stage2_profile`) also
+            ``stats["profile"]``, the time breakdown of the parent and the workers (the hits do not change).
     """
     t_start = time.perf_counter()
+    prof = stage2_profile.Stage2Profile() if stage2_profile.profiling_enabled() else None
     needs = OutputNeeds.coerce(output_needs)
     min_seq_identity = _check_fraction("min_seq_identity", min_seq_identity)
     min_coverage = _check_fraction("min_coverage", min_coverage)
@@ -726,8 +770,14 @@ def align_candidates_esm_codes(
     spec = prepared.for_worker()
     kernel = swkern.load()
     run = _Run(spec, needs, need_panel, ln_max, min_seq_identity, min_coverage, db_residues, task_cells)
+    run.prof = prof
     results: Dict[str, List[Hit]] = {qid: [] for qid in prefilter_results}
+    if prof is not None:
+        t_phase = time.perf_counter()
+        prof.add("setup", t_phase - t_start)
     queries = _collect_queries(query_index, prefilter_results, query_sequences, run)
+    if prof is not None:
+        prof.add("collect", time.perf_counter() - t_phase)
     if queries and need_panel and db_residues <= 0:
         raise ValueError("E-values need a non-empty database (db_residues > 0), but the database has "
                          f"{db_residues} residues; pass max_evalue=None and panel_policy='never' to rank by S only")
@@ -745,7 +795,7 @@ def align_candidates_esm_codes(
                                codes=(str(code_store.bin_path), int(manifest["total_residues"]),
                                       int(manifest["code_bytes"])),
                                queries=tuple(query_index.memmap_args()), block_floats=block_floats,
-                               max_pair_cells=max_pair_cells)
+                               max_pair_cells=max_pair_cells, profile=prof is not None)
             if need_panel:
                 _codes, panel_offsets = spec.load_panel()
                 run.set_panel(panel_offsets)
@@ -758,9 +808,21 @@ def align_candidates_esm_codes(
             pool.close(terminate=True)
         raise
     if owned:
+        if prof is not None:
+            t_phase = time.perf_counter()
         pool.close()
+        if prof is not None:
+            prof.add("pool_close", time.perf_counter() - t_phase)
     run.workers = max(run.workers, pool.workers)
+    if prof is not None:
+        t_phase = time.perf_counter()
     run.finish(results, time.perf_counter() - t_start, max_pair_cells, stats)
+    if prof is not None:
+        prof.add("finish", time.perf_counter() - t_phase)
+        summary = prof.summary(run.workers)
+        logger.info(stage2_profile.Stage2Profile.log_line(summary))
+        if stats is not None:
+            stats["profile"] = summary
     return results
 
 
@@ -789,6 +851,7 @@ class _Run:
         self.query_domain = dict(aligned=0, short=0, long=0, nonstandard=0)
         self.hit_domain = dict(hits=0, ecal0=0, query_outside=0, target_long=0, target_nonstandard=0,
                                target_low_distinct=0)
+        self.prof: Optional[stage2_profile.Stage2Profile] = None     # profiling mode only
 
     def query_inside(self, seq: str) -> bool:
         """The query side of S13 (length, non-standard fraction), counted for the once-per-run warning."""
@@ -904,29 +967,47 @@ def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run)
 
 def _run_batch(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit, code_store,
                fetch_subject_sequences, results: Dict[str, List[Hit]]):
+    prof = run.prof
+    if prof is not None:
+        t0 = time.perf_counter()
     # codes by id (the .bin order depends on the build's ranks)
     entries = code_store.lookup(tid for q in batch for tid in q.cand_ids)
     for q in batch:
         q.cand_off = np.array([entries[t].offset for t in q.cand_ids], np.int64)
         q.cand_len = np.array([entries[t].length for t in q.cand_ids], np.int64)
+    if prof is not None:
+        prof.add("lookup", time.perf_counter() - t0)
     _round1(batch, run, pool, init)
+    if prof is not None:
+        t0 = time.perf_counter()
     for q in batch:
         _statistics(q, run)
+    if prof is not None:
+        prof.add("statistics", time.perf_counter() - t0)
     survivors = [q for q in batch if q.surv.size]
     if not survivors:
         return
+    if prof is not None:
+        t0 = time.perf_counter()
     wanted = {q.cand_ids[k] for q in survivors for k in q.surv.tolist()}
     sequences = fetch_subject_sequences(wanted)
     missing = sorted(t for t in wanted if t not in sequences)
     if missing:
         raise ValueError(f"{len(missing)} target(s) have residue codes but no sequence in the sequence store "
                          f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database disagree")
+    if prof is not None:
+        prof.add("fetch", time.perf_counter() - t0)
     _round2(survivors, run, pool, init)
+    if prof is not None:
+        prof.round2_parts(survivors)
     for q in survivors:
         results[q.qid] = _hits(q, run, sequences)
 
 
 def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit):
+    prof = run.prof
+    if prof is not None:
+        t0 = time.perf_counter()
     workers = pool.requested_workers()
     total = sum(q.n * ((run.panel_residues if run.need_panel else 0) + int(q.cand_len.sum())) for q in batch)
     target = target_task_cells(total, workers, run.task_cells)
@@ -957,7 +1038,16 @@ def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
             table.append((qi, _CODES, k0, k1))
         run.candidate_pairs += k
     run.round1_tasks += len(tasks)
-    for tid, s_f, s_r, skipped in pool.run(_round1_task, _lpt(tasks, costs), init):
+    ordered = _lpt(tasks, costs)
+    if prof is not None:
+        t1 = time.perf_counter()
+        prof.add("plan_r1", t1 - t0)
+        prof.begin_round("round1", min(workers, len(tasks)))
+    for res in pool.run(_round1_task, ordered, init, profile=prof):
+        if prof is not None:
+            res = prof.received(res)
+            tc = time.perf_counter()
+        tid, s_f, s_r, skipped = res
         qi, source, k0, k1 = table[tid]
         q = batch[qi]
         if source == _PANEL:
@@ -967,7 +1057,13 @@ def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
                                  f"with a panel member exceeds max_pair_cells={init.max_pair_cells} cells")
         else:
             q.s_f[k0:k1], q.s_r[k0:k1], q.skipped[k0:k1] = s_f, s_r, skipped
+        if prof is not None:
+            prof.add("consume_r1", time.perf_counter() - tc)
     run.workers = max(run.workers, pool.workers)
+    if prof is not None:
+        wall = time.perf_counter() - t1
+        prof.add("round1", wall)
+        prof.end_round(wall, pool.workers or 1)
 
 
 def _statistics(q: _Query, run: _Run):
@@ -1000,6 +1096,9 @@ def _statistics(q: _Query, run: _Run):
 
 
 def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit):
+    prof = run.prof
+    if prof is not None:
+        t0 = time.perf_counter()
     workers = pool.requested_workers()
     total = sum(q.n * int(q.cand_len[q.surv].sum()) for q in batch)
     target = target_task_cells(total, workers, run.task_cells)
@@ -1013,7 +1112,16 @@ def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
             costs.append(q.n * int(pairs[:, 1].sum()))
             table.append((qi, k0, k1))
     run.round2_tasks += len(tasks)
-    for tid, scores, ends, path, path_off, distinct, skipped in pool.run(_round2_task, _lpt(tasks, costs), init):
+    ordered = _lpt(tasks, costs)
+    if prof is not None:
+        t1 = time.perf_counter()
+        prof.add("plan_r2", t1 - t0)
+        prof.begin_round("round2", min(workers, len(tasks)))
+    for res in pool.run(_round2_task, ordered, init, profile=prof):
+        if prof is not None:
+            res = prof.received(res)
+            tc = time.perf_counter()
+        tid, scores, ends, path, path_off, distinct, skipped = res
         qi, k0, k1 = table[tid]
         q = batch[qi]
         want = q.s_f[q.surv[k0:k1]]
@@ -1027,7 +1135,13 @@ def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
                 "raw score would not be the one behind the E-value")
         q.parts.append((k0, np.asarray(ends), np.asarray(path), np.asarray(path_off, np.int64),
                         np.asarray(distinct, np.int64)))
+        if prof is not None:
+            prof.add("consume_r2", time.perf_counter() - tc)
     run.workers = max(run.workers, pool.workers)
+    if prof is not None:
+        wall = time.perf_counter() - t1
+        prof.add("round2", wall)
+        prof.end_round(wall, pool.workers or 1)
 
 
 def _assemble(q: _Query):
@@ -1050,7 +1164,13 @@ def _assemble(q: _Query):
 def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
     """Metrics, ecal, filters and S14 order of one query's survivors."""
     needs, d = run.needs, run.domain
+    prof = run.prof
+    if prof is not None:
+        t0 = time.perf_counter()
     ends, path, path_off, distinct = _assemble(q)
+    if prof is not None:
+        t1 = time.perf_counter()
+        prof.add("hits_assemble", t1 - t0)
     surv = q.surv
     q_bytes = np.frombuffer(sanitized_bytes(q.seq), np.uint8)
     t_seqs = [sequences[q.cand_ids[k]] for k in surv.tolist()]
@@ -1071,6 +1191,9 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
         qcov = cols["q_aligned"] / q.n
         tcov = np.where(t_len > 0, cols["t_aligned"] / np.maximum(t_len, 1), 0.0)
     kept = (aln_len > 0) & (identity >= run.min_id) & (np.minimum(qcov, tcov) >= run.min_cov)
+    if prof is not None:
+        t2 = time.perf_counter()
+        prof.add("hits_metrics", t2 - t1)
 
     q_inside = q.inside
     hits: List[Hit] = []
@@ -1120,7 +1243,12 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
             t_seq=t_arr.tobytes().decode("ascii") if needs.tseq else None,
             score_rev=float(q.s_r[k]), q90=q90, score_adj=s_prime, log_evalue=lne, ecal=bool(ecal))
         hits.append(Hit(subject_id=q.cand_ids[k], emb_score=q.cand_emb[k], metrics=metrics))
+    if prof is not None:
+        t3 = time.perf_counter()
+        prof.add("hits_objects", t3 - t2)
     # S14: S = fp64(S_f) - fp64(S_r) descending (score and score_rev hold the exact float32 values), then the
     # embedding score descending, then the target id ascending
     hits.sort(key=lambda h: (-(h.metrics.score - h.metrics.score_rev), -h.emb_score, h.subject_id))
+    if prof is not None:
+        prof.add("hits_sort", time.perf_counter() - t3)
     return hits

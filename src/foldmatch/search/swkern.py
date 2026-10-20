@@ -525,12 +525,20 @@ def _prepare(qp, codes, offsets, lengths, max_pair_cells):
     return qp, codes, starts, lens, skipped
 
 
+def _add_time(timings: Dict[str, float], name: str, seconds: float) -> None:
+    timings[name] = timings.get(name, 0.0) + seconds
+
+
 def score_fwd_rev(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, *, lengths=None,
                   block_floats: int = DEFAULT_BLOCK_FLOATS, max_pair_cells: int = DEFAULT_MAX_PAIR_CELLS,
                   reference_sim: bool = False, kernel: Optional[Kernel] = None,
-                  workspace: Optional[Workspace] = None) -> ScoreResult:
+                  workspace: Optional[Workspace] = None, timings: Optional[Dict[str, float]] = None) -> ScoreResult:
     """Round 1 (S9): S_f and S_r of one query against K candidates, score only. One similarity per pair (its own
-    GEMM); S_r runs on the row-reversed view of it. See :func:`plan_blocks` for ``block_floats``."""
+    GEMM); S_r runs on the row-reversed view of it. See :func:`plan_blocks` for ``block_floats``.
+
+    ``timings`` (profiling only): a dict that receives the seconds spent in the similarity (``sim``: decode +
+    per-pair GEMMs) and in the kernel call (``kernel``: rowcol z + DP of S_f and S_r), and the ``blocks`` count; the
+    results are the same with or without it."""
     k = kernel or load()
     ws = workspace or default_workspace()
     qp, codes, starts, lens, skipped = _prepare(qp, codes, offsets, lengths, max_pair_cells)
@@ -538,11 +546,19 @@ def score_fwd_rev(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, 
     s_f = np.full(K, np.nan, np.float32)
     s_r = np.full(K, np.nan, np.float32)
     for k0, k1 in plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats):
+        if timings is not None:
+            t0 = time.perf_counter()
         b = _Block(k, ws, qp, codes, starts, lens, k0, k1, reference_sim)
         kw = ws.kernel_floats(k.ws_floats(n, int(b.m.max())))
+        if timings is not None:
+            t1 = time.perf_counter()
+            _add_time(timings, "sim", t1 - t0)
         st = k.lib.fmsw_score_fwd_rev(b.sim.ctypes.data, n, b.pair_off.ctypes.data, b.m.ctypes.data, b.K,
                                       params.offset, params.gap_open, params.gap_extend,
                                       s_f[k0:].ctypes.data, s_r[k0:].ctypes.data, kw.ctypes.data, kw.size)
+        if timings is not None:
+            _add_time(timings, "kernel", time.perf_counter() - t1)
+            _add_time(timings, "blocks", 1)
         _check_status(st, "fmsw_score_fwd_rev")
     return ScoreResult(s_f, s_r, skipped)
 
@@ -550,10 +566,13 @@ def score_fwd_rev(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, 
 def align(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, *, lengths=None, traceback: bool = True,
           block_floats: int = DEFAULT_BLOCK_FLOATS, max_pair_cells: int = DEFAULT_MAX_PAIR_CELLS,
           reference_sim: bool = False, kernel: Optional[Kernel] = None,
-          workspace: Optional[Workspace] = None) -> AlignResult:
+          workspace: Optional[Workspace] = None, timings: Optional[Dict[str, float]] = None) -> AlignResult:
     """Round 2: forward DP of one query against K candidates; with ``traceback`` also the paths (forward order,
     exactly as the kernel wrote them; never reversed here). The scores equal :func:`score_fwd_rev`'s S_f bit for
-    bit (same per-pair GEMM, same DP)."""
+    bit (same per-pair GEMM, same DP).
+
+    ``timings`` (profiling only): as for :func:`score_fwd_rev` (``kernel`` is rowcol z + DP + traceback here), plus
+    ``paths``, the seconds spent gathering the paths of the blocks; the results are the same with or without it."""
     k = kernel or load()
     ws = workspace or default_workspace()
     qp, codes, starts, lens, skipped = _prepare(qp, codes, offsets, lengths, max_pair_cells)
@@ -563,7 +582,12 @@ def align(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, *, lengt
     counts = np.zeros(K, np.int64)
     parts: List[Tuple[int, np.ndarray, np.ndarray]] = []
     for k0, k1 in plan_blocks(n, lens.tolist(), skipped.tolist(), block_floats):
+        if timings is not None:
+            t0 = time.perf_counter()
         b = _Block(k, ws, qp, codes, starts, lens, k0, k1, reference_sim)
+        if timings is not None:
+            t1 = time.perf_counter()
+            _add_time(timings, "sim", t1 - t0)
         mmax = int(b.m.max())
         kw = ws.kernel_floats(k.ws_floats(n, mmax))
         if traceback:
@@ -574,20 +598,29 @@ def align(qp: np.ndarray, codes: np.ndarray, offsets, params: DPParams, *, lengt
             fl_ptr, fl_len, p_ptr, po_ptr = fl.ctypes.data, fl.size, pbuf.ctypes.data, poff.ctypes.data
         else:
             cap, fl_ptr, fl_len, p_ptr, po_ptr = 0, None, 0, None, None
+        if timings is not None:
+            t2 = time.perf_counter()
         st = k.lib.fmsw_align(b.sim.ctypes.data, n, b.pair_off.ctypes.data, b.m.ctypes.data, b.K,
                               params.offset, params.gap_open, params.gap_extend, int(bool(traceback)),
                               scores[k0:].ctypes.data, ends[k0:].ctypes.data, p_ptr, cap, po_ptr,
                               kw.ctypes.data, kw.size, fl_ptr, fl_len)
+        if timings is not None:
+            _add_time(timings, "kernel", time.perf_counter() - t2)
+            _add_time(timings, "blocks", 1)
         _check_status(st, "fmsw_align")
         if traceback:
             counts[k0:k1] = np.diff(poff)
             parts.append((k0, pbuf[:2 * int(poff[-1])].reshape(-1, 2), poff))
+    if timings is not None:
+        t3 = time.perf_counter()
     path_off = np.zeros(K + 1, np.int64)
     np.cumsum(counts, out=path_off[1:])
     if parts:
         path = np.concatenate([p for _, p, _ in parts]) if len(parts) > 1 else parts[0][1].copy()
     else:
         path = np.zeros((0, 2), np.int32)
+    if timings is not None:
+        _add_time(timings, "paths", time.perf_counter() - t3)
     return AlignResult(scores, ends, path, path_off, skipped)
 
 

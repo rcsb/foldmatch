@@ -37,6 +37,7 @@ from foldmatch.search import alignment, output, swkern
 from foldmatch.search import code_statistics as cs
 from foldmatch.search import code_alignment as ca
 from foldmatch.search import scoring_system as ss
+from foldmatch.search import stage2_profile
 from foldmatch.search.query_encodings import QueryEncodingEntry, QueryEncodingIndex
 from foldmatch.search.residue_code_store import ResidueCodeStore, ResidueCodeStoreError
 from foldmatch.search.sequence_store import SequenceStore
@@ -408,6 +409,126 @@ class InvarianceTest(_WorldCase):
                                query_index=other)
             self.assertEqual(pool.starts, 2)
         self.assertEqual(_signature(a), _signature(b))
+
+
+# =====================================================================================================================
+# profiling mode (P7.1)
+# =====================================================================================================================
+@pytest.mark.usefixtures("fmsw_libs")
+class ProfileTest(_WorldCase):
+    """FOLDMATCH_STAGE2_PROFILE: the time breakdown is recorded, every task is accounted for, and the hits are the same
+    bit for bit as without it (in-process and with a spawn pool)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.prefilter = _f1_mixed([4, 7, 9, 48, 10], per_query=12)
+        with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: ""}):
+            cls.ref = cls.f1_world().align(cls.prefilter, max_evalue=10.0)
+
+    def _profiled(self, pool=None, **kwargs):
+        with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: "1"}):
+            return self.f1_world().align(self.prefilter, pool, max_evalue=10.0, **kwargs)
+
+    def _check_accounting(self, stats):
+        p = stats["profile"]
+        w = p["workers"]
+        self.assertEqual(w["panel"]["tasks"] + w["candidates"]["tasks"], stats["round1_tasks"])
+        self.assertEqual(w["round2"]["tasks"], stats["round2_tasks"])
+        self.assertEqual(w["panel"]["pairs"], stats["panel_pairs"])
+        self.assertEqual(w["candidates"]["pairs"], stats["candidate_pairs"])
+        self.assertEqual(w["round2"]["pairs"], stats["survivors"])
+        self.assertEqual(len(p["tasks"]), stats["round1_tasks"] + stats["round2_tasks"])
+        for kind in ("panel", "candidates", "round2"):
+            k = w[kind]
+            parts = sum(k[c] for c in ("prep", "sim", "kernel", "paths", "distinct", "driver", "other"))
+            self.assertAlmostEqual(parts, k["seconds"], delta=1e-9 + 1e-9 * k["seconds"], msg=kind)
+            self.assertGreater(k["sim"], 0.0, kind)
+            self.assertGreater(k["kernel"], 0.0, kind)
+        self.assertGreater(w["round2"]["distinct"], 0.0)
+        for phase in ("setup", "collect", "lookup", "plan_r1", "round1", "consume_r1", "statistics", "fetch",
+                      "plan_r2", "round2", "consume_r2", "hits_assemble", "hits_metrics", "hits_objects",
+                      "hits_sort", "finish", "total"):
+            self.assertIn(phase, p["parent"])
+        self.assertGreater(p["memory"]["round2_parts_peak_bytes"], 0)
+        self.assertEqual(p["memory"]["round2_parts_peak_survivors"], stats["survivors"])
+        self.assertEqual([r["name"] for r in p["ipc"]["rounds"]], ["round1", "round2"])
+        return p
+
+    def test_the_mode_is_off_unless_asked_for(self):
+        self.assertNotIn("profile", self.ref[1])
+        for value in ("", "0", "false", "No", " off "):
+            with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: value}):
+                self.assertFalse(stage2_profile.profiling_enabled(), value)
+        for value in ("1", "yes", "true"):
+            with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: value}):
+                self.assertTrue(stage2_profile.profiling_enabled(), value)
+
+    def test_in_process_profile_keeps_the_hits_and_accounts_for_every_task(self):
+        res, stats = self._profiled(task_cells=1 << 14)
+        self.assertEqual(_signature(res), _signature(self.ref[0]))
+        p = self._check_accounting(stats)
+        self.assertEqual(p["pool"]["executors"], 0)
+        self.assertGreater(p["memory"]["in_process_rss_max_bytes"], 0)
+        self.assertEqual(p["ipc"]["task_bytes"], 0)                     # nothing is pickled in-process
+
+    def test_pool_profile_keeps_the_hits_and_records_the_worker_start_up(self):
+        with ca.CodeAlignmentPool(2) as pool:
+            res, stats = self._profiled(pool, task_cells=1 << 14)
+            again, stats2 = self._profiled(pool, task_cells=1 << 14)
+            self.assertEqual(pool.starts, 1)
+        self.assertEqual(_signature(res), _signature(self.ref[0]))
+        self.assertEqual(_signature(again), _signature(self.ref[0]))
+        p = self._check_accounting(stats)
+        self.assertEqual((p["pool"]["executors"], p["pool"]["workers"]), (1, 2))
+        starts = p["pool"]["worker_starts"]
+        self.assertTrue(1 <= len(starts) <= 2)
+        for s in starts:
+            self.assertGreater(s["init_seconds"], 0.0)
+            self.assertGreaterEqual(s["ready_after_submit"], 0.0)
+        self.assertGreater(p["ipc"]["task_bytes"], 0)
+        self.assertGreater(p["ipc"]["result_bytes"], 0)
+        self.assertEqual(p["ipc"]["submit_to_start"]["n"], stats["round1_tasks"] + stats["round2_tasks"])
+        self.assertGreater(p["memory"]["worker_rss_max_bytes"], 0)
+        for r in p["ipc"]["rounds"]:
+            self.assertGreater(r["utilisation"], 0.0)
+            self.assertLessEqual(r["utilisation"], 1.0 + 1e-6)
+        # each worker process reports its start-up once (with its first task), and the warm pool starts nothing
+        pids = [s["pid"] for s in starts + stats2["profile"]["pool"]["worker_starts"]]
+        self.assertEqual(len(pids), len(set(pids)))
+        self.assertLessEqual(len(pids), 2)
+        self.assertEqual(stats2["profile"]["pool"]["executors"], 0)
+
+    def test_switching_the_mode_restarts_the_pool_and_the_hits_stay_the_same(self):
+        with ca.CodeAlignmentPool(2) as pool:
+            on, _ = self._profiled(pool, task_cells=1 << 14)
+            with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: ""}):
+                off, stats = self.f1_world().align(self.prefilter, pool, max_evalue=10.0, task_cells=1 << 14)
+            self.assertEqual(pool.starts, 2)
+        self.assertNotIn("profile", stats)
+        self.assertEqual(_signature(on), _signature(off))
+
+    def test_kernel_wrapper_timings_do_not_change_the_results(self):
+        f1 = _f1()
+        q16 = f1[3]["q16"]
+        codes = np.concatenate([p["codes"] for p in f1[:20]])
+        offsets = np.concatenate([[0], np.cumsum([len(p["codes"]) for p in f1[:20]])])
+        qp = swkern.query_prep(q16)
+        a = swkern.score_fwd_rev(qp, codes, offsets, swkern.SETTING_D, block_floats=1 << 13)
+        t1 = {}
+        b = swkern.score_fwd_rev(qp, codes, offsets, swkern.SETTING_D, block_floats=1 << 13, timings=t1)
+        for x, y in ((a.s_fwd, b.s_fwd), (a.s_rev, b.s_rev)):
+            np.testing.assert_array_equal(x.view(np.uint32), y.view(np.uint32))
+        self.assertEqual(set(t1), {"sim", "kernel", "blocks"})
+        self.assertGreater(t1["blocks"], 1)
+        c = swkern.align(qp, codes, offsets, swkern.SETTING_D, block_floats=1 << 13)
+        t2 = {}
+        d = swkern.align(qp, codes, offsets, swkern.SETTING_D, block_floats=1 << 13, timings=t2)
+        np.testing.assert_array_equal(c.scores.view(np.uint32), d.scores.view(np.uint32))
+        for x, y in ((c.ends, d.ends), (c.path, d.path), (c.path_off, d.path_off)):
+            np.testing.assert_array_equal(x, y)
+        self.assertEqual(set(t2), {"sim", "kernel", "blocks", "paths"})
+        self.assertEqual(t2["blocks"], t1["blocks"])
 
 
 # =====================================================================================================================
