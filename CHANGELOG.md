@@ -102,10 +102,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `--min-coverage` default to 0 and `--max-evalue` to `1e-3`, as under
   BLOSUM62 (explicit values are honoured; the help gives both scorings'
   defaults), and the BLOSUM62 options `--gap-open`, `--gap-extend`,
-  `--comp-bias-corr`, `--significance-mode`, as well as `--no-seq-identity`,
-  are refused (exit status 2). Before ESM3 is loaded, and on every rank
-  alike, the query is refused with a one-line message (exit status 1) when
-  its FASTA has duplicate ids, `<` or `>` in a sequence, or non-ASCII
+  `--comp-bias-corr`, `--comp-bias-corr-scale`, `--significance-mode`,
+  `--significance-sample-size`, as well as `--no-seq-identity`, are refused
+  (exit status 2), whatever their value. Before ESM3 is loaded, and on every
+  rank alike, the query is refused with a one-line message (exit status 1)
+  when its FASTA has duplicate ids, `<` or `>` in a sequence, or non-ASCII
   characters; when the database was built without `--residue-codes`, or
   its codes are a partial build; when the codes were built for a scoring
   system this FoldMatch does not know (a database from a newer FoldMatch)
@@ -119,11 +120,17 @@ While the major version is `0`, breaking changes are released in a minor bump.
   non-standard residues and the target at least 2 distinct codes; other
   hits are still reported, with `ecal=0`, and one warning per run gives the
   counts. A query of one residue, or whose encoding rows are all identical,
-  reports no hits. Stage 2 runs in a pool of worker processes
-  (`--align-workers`, all CPUs by default) that load neither torch nor
-  ESM3, after ESM3 and the aggregator have been freed; its output does not
-  depend on the number of workers; a worker that is killed (for example by
-  the out-of-memory killer) stops the run with an error. The query
+  reports no hits. Stage 2 runs in a pool of worker processes that load
+  neither torch nor ESM3, after ESM3 and the aggregator have been freed:
+  `--align-workers N` uses N workers; by default the pool has up to one
+  worker per physical core (SMT siblings count once) and starts only as many
+  as the work needs, so a small query does not start a worker on every CPU
+  (a later batch of queries with more work grows the pool). Its output does
+  not depend on the number of workers. A worker needs about 5 bytes per
+  residue pair of the pair it aligns (up to 1.3 GiB for the longest pairs it
+  aligns, 2^28 residue pairs; longer ones are skipped and counted) and keeps
+  at most 128 MiB of it between tasks; a worker that is killed (for example
+  by the out-of-memory killer) stops the run with an error. The query
   encodings are written next to the query's embedding shards in
   `--tmp-embedding-folder` and deleted with them at the end of the run, also
   when it fails (a process whose ESM3 pass fails deletes the shard it wrote).
@@ -137,6 +144,22 @@ While the major version is `0`, breaking changes are released in a minor bump.
   negative bit score). The four fields render empty under BLOSUM62 and in
   `query db`. BLOSUM62 columns, `bits` included, and the default columns are
   unchanged.
+- **esm-codes Stage 2 speed** (measured on one AMD EPYC 7763 node, OpenBLAS,
+  one BLAS thread per worker; the output does not depend on any of the
+  settings below). On one core, scoring a 300-residue query against 1,000
+  candidates and tracing back the hits that pass takes 0.25 s at
+  `--max-evalue 1e-3` (none passed in this benchmark) and 0.49 s at
+  `--max-evalue inf` (all 1,000 traced back); BLOSUM62's Stage 2 takes
+  2.65 s on the same targets. The per-query panel pass that calibrates the
+  E-value adds 0.11 s at 71 residues, 0.38 s at 300 and 1.17 s at 966. With
+  100 candidates a query takes 0.15 / 0.40 / 1.29 s at 100 / 300 / 1,000
+  residues on one core, 1.5-1.6x the BLOSUM62 time (codes are faster from
+  about 160 candidates on), and 0.03 / 0.07 / 0.20 s on 8 workers. On 64
+  workers, 640 queries x 1,000 candidates run at 128,000-154,000 candidate
+  pairs per second at `1e-3` and 58,000-67,000 at `inf` (the lower ends
+  with the workers pinned to 65 cores, the higher with the default
+  affinity). A worker's memory stays under 70 MiB at 1,000 residues x 1,000
+  candidates.
 - **`fm-search download-models`**: the same command, with the same `--system`
   option and help, as `fm-embedding download-models` and `inference
   download-models`, since `fm-search` now uses the scoring bundle too.
@@ -203,6 +226,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   or the search, and check the sequence stores it will read: `--seq-identity`
   without a store, an incomplete store and an E-value filter over an empty
   database are reported there.
+- **An unknown `--format-output` field is refused before the ESM3 pass**
+  by `fm-search query sequences --scoring blosum62` too, as under esm-codes:
+  whenever Stage 2 runs, an empty list or an unknown field is now a usage
+  error (exit status 2) reported before the queries are embedded. Before, the
+  queries were embedded first and the command then failed with exit status 1
+  (and the Python function `query_database_from_fasta` raised `ValueError`;
+  it now raises `typer.BadParameter`). An embedding-only search does not use
+  the option and still ignores it; `fm-search query db` is unchanged.
 - **An interrupted sequence-store build is detected.** A `.sequences` file
   whose build stopped part way (it now records its totals last) is refused
   with an "incomplete" error instead of being read as the whole database:
@@ -273,6 +304,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   an error instead; CI, the release wheels and the Docker image do. In a
   source checkout, rebuild the kernel after editing its C source with `python
   -m foldmatch._native.build`; a library built from other source is refused.
+- **`threadpoolctl` is a declared dependency** (`threadpoolctl==3.6.0`,
+  exactly pinned like the others). The esm-codes Stage 2 uses it to limit to
+  one thread the BLAS of its worker processes and of an in-process run, which
+  keeps reruns bit-identical; it already came with `esm` (through
+  scikit-learn), and the code still works without it. threadpoolctl cannot
+  limit Apple Accelerate (numpy's BLAS on macOS): an in-process run there
+  keeps Accelerate's own thread count and says so once in the log, while the
+  worker processes are limited through `VECLIB_MAXIMUM_THREADS=1` either way.
 - **`download-models` also fetches the esm-codes scoring bundle.** `fm-embedding
   download-models` and `inference download-models` now download, besides ESM3
   and the aggregator, the bundle of every registered esm-codes scoring system
@@ -340,6 +379,22 @@ While the major version is `0`, breaking changes are released in a minor bump.
 - **A FASTA header without an id** (a line holding only `>`) is now refused
   before the ESM3 pass with a one-line error naming the file and position;
   it used to stop the build with an `IndexError` traceback.
+- **A multi-rank `fm-search query sequences` writes the queries in input
+  order.** With more than one rank (`--devices 2`, several GPUs, or the tasks
+  of a multi-task `srun` step), rank 0 read the query embeddings rank by rank,
+  so the output file listed rank 0's queries first, then rank 1's, and so on,
+  under `--scoring blosum62` (with or without Stage 2) and `--scoring
+  esm-codes` alike. The queries are now written in the order of the FASTA
+  file, so a multi-rank run writes the file a 1-rank run writes from the same
+  embeddings; each query's hits were already the same. A 1-rank run's output
+  is unchanged. A repeated query id (accepted, with a warning, only under
+  BLOSUM62) is reported once, at its first record, with the hits of its last
+  record, as on one rank; on several ranks it could take its embedding scores
+  and candidates from one record and its alignments from the other. Stage 2
+  now also aligns the record that Stage 1 searched when the last record of a
+  repeated id is shorter than `--min-res-n`: before, that short record's
+  sequence was aligned, even on one rank (the one case in which a 1-rank
+  run's output changes).
 
 ## [0.8.0] - 2026-07-21
 
