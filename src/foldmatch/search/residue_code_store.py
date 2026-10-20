@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -690,25 +690,50 @@ class ResidueCodeStore:
         unique = list(dict.fromkeys(ids))
         out: Dict[str, CodeEntry] = {}
         if unique:
-            with _sqlite_errors(self.idx_path):
-                conn = _connect_ro(self.idx_path)
-                try:
-                    for start in range(0, len(unique), _SQLITE_VAR_CHUNK):
-                        chunk = unique[start:start + _SQLITE_VAR_CHUNK]
-                        placeholders = ",".join("?" * len(chunk))
-                        for entry_id, offset, length, sha1 in conn.execute(
-                                f"SELECT id, offset, length, seq_sha1 FROM entries WHERE id IN ({placeholders})",
-                                chunk):
-                            out[entry_id] = CodeEntry(offset, length, sha1)
-                finally:
-                    conn.close()
-        missing = [i for i in unique if i not in out]
+            for entry_id, offset, length, sha1 in self._select(unique, "offset, length, seq_sha1"):
+                out[entry_id] = CodeEntry(offset, length, sha1)
+        self._refuse_missing(unique, out)
+        return out
+
+    def lookup_rows(self, ids: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """``(offsets, lengths)``, int64 arrays aligned with ``ids`` (repeats allowed): the code rows of each id, as
+        :meth:`lookup` gives them, without building an entry per id (Stage 2 looks up a whole batch of candidates
+        at once). Missing ids raise as in :meth:`lookup`."""
+        self._require_complete()
+        ids = ids if isinstance(ids, list) else list(ids)
+        unique = list(dict.fromkeys(ids))
+        rows: Dict[str, Tuple[int, int]] = {}
+        if unique:
+            for entry_id, offset, length in self._select(unique, "offset, length"):
+                rows[entry_id] = (offset, length)
+        self._refuse_missing(unique, rows)
+        if not ids:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        table = np.array([rows[i] for i in unique], np.int64).reshape(-1, 2)
+        position = dict(zip(unique, range(len(unique))))
+        picks = np.fromiter((position[i] for i in ids), np.int64, len(ids))
+        found = table[picks]
+        return np.ascontiguousarray(found[:, 0]), np.ascontiguousarray(found[:, 1])
+
+    def _select(self, unique: List[str], columns: str) -> Iterator[tuple]:
+        """``(id, *columns)`` rows of the ids, queried in ``IN`` chunks of 900 on one read-only connection."""
+        with _sqlite_errors(self.idx_path):
+            conn = _connect_ro(self.idx_path)
+            try:
+                for start in range(0, len(unique), _SQLITE_VAR_CHUNK):
+                    chunk = unique[start:start + _SQLITE_VAR_CHUNK]
+                    placeholders = ",".join("?" * len(chunk))
+                    yield from conn.execute(f"SELECT id, {columns} FROM entries WHERE id IN ({placeholders})", chunk)
+            finally:
+                conn.close()
+
+    def _refuse_missing(self, unique: List[str], found: Mapping[str, object]) -> None:
+        missing = [i for i in unique if i not in found]
         if missing:
             raise ResidueCodeStoreError(
                 f"{len(missing)} id(s) have no residue codes in {self.idx_path} (first: "
                 f"{', '.join(map(str, missing[:_EXAMPLE_IDS]))}): the code store and the database disagree. "
                 f"{_REBUILD_HINT}.")
-        return out
 
     def open_memmap(self) -> np.ndarray:
         """The codes, ``uint8 [N_res, code_bytes]``, memory-mapped read-only. An empty store gives an empty array

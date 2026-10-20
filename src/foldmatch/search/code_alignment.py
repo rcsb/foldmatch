@@ -923,7 +923,7 @@ def align_candidates_esm_codes(
             and ``seq_sha1`` match ``query_sequences``; queries are processed in memmap order.
         prefilter_results: Stage-1 output ``{query_id: ([target_ids], [embedding scores])}``.
         code_store: the database's :class:`~foldmatch.search.residue_code_store.ResidueCodeStore` (complete;
-            ``lookup()`` by id, its ``.bin`` mapped by the workers).
+            ``lookup_rows()`` by id, its ``.bin`` mapped by the workers).
         fetch_subject_sequences: ``ids -> {id: sequence}`` (``SequenceStore.fetch``), called once per query with
             survivors, for its survivors only; every survivor's sequence must be there, with as many residues as its
             codes.
@@ -1305,10 +1305,12 @@ class _Dataflow:
         prof = self.run.prof
         if prof is not None:
             t0 = time.perf_counter()
-        entries = self.code_store.lookup(tid for q in batch for tid in q.cand_ids)
+        offsets, lengths = self.code_store.lookup_rows([tid for q in batch for tid in q.cand_ids])
+        start = 0
         for q in batch:
-            q.cand_off = np.array([entries[t].offset for t in q.cand_ids], np.int64)
-            q.cand_len = np.array([entries[t].length for t in q.cand_ids], np.int64)
+            end = start + len(q.cand_ids)
+            q.cand_off, q.cand_len = offsets[start:end], lengths[start:end]
+            start = end
         if prof is not None:
             prof.add("lookup", time.perf_counter() - t0)
         return batch

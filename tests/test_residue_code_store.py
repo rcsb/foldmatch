@@ -313,6 +313,25 @@ class LookupTest(_StoreCase):
             np.testing.assert_array_equal(memmap[entry.offset:entry.offset + entry.length], codes)
             offset += len(codes)
 
+    def test_lookup_rows_equal_lookup(self):
+        """lookup_rows: the offsets and lengths lookup gives, aligned with the ids (repeats, any order, more than
+        900 ids), as int64 arrays; empty in, empty out; a missing id raises as lookup does."""
+        records = _records(1200, random.Random(8), min_len=1, max_len=5)
+        store, _, _ = self._build(records, _entries(records), size=400)
+        ids = [r[0] for r in records]
+        rng = random.Random(9)
+        picks = [rng.choice(ids) for _ in range(3000)] + list(reversed(ids))
+        found = store.lookup(picks)
+        off, ln = store.lookup_rows(picks)
+        self.assertEqual((off.dtype, ln.dtype, off.shape, ln.shape), (np.int64, np.int64, (len(picks),), (len(picks),)))
+        self.assertEqual(off.tolist(), [found[i].offset for i in picks])
+        self.assertEqual(ln.tolist(), [found[i].length for i in picks])
+        off0, ln0 = store.lookup_rows([])
+        self.assertEqual((off0.shape, ln0.shape), ((0,), (0,)))
+        with self.assertRaises(ResidueCodeStoreError) as ctx:
+            store.lookup_rows([ids[0], "nope", ids[1], "nope"])
+        self.assertIn("1 id(s) have no residue codes", str(ctx.exception))
+
     def test_missing_id_raises(self):
         records = _records(5, random.Random(6))
         store, _, _ = self._build(records)
