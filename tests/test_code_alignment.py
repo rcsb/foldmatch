@@ -1147,6 +1147,8 @@ class PoolAndWorkerTest(_WorldCase):
             ca._init_worker(bad, raise_errors=True)
         ca._reset_worker_state()
 
+    _mixed = _f1_mixed(range(0, 50, 5), per_query=6)
+
     def test_pool_arguments(self):
         self.assertTrue(ca.CodeAlignmentPool(0).serial)
         self.assertTrue(ca.CodeAlignmentPool(1).serial)
@@ -1247,7 +1249,62 @@ class PoolAndWorkerTest(_WorldCase):
             self.assertEqual(pool.starts, 0 if ca._blas_limit_available() else 1)
         with mock.patch.object(ca, "_blas_limit_available", return_value=False), ca.CodeAlignmentPool(4) as pool:
             got, st = world.align(pre, pool, max_evalue=None, panel_policy="never")
-            self.assertEqual((pool.starts, pool.workers, st["workers"]), (1, 1, 1))
+            self.assertEqual((pool.starts, pool.processes, st["workers"]), (1, 1, 1))
+            self.assertEqual(pool.workers, 4)                  # the pool's size; one task started one worker
+        self.assertEqual(_signature(ref), _signature(got))
+
+    def test_a_small_first_batch_does_not_cap_the_pool(self):
+        """N workers: a first batch of 2 tasks starts 2 processes, a later batch of many tasks the rest of the N,
+        in the same pool (P7.1 found a warm-up call capping a persistent pool at its first batch's tasks)."""
+        world = self.f1_world()
+        f1 = _f1()
+        small = {f1[0]["qid"]: ([f1[1]["tid"], f1[2]["tid"]], [0.5, 0.4])}
+        with ca.CodeAlignmentPool(3) as pool:
+            _, st = world.align(small, pool, max_evalue=None, panel_policy="never", task_cells=1)
+            self.assertEqual((st["round1_tasks"], pool.starts, pool.workers, pool.processes), (2, 1, 3, 2))
+            got, st = world.align(self.__class__._mixed, pool, max_evalue=None, panel_policy="never",
+                                  task_cells=1 << 14)
+            self.assertEqual((pool.starts, pool.workers, pool.processes, st["workers"]), (1, 3, 3, 3))
+        ref, _ = world.align(self.__class__._mixed, None, max_evalue=None, panel_policy="never")
+        self.assertEqual(_signature(ref), _signature(got))
+
+    def test_the_default_pool_starts_workers_by_the_work(self):
+        """num_workers=None: one worker per min_worker_cells cells of the batch (at most the budget); a batch with
+        less work runs in-process; a later, larger batch restarts the pool with more workers; the bits stay the
+        same."""
+        self.assertEqual(ca.CodeAlignmentPool(0).plan_workers(10 ** 12), 1)
+        self.assertEqual(ca.CodeAlignmentPool(5).plan_workers(1), 5)
+        p = ca.CodeAlignmentPool(None, min_worker_cells=100)
+        budget = p.requested_workers()
+        self.assertEqual(p.plan_workers(0), 1)
+        self.assertEqual(p.plan_workers(100), 1)
+        self.assertEqual(p.plan_workers(101), min(budget, 2))
+        self.assertEqual(p.plan_workers(10 ** 9), budget)
+        with self.assertRaises(ValueError):
+            ca.CodeAlignmentPool(None, min_worker_cells=0)
+        world = self.f1_world()
+        f1 = _f1()
+        one = {f1[0]["qid"]: ([f1[1]["tid"]], [0.5])}
+        cells = len(f1[0]["q16"]) * len(f1[1]["codes"])
+        mixed = self.__class__._mixed
+        mixed_cells = sum(len(next(x for x in f1 if x["qid"] == q)["q16"])
+                          * sum(len(next(x for x in f1 if x["tid"] == t)["codes"]) for t in tids)
+                          for q, (tids, _) in mixed.items())
+        ref, _ = world.align(mixed, None, max_evalue=None, panel_policy="never")
+        if not ca._blas_limit_available():
+            self.skipTest("in-process batches need threadpoolctl")
+        with ca.CodeAlignmentPool(None, min_worker_cells=cells) as pool:
+            _, st = world.align(one, pool, max_evalue=None, panel_policy="never")
+            self.assertEqual((pool.starts, st["workers"]), (0, 0))              # one worker's share: in-process
+            pool.min_worker_cells = -(-mixed_cells // 2)
+            want = min(budget, 2)
+            got, st = world.align(mixed, pool, max_evalue=None, panel_policy="never", task_cells=1 << 14)
+            self.assertEqual((pool.starts, pool.workers), (1 if want > 1 else 0, want if want > 1 else 0))
+            if budget >= 3:
+                pool.min_worker_cells = -(-mixed_cells // 3)
+                again, st = world.align(mixed, pool, max_evalue=None, panel_policy="never", task_cells=1 << 14)
+                self.assertEqual((pool.starts, pool.workers), (2, 3))           # grown: restarted with more
+                self.assertEqual(_signature(ref), _signature(again))
         self.assertEqual(_signature(ref), _signature(got))
 
     def test_serial_pool_releases_its_in_process_state(self):

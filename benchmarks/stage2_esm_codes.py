@@ -932,11 +932,11 @@ def node_mode(a) -> dict:
         for W in a.workers:
             out = res["results"][str(W)] = {}
             with ca.CodeAlignmentPool(W) as pool:
-                # the first call sizes the persistent pool (never more workers than its first batch's tasks):
-                # start it with the whole workload
+                # the first call starts the persistent pool (cold): the whole workload
                 _r, _s, cold = world.align(pf, pool, max_evalue=1e-3)
                 out["pool_start_call_s"] = cold
                 out["pool_workers"] = pool.workers
+                out["pool_processes"] = getattr(pool, "processes", None)
                 for name, kw in configs:
                     walls, st, sig = [], None, None
                     for _ in range(a.rounds):
@@ -990,7 +990,7 @@ def sweep_mode(a) -> dict:
         for W in a.workers:
             pool = ca.CodeAlignmentPool(max(W, 1))
             try:
-                world.align(pf, pool)          # sizes the persistent pool with the whole workload
+                world.align(pf, pool)          # starts the persistent pool with the whole workload
                 res.setdefault("pool_workers", {})[str(W)] = pool.workers
                 for e in a.block_exps:
                     walls, sig = [], None

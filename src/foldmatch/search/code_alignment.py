@@ -33,8 +33,10 @@ in-process, and an explicitly serial run (0 or 1 workers) needs ``*_NUM_THREADS=
 pool's bits.
 
 **Pool.** :class:`CodeAlignmentPool` is the persistent ``spawn`` pool of one run (a
-:class:`concurrent.futures.ProcessPoolExecutor`), started lazily at the first batch that has more than one task and
-reused for both rounds and every batch; ``None``, ``0`` or ``1`` runs the same task functions in-process. A worker
+:class:`concurrent.futures.ProcessPoolExecutor`), started lazily at the first batch that needs it and reused for both
+rounds and every batch; without a worker count it starts only as many workers as the batch's work justifies (one per
+:data:`MIN_WORKER_CELLS` similarity cells, up to every CPU); ``None``, ``0`` or ``1`` as the aligner's ``pool`` runs
+the same task functions in-process. A worker
 that ends without returning its task (killed, e.g. by the out-of-memory killer, or unable to start) stops the run
 with :class:`WorkerPoolError` instead of leaving it waiting. Spawn workers re-import the main module, so a script
 that runs this Stage 2 with a pool must guard its entry point with ``if __name__ == "__main__":`` (the ``fm-search``
@@ -73,6 +75,11 @@ PANEL_FIELDS = frozenset({"evalue", "bits", "q90", "rawadj"})
 DEFAULT_TASK_CELLS = 1 << 24
 TASK_CELLS_FLOOR = 1 << 20
 TASKS_PER_WORKER = 4
+#: A pool sized by default (``num_workers=None``) starts at most one worker per this many similarity cells of its
+#: first batch (about 40 ms of one EPYC core, against about 0.3 s to start a spawn worker), so a small query does not
+#: start a worker on every CPU; a later, larger batch grows it. 2^23 gives a 300-aa query with 100 candidates and the
+#: panel 14 workers.
+MIN_WORKER_CELLS = 1 << 23
 DEFAULT_QUERY_BATCH = 256
 _BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
                      "BLIS_NUM_THREADS")
@@ -433,10 +440,13 @@ class CodeAlignmentPool:
     ESM3 and the aggregator are freed) and started as its tasks are submitted, reused for both rounds and every
     batch, restarted only when the worker setup (database, query memmap, limits) changes.
 
-    ``num_workers``: ``None`` uses every CPU (the CPU affinity mask is widened first, as for BLOSUM62); ``0`` or ``1``
-    runs the task functions in-process; ``N > 1`` uses at most N workers (never more than the first batch's tasks).
-    A batch with a single task runs in-process while no pool is running, but only when BLAS can be limited to one
-    thread here (threadpoolctl); otherwise a pool of one worker is started, so the bits never depend on the batch.
+    ``num_workers``: ``None`` uses up to every CPU (the CPU affinity mask is widened first, as for BLOSUM62), but
+    starts only as many workers as the work justifies (one per ``min_worker_cells`` similarity cells of the batch,
+    :data:`MIN_WORKER_CELLS`; a later, larger batch restarts the pool with more); ``0`` or ``1`` runs the task
+    functions in-process; ``N > 1`` uses N workers, started as tasks are submitted (a small first batch starts fewer,
+    and later batches start the rest). While no pool is running, a batch with a single task, or (``None``) with less
+    work than one worker's share, runs in-process, but only when BLAS can be limited to one thread here
+    (threadpoolctl); otherwise a pool of one worker is started, so the bits never depend on the batch.
 
     A worker that ends without returning its task (killed, or unable to start) raises :class:`WorkerPoolError` in
     the parent instead of a wait that never ends; the pool is stopped and the next batch starts a new one. Spawn
@@ -444,7 +454,8 @@ class CodeAlignmentPool:
     Use it as a context manager, or call :meth:`close`.
     """
 
-    def __init__(self, num_workers: Optional[int] = None, *, start_method: str = "spawn"):
+    def __init__(self, num_workers: Optional[int] = None, *, start_method: str = "spawn",
+                 min_worker_cells: int = MIN_WORKER_CELLS):
         if num_workers is not None and (isinstance(num_workers, bool) or not isinstance(num_workers, int)
                                         or num_workers < 0):
             raise ValueError(f"num_workers must be None or an int >= 0, got {num_workers!r}")
@@ -452,11 +463,12 @@ class CodeAlignmentPool:
             raise ValueError(f"start method {start_method!r} is not available here ({mp.get_all_start_methods()})")
         self.num_workers = num_workers
         self.start_method = start_method
+        self.min_worker_cells = _positive_int("min_worker_cells", min_worker_cells)
         self._pool: Optional[ProcessPoolExecutor] = None
         self._init: Optional[_WorkerInit] = None
         self._requested: Optional[int] = None
         self._in_process: Optional[_WorkerInit] = None
-        self.workers = 0          # worker processes of the running pool, at most (0 = in-process or not started)
+        self.workers = 0          # worker processes the running pool may start (0 = in-process or not started)
         self.starts = 0           # process pools started so far
 
     def __enter__(self) -> "CodeAlignmentPool":
@@ -482,21 +494,42 @@ class CodeAlignmentPool:
             self._requested = max(1, _available_cpus() if self.num_workers is None else int(self.num_workers))
         return self._requested
 
-    def run(self, fn, tasks: list, init: _WorkerInit, profile: Optional[stage2_profile.Stage2Profile] = None
-            ) -> Iterator:
-        """The results of ``fn`` over ``tasks``, in completion order. ``profile`` (profiling mode) receives the
-        executor start-up and each task's submit time."""
+    def plan_workers(self, cells: int) -> int:
+        """The workers a batch of ``cells`` similarity cells is planned for (task sizes) and runs on: 1 when serial,
+        ``num_workers`` when given, else (``None``) one per ``min_worker_cells`` cells, at least the running pool's
+        workers and at most the budget (:meth:`requested_workers`)."""
+        budget = self.requested_workers()
+        if self.serial or self.num_workers is not None:
+            return budget
+        work = max(1, -(-max(int(cells), 0) // self.min_worker_cells))
+        return min(budget, max(work, self.workers))
+
+    @property
+    def processes(self) -> int:
+        """Worker processes the running pool has started so far (the executor starts them as tasks are
+        submitted)."""
+        return len(getattr(self._pool, "_processes", None) or {}) if self._pool is not None else 0
+
+    def run(self, fn, tasks: list, init: _WorkerInit, profile: Optional[stage2_profile.Stage2Profile] = None,
+            workers: Optional[int] = None) -> Iterator:
+        """The results of ``fn`` over ``tasks``, in completion order, on ``workers`` workers (default: the budget;
+        the aligner passes :meth:`plan_workers`). ``profile`` (profiling mode) receives the executor start-up and
+        each task's submit time."""
         if not tasks:
             return
         if self._pool is not None and self._init != init:
             logger.info("esm-codes Stage 2: the worker setup changed; restarting the worker pool")
             self.close()
+        want = self.requested_workers() if workers is None else max(1, min(int(workers), self.requested_workers()))
         if self._pool is None:
-            workers = min(self.requested_workers(), len(tasks))
-            if self.serial or (workers <= 1 and _blas_limit_available()):
+            if self.serial or (min(want, len(tasks)) <= 1 and _blas_limit_available()):
                 yield from self._run_here(fn, tasks, init)
                 return
-            self._start(init, max(1, workers), profile)
+            self._start(init, want, profile)
+        elif want > self.workers:
+            logger.info(f"esm-codes Stage 2: this batch needs {want} workers; restarting the pool of {self.workers}")
+            self.close()
+            self._start(init, want, profile)
         yield from self._run_in_pool(fn, tasks, profile)
 
     def _run_here(self, fn, tasks, init):
@@ -536,13 +569,15 @@ class CodeAlignmentPool:
     def _start(self, init: _WorkerInit, workers: int, profile=None):
         t0 = time.perf_counter()
         ctx = mp.get_context(self.start_method)
+        # max_workers is the pool's size for the rest of the run: the executor starts the workers as tasks are
+        # submitted, so a small first batch starts fewer and a larger batch later starts the rest
         self._pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_init_pool_worker,
                                          initargs=(init,))
         self._init, self.workers = init, workers
         self.starts += 1
         if profile is not None:
             profile.executor_created(time.perf_counter() - t0, workers)
-        logger.info(f"esm-codes Stage 2: a pool of {workers} {self.start_method} workers")
+        logger.info(f"esm-codes Stage 2: a pool of up to {workers} {self.start_method} workers")
 
     def close(self, terminate: bool = False) -> None:
         """Stop the workers (``terminate``: at once, without waiting for queued or running tasks) and release the
@@ -864,7 +899,6 @@ def align_candidates_esm_codes(
         pool.close()
         if prof is not None:
             prof.add("pool_close", time.perf_counter() - t_phase)
-    run.workers = max(run.workers, pool.workers)
     if prof is not None:
         t_phase = time.perf_counter()
     run.finish(results, time.perf_counter() - t_start, max_pair_cells, stats)
@@ -1059,8 +1093,8 @@ def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
     prof = run.prof
     if prof is not None:
         t0 = time.perf_counter()
-    workers = pool.requested_workers()
     total = sum(q.n * ((run.panel_residues if run.need_panel else 0) + int(q.cand_len.sum())) for q in batch)
+    workers = pool.plan_workers(total)
     target = target_task_cells(total, workers, run.task_cells)
     tasks, costs, table = [], [], []
     panel_chunks: Dict[int, List[Tuple[int, int]]] = {}
@@ -1094,7 +1128,7 @@ def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
         t1 = time.perf_counter()
         prof.add("plan_r1", t1 - t0)
         prof.begin_round("round1", min(workers, len(tasks)))
-    for res in pool.run(_round1_task, ordered, init, profile=prof):
+    for res in pool.run(_round1_task, ordered, init, profile=prof, workers=workers):
         if prof is not None:
             res = prof.received(res)
             tc = time.perf_counter()
@@ -1110,11 +1144,11 @@ def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
             q.s_f[k0:k1], q.s_r[k0:k1], q.skipped[k0:k1] = s_f, s_r, skipped
         if prof is not None:
             prof.add("consume_r1", time.perf_counter() - tc)
-    run.workers = max(run.workers, pool.workers)
+    run.workers = max(run.workers, pool.processes)
     if prof is not None:
         wall = time.perf_counter() - t1
         prof.add("round1", wall)
-        prof.end_round(wall, pool.workers or 1)
+        prof.end_round(wall, pool.processes or 1)
 
 
 def _statistics(q: _Query, run: _Run):
@@ -1150,8 +1184,8 @@ def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
     prof = run.prof
     if prof is not None:
         t0 = time.perf_counter()
-    workers = pool.requested_workers()
     total = sum(q.n * int(q.cand_len[q.surv].sum()) for q in batch)
+    workers = pool.plan_workers(total)
     target = target_task_cells(total, workers, run.task_cells)
     tasks, costs, table = [], [], []
     for qi, q in enumerate(batch):
@@ -1168,7 +1202,7 @@ def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
         t1 = time.perf_counter()
         prof.add("plan_r2", t1 - t0)
         prof.begin_round("round2", min(workers, len(tasks)))
-    for res in pool.run(_round2_task, ordered, init, profile=prof):
+    for res in pool.run(_round2_task, ordered, init, profile=prof, workers=workers):
         if prof is not None:
             res = prof.received(res)
             tc = time.perf_counter()
@@ -1188,11 +1222,11 @@ def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _Work
                         np.asarray(distinct, np.int64)))
         if prof is not None:
             prof.add("consume_r2", time.perf_counter() - tc)
-    run.workers = max(run.workers, pool.workers)
+    run.workers = max(run.workers, pool.processes)
     if prof is not None:
         wall = time.perf_counter() - t1
         prof.add("round2", wall)
-        prof.end_round(wall, pool.workers or 1)
+        prof.end_round(wall, pool.processes or 1)
 
 
 def _assemble(q: _Query):
