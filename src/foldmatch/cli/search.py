@@ -814,11 +814,11 @@ def query_database_from_fasta(
                  'identity, coverage) as well as the raw score, bits and E-value. '
                  'Default: off.' + _BLOSUM62_ONLY
         )] = None,
-        comp_bias_corr_scale: Annotated[float, typer.Option(
+        comp_bias_corr_scale: Annotated[Optional[float], typer.Option(
             min=0.0, max=1.0,
             help='Scale applied to the compositional bias correction when '
-                 '--comp-bias-corr is set (0-1).'
-        )] = 1.0,
+                 '--comp-bias-corr is set (0-1). Default: 1.0.' + _BLOSUM62_ONLY
+        )] = None,
         significance_mode: Annotated[Optional[SignificanceMode], typer.Option(
             help="Scale for the BitScore/Pvalue/Evalue columns. 'default' uses "
                  "calibrated statistics, but requires the default gap penalties "
@@ -826,11 +826,12 @@ def query_database_from_fasta(
                  "values are unreliable and comparable only within this tool. "
                  "Default: 'default'." + _BLOSUM62_ONLY
         )] = None,
-        significance_sample_size: Annotated[int, typer.Option(
+        significance_sample_size: Annotated[Optional[int], typer.Option(
             help="For --significance-mode sampled: number of random alignments "
                  "sampled to estimate lambda/K for the BitScore/Pvalue/Evalue "
-                 "columns. Larger is slower; ignored when mode is 'default'."
-        )] = 500,
+                 "columns. Larger is slower; ignored when mode is 'default'. "
+                 "Default: 500." + _BLOSUM62_ONLY
+        )] = None,
         align_workers: Annotated[Optional[int], typer.Option(
             help='Process-pool size for Stage-2 alignment. Defaults to all CPUs '
                  'on the node (widening any scheduler --cpu-bind pinning); set '
@@ -849,12 +850,12 @@ def query_database_from_fasta(
     """Search database using protein sequences from a FASTA file."""
 
     set_log_level(log_level)
-    _check_comp_bias_corr_scale(comp_bias_corr_scale)
     # The per-scoring defaults; under esm-codes the BLOSUM62-only options are refused (exit 2), before anything is read.
     stage2 = resolve_query_stage2_options(
         scoring, seq_identity=seq_identity, min_seq_identity=min_seq_identity, min_coverage=min_coverage,
         max_evalue=max_evalue, gap_open=gap_open, gap_extend=gap_extend, comp_bias_corr=comp_bias_corr,
-        significance_mode=significance_mode,
+        comp_bias_corr_scale=comp_bias_corr_scale, significance_mode=significance_mode,
+        significance_sample_size=significance_sample_size,
     )
     if stage2.scoring is ScoringChoice.esm_codes:
         _query_sequences_esm_codes(
@@ -867,7 +868,9 @@ def query_database_from_fasta(
         return
     min_seq_identity, min_coverage, max_evalue = stage2.min_seq_identity, stage2.min_coverage, stage2.max_evalue
     gap_open, gap_extend, comp_bias_corr = stage2.gap_open, stage2.gap_extend, stage2.comp_bias_corr
-    significance_mode = stage2.significance_mode
+    comp_bias_corr_scale, significance_mode = stage2.comp_bias_corr_scale, stage2.significance_mode
+    significance_sample_size = stage2.significance_sample_size
+    _check_comp_bias_corr_scale(comp_bias_corr_scale)
     preflight = _fasta_preflight(fasta_file, min_res_n)
     # Read-only, on every rank, before ESM3: whether Stage 2 runs, and whether
     # the subject's sequence store can serve it.
@@ -1673,13 +1676,15 @@ def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missin
 #: had before --scoring; esm-codes filters on the E-value only (D8).
 BLOSUM62_QUERY_DEFAULTS = MappingProxyType(dict(
     min_seq_identity=0.3, min_coverage=0.8, max_evalue=1e-3, gap_open=11, gap_extend=1, comp_bias_corr=False,
-    significance_mode=SignificanceMode.default,
+    comp_bias_corr_scale=1.0, significance_mode=SignificanceMode.default, significance_sample_size=500,
 ))
 ESM_CODES_QUERY_DEFAULTS = MappingProxyType(dict(min_seq_identity=0.0, min_coverage=0.0, max_evalue=1e-3))
 #: The BLOSUM62-only options, refused under esm-codes whatever their value (D20: exit status 2).
 _BLOSUM62_ONLY_OPTIONS = (("gap_open", "--gap-open"), ("gap_extend", "--gap-extend"),
                           ("comp_bias_corr", "--comp-bias-corr/--no-comp-bias-corr"),
-                          ("significance_mode", "--significance-mode"))
+                          ("comp_bias_corr_scale", "--comp-bias-corr-scale"),
+                          ("significance_mode", "--significance-mode"),
+                          ("significance_sample_size", "--significance-sample-size"))
 
 
 @dataclass(frozen=True)
@@ -1693,21 +1698,26 @@ class QueryStage2Options:
     gap_open: Optional[int] = None
     gap_extend: Optional[int] = None
     comp_bias_corr: Optional[bool] = None
+    comp_bias_corr_scale: Optional[float] = None
     significance_mode: Optional[SignificanceMode] = None
+    significance_sample_size: Optional[int] = None
 
 
 def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optional[bool] = None,
                                  min_seq_identity: Optional[float] = None, min_coverage: Optional[float] = None,
                                  max_evalue: Optional[float] = None, gap_open: Optional[int] = None,
                                  gap_extend: Optional[int] = None, comp_bias_corr: Optional[bool] = None,
-                                 significance_mode: Optional[SignificanceMode] = None) -> QueryStage2Options:
+                                 comp_bias_corr_scale: Optional[float] = None,
+                                 significance_mode: Optional[SignificanceMode] = None,
+                                 significance_sample_size: Optional[int] = None) -> QueryStage2Options:
     """``query sequences``' Stage-2 options for ``scoring`` (P6.1): an option left out (None) takes the scoring's
     default (:data:`BLOSUM62_QUERY_DEFAULTS`, :data:`ESM_CODES_QUERY_DEFAULTS`), an explicit value is kept.
 
     Under esm-codes, every BLOSUM62-only option given (``--gap-open``, ``--gap-extend``,
-    ``--comp-bias-corr/--no-comp-bias-corr``, ``--significance-mode``) and ``--no-seq-identity`` are refused, and
-    so are filter values out of range: ``typer.BadParameter`` (exit status 2, D20), before anything is read.
-    Under blosum62 nothing is checked here, as before.
+    ``--comp-bias-corr/--no-comp-bias-corr``, ``--comp-bias-corr-scale``, ``--significance-mode``,
+    ``--significance-sample-size``) and ``--no-seq-identity`` are refused, and so are filter values out of range:
+    ``typer.BadParameter`` (exit status 2, D20), before anything is read. Under blosum62 nothing is checked here, as
+    before.
     """
     try:
         scoring = ScoringChoice(scoring)
@@ -1715,17 +1725,16 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
         raise typer.BadParameter(f"{scoring!r} is not a scoring; expected one of "
                                  f"{', '.join(c.value for c in ScoringChoice)}.", param_hint="--scoring") from None
     given = dict(min_seq_identity=min_seq_identity, min_coverage=min_coverage, max_evalue=max_evalue)
+    blosum = dict(gap_open=gap_open, gap_extend=gap_extend, comp_bias_corr=comp_bias_corr,
+                  comp_bias_corr_scale=comp_bias_corr_scale, significance_mode=significance_mode,
+                  significance_sample_size=significance_sample_size)
     if scoring is ScoringChoice.blosum62:
-        blosum = dict(gap_open=gap_open, gap_extend=gap_extend, comp_bias_corr=comp_bias_corr,
-                      significance_mode=significance_mode)
         values = {name: BLOSUM62_QUERY_DEFAULTS[name] if value is None else value
                   for name, value in {**given, **blosum}.items()}
         if values["significance_mode"] is not None:
             values["significance_mode"] = SignificanceMode(values["significance_mode"])
         return QueryStage2Options(scoring=scoring, **values)
-    refused = [flag for name, flag in _BLOSUM62_ONLY_OPTIONS
-               if {"gap_open": gap_open, "gap_extend": gap_extend, "comp_bias_corr": comp_bias_corr,
-                   "significance_mode": significance_mode}[name] is not None]
+    refused = [flag for name, flag in _BLOSUM62_ONLY_OPTIONS if blosum[name] is not None]
     problems = []
     if refused:
         problems.append(

@@ -241,7 +241,7 @@ class OptionTest(unittest.TestCase):
     def test_scoring_dependent_defaults_are_resolved_per_scoring(self):
         """The typer defaults are None (resolved per scoring) and the help states both scorings' defaults."""
         for name in ("min_seq_identity", "min_coverage", "max_evalue", "gap_open", "gap_extend", "comp_bias_corr",
-                     "significance_mode"):
+                     "comp_bias_corr_scale", "significance_mode", "significance_sample_size"):
             with self.subTest(option=name):
                 param = self._param(("query", "sequences"), name)
                 self.assertIsNone(param.default)
@@ -250,12 +250,17 @@ class OptionTest(unittest.TestCase):
                            ("max_evalue", "(default 1e-3)"), ("gap_open", "refused with --scoring esm-codes"),
                            ("gap_extend", "refused with --scoring esm-codes"),
                            ("comp_bias_corr", "refused with --scoring esm-codes"),
-                           ("significance_mode", "refused with --scoring esm-codes")):
+                           ("comp_bias_corr_scale", "Default: 1.0. BLOSUM62 scoring only: refused with --scoring "
+                                                    "esm-codes"),
+                           ("significance_mode", "refused with --scoring esm-codes"),
+                           ("significance_sample_size", "Default: 500. BLOSUM62 scoring only: refused with --scoring "
+                                                        "esm-codes")):
             with self.subTest(option=name):
                 self.assertIn(text, self._param(("query", "sequences"), name).help)
         # query db keeps its options and defaults.
         for name, default in (("min_seq_identity", 0.3), ("min_coverage", 0.8), ("max_evalue", 1e-3),
-                              ("gap_open", 11), ("gap_extend", 1), ("comp_bias_corr", False)):
+                              ("gap_open", 11), ("gap_extend", 1), ("comp_bias_corr", False),
+                              ("comp_bias_corr_scale", 1.0), ("significance_sample_size", 500)):
             with self.subTest(command="query db", option=name):
                 self.assertEqual(self._param(("query", "db"), name).default, default)
 
@@ -278,15 +283,16 @@ class ResolveOptionsTest(unittest.TestCase):
     def test_blosum62_defaults_are_the_old_ones(self):
         o = search.resolve_query_stage2_options("blosum62")
         self.assertEqual((o.scoring, o.min_seq_identity, o.min_coverage, o.max_evalue, o.gap_open, o.gap_extend,
-                          o.comp_bias_corr, o.significance_mode),
-                         (ScoringChoice.blosum62, 0.3, 0.8, 1e-3, 11, 1, False, SignificanceMode.default))
+                          o.comp_bias_corr, o.comp_bias_corr_scale, o.significance_mode, o.significance_sample_size),
+                         (ScoringChoice.blosum62, 0.3, 0.8, 1e-3, 11, 1, False, 1.0, SignificanceMode.default, 500))
         self.assertEqual(search.resolve_query_stage2_options(), o)
 
     def test_esm_codes_defaults(self):
         o = search.resolve_query_stage2_options("esm-codes")
         self.assertEqual((o.scoring, o.min_seq_identity, o.min_coverage, o.max_evalue),
                          (ScoringChoice.esm_codes, 0.0, 0.0, 1e-3))
-        self.assertEqual((o.gap_open, o.gap_extend, o.comp_bias_corr, o.significance_mode), (None,) * 4)
+        self.assertEqual((o.gap_open, o.gap_extend, o.comp_bias_corr, o.comp_bias_corr_scale, o.significance_mode,
+                          o.significance_sample_size), (None,) * 6)
 
     def test_explicit_values_are_honoured(self):
         for scoring in ("blosum62", "esm-codes"):
@@ -295,15 +301,19 @@ class ResolveOptionsTest(unittest.TestCase):
                                                         max_evalue=float("inf"), seq_identity=True)
                 self.assertEqual((o.min_seq_identity, o.min_coverage, o.max_evalue), (0.5, 0.25, float("inf")))
         o = search.resolve_query_stage2_options("blosum62", gap_open=10, gap_extend=2, comp_bias_corr=True,
-                                                significance_mode="sampled", min_seq_identity=0.0)
-        self.assertEqual((o.gap_open, o.gap_extend, o.comp_bias_corr, o.significance_mode, o.min_seq_identity),
-                         (10, 2, True, SignificanceMode.sampled, 0.0))
+                                                comp_bias_corr_scale=0.5, significance_mode="sampled",
+                                                significance_sample_size=50, min_seq_identity=0.0)
+        self.assertEqual((o.gap_open, o.gap_extend, o.comp_bias_corr, o.comp_bias_corr_scale, o.significance_mode,
+                          o.significance_sample_size, o.min_seq_identity),
+                         (10, 2, True, 0.5, SignificanceMode.sampled, 50, 0.0))
 
     def test_blosum62_options_are_refused_under_esm_codes(self):
         import typer
         cases = {"--gap-open": dict(gap_open=11), "--gap-extend": dict(gap_extend=1),
                  "--comp-bias-corr/--no-comp-bias-corr": dict(comp_bias_corr=False),
+                 "--comp-bias-corr-scale": dict(comp_bias_corr_scale=1.0),
                  "--significance-mode": dict(significance_mode=SignificanceMode.default),
+                 "--significance-sample-size": dict(significance_sample_size=500),
                  "--no-seq-identity": dict(seq_identity=False)}
         for flag, kwargs in cases.items():
             with self.subTest(flag=flag), self.assertRaises(typer.BadParameter) as ctx:
@@ -314,6 +324,10 @@ class ResolveOptionsTest(unittest.TestCase):
                                                 seq_identity=False)
         self.assertIn("--gap-open, --significance-mode are BLOSUM62 options", str(ctx.exception))
         self.assertIn("--no-seq-identity", str(ctx.exception))
+        with self.assertRaises(typer.BadParameter) as ctx:   # P7.0b: a NaN scale is refused as given, not checked
+            search.resolve_query_stage2_options("esm-codes", comp_bias_corr_scale=float("nan"),
+                                                significance_sample_size=0)
+        self.assertIn("--comp-bias-corr-scale, --significance-sample-size are BLOSUM62 options", str(ctx.exception))
 
     def test_esm_codes_filter_values_are_checked(self):
         import typer
@@ -343,6 +357,10 @@ class RefusedOptionsCliTest(_Case):
         for extra, flag in ((("--gap-open", "11"), "--gap-open"), (("--gap-extend", "2"), "--gap-extend"),
                             (("--comp-bias-corr",), "--comp-bias-corr"), (("--no-comp-bias-corr",), "--comp-bias-corr"),
                             (("--significance-mode", "sampled"), "--significance-mode"),
+                            (("--comp-bias-corr-scale", "1.0"), "--comp-bias-corr-scale"),
+                            (("--comp-bias-corr-scale", "0.5"), "--comp-bias-corr-scale"),
+                            (("--significance-sample-size", "500"), "--significance-sample-size"),
+                            (("--significance-sample-size", "100"), "--significance-sample-size"),
                             (("--no-seq-identity",), "--no-seq-identity")):
             with self.subTest(extra=extra):
                 self.usage_error(self.run_esm(*extra), flag, "--scoring")
@@ -646,9 +664,11 @@ class QueryTest(_DbCase):
             self.assertEqual(result.exit_code, 0, (result.output, result.exception))
             kwargs = blosum.call_args.kwargs
             self.assertEqual({k: kwargs[k] for k in ("min_seq_identity", "min_coverage", "max_evalue", "gap_open",
-                                                       "gap_extend", "comp_bias_corr", "significance_mode")},
+                                                       "gap_extend", "comp_bias_corr", "comp_bias_corr_scale",
+                                                       "significance_mode", "significance_sample_size")},
                              dict(min_seq_identity=0.3, min_coverage=0.8, max_evalue=1e-3, gap_open=11, gap_extend=1,
-                                  comp_bias_corr=False, significance_mode=SignificanceMode.default))
+                                  comp_bias_corr=False, comp_bias_corr_scale=1.0,
+                                  significance_mode=SignificanceMode.default, significance_sample_size=500))
         self.assertEqual(_sha256(outs["codes"]), _sha256(outs["plain"]))
         self.assertTrue(_rows(outs["codes"]))
         result, out = self.query(self.database("codes"), "--format-output", ALL_FIELDS, run_id="ball")
@@ -658,6 +678,24 @@ class QueryTest(_DbCase):
         for row in rows:
             self.assertEqual([row[f] for f in output.ESM_CODES_OUTPUT_FIELDS], [""] * 4)
             self.assertNotIn(".", row["raw"])   # the integer BLOSUM62 score
+
+    def test_blosum62_takes_the_scale_and_the_sample_size(self):
+        """P7.0b: --comp-bias-corr-scale and --significance-sample-size reach the BLOSUM62 Stage 2; a NaN scale is
+        still the ValueError (exit status 1) it was, raised before the pre-flight."""
+        from foldmatch.search import alignment
+        with mock.patch.object(alignment, "align_candidates", wraps=alignment.align_candidates) as blosum:
+            result, _ = self.query(self.database("codes"), "--comp-bias-corr", "--comp-bias-corr-scale", "0.5",
+                                   "--significance-mode", "sampled", "--significance-sample-size", "20",
+                                   "--gap-open", "3", "--max-evalue", "inf")
+        self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+        kwargs = blosum.call_args.kwargs
+        self.assertEqual((kwargs["comp_bias_corr_scale"], kwargs["significance_sample_size"]), (0.5, 20))
+        with mock.patch.object(search, "_fasta_preflight", side_effect=AssertionError("pre-flight")) as preflight:
+            result, _ = self.query(self.database("codes"), "--comp-bias-corr-scale", "nan", predict=mock.Mock())
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIsInstance(result.exception, ValueError)
+        self.assertIn("--comp-bias-corr-scale must be between 0 and 1", str(result.exception))
+        preflight.assert_not_called()
 
     def test_explicit_values_are_honoured(self):
         db = self.database("codes")
