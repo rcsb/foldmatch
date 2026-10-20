@@ -40,7 +40,7 @@ pool's bits.
 **Pool.** :class:`CodeAlignmentPool` is the persistent ``spawn`` pool of one run (a
 :class:`concurrent.futures.ProcessPoolExecutor`), started lazily at the first batch that needs it and reused for both
 rounds and every batch; without a worker count it starts only as many workers as the batch's work justifies (one per
-:data:`MIN_WORKER_CELLS` similarity cells, up to every CPU); ``None``, ``0`` or ``1`` as the aligner's ``pool`` runs
+:data:`MIN_WORKER_CELLS` similarity cells, up to one per physical core); ``None``, ``0`` or ``1`` as the aligner's ``pool`` runs
 the same task functions in-process. A worker that ends without returning its task (killed, e.g. by the out-of-memory killer, or unable to start) stops the run
 with :class:`WorkerPoolError` instead of leaving it waiting. Spawn workers re-import the main module, so a script
 that runs this Stage 2 with a pool must guard its entry point with ``if __name__ == "__main__":`` (the ``fm-search``
@@ -68,7 +68,7 @@ from foldmatch.search import code_statistics as cs
 from foldmatch.search import stage2_profile
 from foldmatch.search import swkern
 from foldmatch.search.alignment import (
-    _BIOTITE_ALPHABET, AlignmentMetrics, Hit, _available_cpus, _expand_cpu_affinity,
+    _BIOTITE_ALPHABET, AlignmentMetrics, Hit, _expand_cpu_affinity,
 )
 from foldmatch.utils.sequence import STANDARD_AMINO_ACIDS, normalize_sequence, seq_sha1
 
@@ -446,8 +446,8 @@ class CodeAlignmentPool:
     ESM3 and the aggregator are freed) and started as its tasks are submitted, reused for both rounds and every
     batch, restarted only when the worker setup (database, query memmap, limits) changes.
 
-    ``num_workers``: ``None`` uses up to every CPU (the CPU affinity mask is widened first, as for BLOSUM62), but
-    starts only as many workers as the work justifies (one per ``min_worker_cells`` similarity cells of the batch,
+    ``num_workers``: ``None`` uses up to one worker per physical core (the CPU affinity mask is widened first, as for
+    BLOSUM62; SMT siblings count once), but starts only as many workers as the work justifies (one per ``min_worker_cells`` similarity cells of the batch,
     :data:`MIN_WORKER_CELLS`; a later, larger batch restarts the pool with more); ``0`` or ``1`` runs the task
     functions in-process; ``N > 1`` uses N workers, started as tasks are submitted (a small first batch starts fewer,
     and later batches start the rest). While no pool is running, a batch with a single task, or (``None``) with less
@@ -492,12 +492,13 @@ class CodeAlignmentPool:
         return self.num_workers is not None and self.num_workers <= 1
 
     def requested_workers(self) -> int:
-        """The worker budget: 1 when serial, else ``num_workers`` or every usable CPU (after widening affinity)."""
+        """The worker budget: 1 when serial, else ``num_workers`` or one per physical core of the usable CPUs (after
+        widening affinity; SMT siblings count once: two workers on one core run slower than one, P7.2)."""
         if self.serial:
             return 1
         if self._requested is None:
             _expand_cpu_affinity()
-            self._requested = max(1, _available_cpus() if self.num_workers is None else int(self.num_workers))
+            self._requested = max(1, _physical_cpus() if self.num_workers is None else int(self.num_workers))
         return self._requested
 
     def plan_workers(self, cells: int) -> int:
@@ -706,6 +707,36 @@ class _Session:
     @property
     def idle(self) -> bool:
         return not self.local and self.inflight == 0
+
+
+def _physical_cpus(cpus: Optional[Iterable[int]] = None, siblings=None) -> int:
+    """The physical cores among the usable CPUs (``cpus``, default: this process's affinity mask): on Linux, CPUs that
+    share a core (SMT siblings, ``/sys/devices/system/cpu/cpuN/topology/thread_siblings_list``) count once; where the
+    topology cannot be read (or off Linux) every CPU counts. ``siblings(cpu) -> str`` replaces the sysfs read
+    (tests)."""
+    if cpus is None:
+        try:
+            cpus = os.sched_getaffinity(0)
+        except AttributeError:
+            return os.cpu_count() or 1
+    cpus = sorted(set(int(c) for c in cpus))
+    if not cpus:
+        return 1
+    if siblings is None:
+        def siblings(cpu):
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                return f.read()
+    cores = set()
+    try:
+        for cpu in cpus:
+            group = []
+            for part in siblings(cpu).strip().split(","):
+                lo, _, hi = part.partition("-")
+                group.extend(range(int(lo), int(hi or lo) + 1))
+            cores.add(frozenset(group) if cpu in group else frozenset((cpu,)))
+    except (OSError, ValueError):
+        return len(cpus)
+    return max(1, len(cores))
 
 
 def _as_pool(pool) -> Tuple[CodeAlignmentPool, bool]:

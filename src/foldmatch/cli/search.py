@@ -833,9 +833,14 @@ def query_database_from_fasta(
                  "Default: 500." + _BLOSUM62_ONLY
         )] = None,
         align_workers: Annotated[Optional[int], typer.Option(
-            help='Process-pool size for Stage-2 alignment. Defaults to all CPUs '
-                 'on the node (widening any scheduler --cpu-bind pinning); set '
-                 'to 0 or 1 to run serially.'
+            help='Process-pool size for Stage-2 alignment; set to 0 or 1 to '
+                 'run serially. Default under --scoring blosum62: all CPUs on '
+                 'the node (widening any scheduler --cpu-bind pinning); under '
+                 'esm-codes: up to one worker per physical core (SMT siblings '
+                 'count once; the pinning widened the same way), only as many '
+                 'as the work needs. An esm-codes worker needs about 5 bytes '
+                 'per residue pair of the pair it aligns (up to 1.3 GiB for the '
+                 'longest pairs aligned, 2^28 residue pairs).'
         )] = None,
         format_output: Annotated[str, typer.Option(
             help=_FORMAT_OUTPUT_HELP

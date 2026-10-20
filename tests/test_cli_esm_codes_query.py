@@ -238,6 +238,14 @@ class OptionTest(unittest.TestCase):
             with self.subTest(command=" ".join(path)):
                 self.assertNotIn("scoring", [p.name for p in self._command(*path).params])
 
+    def test_align_workers_help_gives_each_scorings_default(self):
+        """The esm-codes pool default (P7.2d, P7.2j) is not the BLOSUM62 one; query db is BLOSUM62 only."""
+        text = " ".join(self._param(("query", "sequences"), "align_workers").help.split())
+        self.assertIn("Default under --scoring blosum62: all CPUs on the node", text)
+        self.assertIn("under esm-codes: up to one worker per physical core", text)
+        self.assertIn("only as many as the work needs", text)
+        self.assertIn("Defaults to all CPUs", self._param(("query", "db"), "align_workers").help)
+
     def test_scoring_dependent_defaults_are_resolved_per_scoring(self):
         """The typer defaults are None (resolved per scoring) and the help states both scorings' defaults."""
         for name in ("min_seq_identity", "min_coverage", "max_evalue", "gap_open", "gap_extend", "comp_bias_corr",

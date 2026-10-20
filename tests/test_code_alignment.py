@@ -1308,6 +1308,25 @@ class PoolAndWorkerTest(_WorldCase):
         ref, _ = world.align(self.__class__._mixed, None, max_evalue=None, panel_policy="never")
         self.assertEqual(_signature(ref), _signature(got))
 
+    def test_the_default_budget_is_one_worker_per_physical_core(self):
+        """SMT siblings count once (a 2-socket EPYC 7763 node: 256 CPUs, 128 cores); without a readable topology every
+        CPU counts."""
+        smt = {c: f"{c % 128},{c % 128 + 128}" for c in range(256)}
+        self.assertEqual(ca._physical_cpus(range(256), smt.__getitem__), 128)
+        self.assertEqual(ca._physical_cpus([0, 128, 1], smt.__getitem__), 2)
+        self.assertEqual(ca._physical_cpus(range(64), smt.__getitem__), 64)
+        ranges = {c: "0-3" if c < 4 else "4-7" for c in range(8)}
+        self.assertEqual(ca._physical_cpus(range(8), ranges.__getitem__), 2)
+        self.assertEqual(ca._physical_cpus(range(10), str), 10)                 # no SMT: every CPU its own core
+
+        def unreadable(cpu):
+            raise OSError("no sysfs")
+        self.assertEqual(ca._physical_cpus(range(6), unreadable), 6)
+        self.assertGreaterEqual(ca._physical_cpus(), 1)
+        with mock.patch.object(ca, "_physical_cpus", return_value=7), mock.patch.object(ca, "_expand_cpu_affinity"):
+            self.assertEqual(ca.CodeAlignmentPool().requested_workers(), 7)
+            self.assertEqual(ca.CodeAlignmentPool(12).requested_workers(), 12)
+
     def test_the_default_pool_starts_workers_by_the_work(self):
         """num_workers=None: one worker per min_worker_cells cells of the batch (at most the budget); a batch with
         less work runs in-process; a later, larger batch restarts the pool with more workers; the bits stay the
