@@ -409,6 +409,17 @@ class InvarianceTest(_WorldCase):
         self._same(self.ref_a, got_a)
         self._same(self.ref_b, got_b)
 
+    def test_repeated_candidates_keep_their_order_in_any_scheduling(self):
+        """A candidate listed twice gives two hits with equal S14 keys: they stay in candidate order whatever the
+        order in which a query's round-2 parts arrive."""
+        pre = {q: (ids + ids, emb + emb) for q, (ids, emb) in _f1_mixed([4, 7, 9], per_query=5).items()}
+        ref = self.f1_world().align(pre, None, max_evalue=None)
+        self.assertEqual(ref[1]["hits"], 30)
+        with ca.CodeAlignmentPool(3) as pool:
+            got = self.f1_world().align(pre, pool, max_evalue=None, task_cells=1 << 12)
+        self.assertGreater(got[1]["round2_tasks"], 3)
+        self._same(ref, got)
+
     def test_the_parent_holds_round_2_payload_only_for_queries_in_flight(self):
         """In-process every query's round 2 runs right after its round 1 and its hits are built when its last part
         arrives, so the parent never holds more than one query's survivors (8 here) of round-2 payload."""
