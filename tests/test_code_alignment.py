@@ -398,6 +398,28 @@ class InvarianceTest(_WorldCase):
         self.assertEqual(got[1]["workers"], 2)
         self._same(self.ref_b, got)
 
+    def test_batches_overlap_in_the_dataflow_without_changing_the_output(self):
+        """Several batches on one pool (the next batch's round 1 runs while this one's round 2 does), and round-2
+        hits built per query as its parts arrive: the same bits as the in-process reference."""
+        with ca.CodeAlignmentPool(3) as pool:
+            got_a = self._run(self.workload_a, pool, query_batch=2, task_cells=1 << 15)
+            got_b = self._run(self.workload_b, pool, query_batch=7, task_cells=1 << 14)
+        self.assertEqual(got_a[1]["batches"], 3)
+        self.assertEqual(got_b[1]["batches"], 8)
+        self._same(self.ref_a, got_a)
+        self._same(self.ref_b, got_b)
+
+    def test_the_parent_holds_round_2_payload_only_for_queries_in_flight(self):
+        """In-process every query's round 2 runs right after its round 1 and its hits are built when its last part
+        arrives, so the parent never holds more than one query's survivors (8 here) of round-2 payload."""
+        with mock.patch.dict(os.environ, {stage2_profile.PROFILE_ENV: "1"}):
+            got = self._run(self.workload_b, None, task_cells=1 << 12)
+        self._same(self.ref_b, got)
+        mem = got[1]["profile"]["memory"]
+        self.assertGreater(got[1]["survivors"], 8 * 10)
+        self.assertGreater(mem["round2_parts_peak_survivors"], 0)
+        self.assertLessEqual(mem["round2_parts_peak_survivors"], 8)
+
     def test_pool_restarts_when_the_worker_setup_changes(self):
         world = self.f1_world()
         f1 = _f1()
@@ -451,7 +473,9 @@ class ProfileTest(_WorldCase):
                       "hits_sort", "finish", "total"):
             self.assertIn(phase, p["parent"])
         self.assertGreater(p["memory"]["round2_parts_peak_bytes"], 0)
-        self.assertEqual(p["memory"]["round2_parts_peak_survivors"], stats["survivors"])
+        # the parent holds round-2 payload only for the queries in flight (their hits are built as they complete)
+        self.assertGreater(p["memory"]["round2_parts_peak_survivors"], 0)
+        self.assertLessEqual(p["memory"]["round2_parts_peak_survivors"], stats["survivors"])
         self.assertEqual([r["name"] for r in p["ipc"]["rounds"]], ["round1", "round2"])
         return p
 
@@ -1182,6 +1206,22 @@ class PoolAndWorkerTest(_WorldCase):
             self.assertEqual(sorted(r[0] for r in got), [0, 1])
             self.assertEqual((pool.starts, pool.workers), (2, 2))
 
+    def test_a_worker_that_dies_stops_a_session(self):
+        """The aligner's session (one task at a time, completion order) raises WorkerPoolError for a killed worker
+        too, and leaves no task behind."""
+        world = self.f1_world()
+        init = self._init(world)
+        with ca.CodeAlignmentPool(2) as pool:
+            with _deadline(60), self.assertRaises(ca.WorkerPoolError):
+                with pool.session(init, 10 ** 9, 10) as session:
+                    self.assertFalse(session.in_process)
+                    self.assertEqual(session.window, 4)
+                    for k in range(3):
+                        session.submit(signal.raise_signal, int(signal.SIGKILL), ("kill", k))
+                    while not session.idle:
+                        session.next()
+            self.assertEqual((pool.workers, pool._pool), (0, None))
+
     def test_a_script_without_a_main_guard_fails_instead_of_hanging(self):
         """Spawn workers re-import the main script: without an ``if __name__ == "__main__":`` guard they cannot
         start. The run fails with WorkerPoolError (a multiprocessing.Pool respawned them forever); with the guard the
@@ -1305,6 +1345,56 @@ class PoolAndWorkerTest(_WorldCase):
                 again, st = world.align(mixed, pool, max_evalue=None, panel_policy="never", task_cells=1 << 14)
                 self.assertEqual((pool.starts, pool.workers), (2, 3))           # grown: restarted with more
                 self.assertEqual(_signature(ref), _signature(again))
+        self.assertEqual(_signature(ref), _signature(got))
+
+    def test_a_later_batch_grows_the_pool_within_one_call(self):
+        """num_workers=None, one call (as fm-search makes): a first batch below one worker's share runs in-process,
+        and a later batch with more work moves the call to a pool; a pool planned for 2 workers grows (by restart,
+        at least doubling) for a later batch that plans more. The bits stay those of an in-process run (review of
+        P7.2e: the first batch used to decide for the whole call)."""
+        if not ca._blas_limit_available():
+            self.skipTest("in-process batches need threadpoolctl")
+        world = self.f1_world()
+        f1 = _f1()
+
+        def cells(pre):
+            return sum(len(next(x for x in f1 if x["qid"] == q)["q16"])
+                       * sum(len(next(x for x in f1 if x["tid"] == t)["codes"]) for t in tids)
+                       for q, (tids, _) in pre.items())
+
+        tiny = {f1[0]["qid"]: ([min(f1, key=lambda x: len(x["codes"]))["tid"]], [0.9])}
+        later = _f1_mixed(range(1, 13), per_query=6)               # memmap order: f1[0] first, then these
+        per_batch = max(cells({q: v}) for q, v in later.items())
+        mwc = max(cells(tiny), -(-per_batch // 2))                  # the tiny batch: one share; later ones: 2
+        ref, _ = world.align({**tiny, **later}, None, max_evalue=None, panel_policy="never")
+        with ca.CodeAlignmentPool(None, min_worker_cells=mwc) as pool:
+            budget = pool.requested_workers()
+            got, st = world.align({**tiny, **later}, pool, max_evalue=None, panel_policy="never", query_batch=1,
+                                  task_cells=1 << 14)
+            self.assertEqual(st["batches"], 13)
+            want = min(budget, 2)
+            if want > 1:
+                self.assertEqual((pool.starts, pool.workers), (1, want))
+                self.assertGreaterEqual(st["workers"], 1)
+            else:
+                self.assertEqual((pool.starts, st["workers"]), (0, 0))
+        self.assertEqual(_signature(ref), _signature(got))
+        if budget < 4:
+            return
+        # a pool planned for 2 workers, then batches that plan more: restarts, each at least doubling the pool
+        small = _f1_mixed([1], per_query=2)
+        big = _f1_mixed(range(2, 14), per_query=12)
+        mwc = -(-cells(small) // 2)                                 # the small first batch plans 2 workers
+        plans = [ca.CodeAlignmentPool(None, min_worker_cells=mwc).plan_workers(cells({q: v})) for q, v in big.items()]
+        with ca.CodeAlignmentPool(None, min_worker_cells=mwc) as pool:
+            got, st = world.align({**small, **big}, pool, max_evalue=None, panel_policy="never", query_batch=1,
+                                  task_cells=1 << 14)
+            self.assertLessEqual(pool.workers, budget)
+            if max(plans) > 2:
+                self.assertGreaterEqual(pool.starts, 2)
+                self.assertGreaterEqual(pool.workers, min(budget, max(max(plans), 4)))
+                self.assertLessEqual(pool.starts, 1 + math.ceil(math.log2(budget)))
+        ref, _ = world.align({**small, **big}, None, max_evalue=None, panel_policy="never")
         self.assertEqual(_signature(ref), _signature(got))
 
     def test_serial_pool_releases_its_in_process_state(self):

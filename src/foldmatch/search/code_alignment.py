@@ -19,9 +19,14 @@ its targets in the panel codes or in the code store. Workers hold everything els
 the scoring npz through :meth:`~foldmatch.search.scoring_system.WorkerSpec.load_panel`, the code-store memmap, the
 query memmap and a :class:`~foldmatch.search.swkern.Workspace`) and return numpy arrays. The task size adapts to the
 batch: at most ``task_cells`` similarity cells, and small enough for at least 4 tasks per worker (but not below
-2^20 cells), so that one interactive query still uses every core; tasks are submitted longest first (LPT, by
-``n x sum(m)``), one task per call, and their results consumed in completion order. Workers import neither torch nor
-biotite.
+2^20 cells), so that one interactive query still uses every core. Workers import neither torch nor biotite.
+
+**Dataflow** (:class:`_Dataflow`). A batch's round-1 tasks are queued longest first (LPT, by ``n x sum(m)``); each
+query moves on as soon as its own tasks are back: statistics and survivors when its round 1 is complete (its round-2
+tasks are queued ahead of round 1), hits when its round 2 is complete (its paths are then released). The next batch is
+looked up and queued while the workers still have this one's tasks (at most two batches open). Tasks are submitted one
+at a time, at most twice the pool's workers in flight (:class:`_Session`), and their results consumed in completion
+order: the parent holds the round-2 payload of the queries in flight only, and builds hits while the workers compute.
 
 **Reproducibility (S16).** Every pair's similarity is its own fp32 GEMM into a 64-byte-aligned buffer, so a pair's
 bits depend only on the pair, the BLAS build and the BLAS thread count (multi-threaded OpenBLAS changes last bits,
@@ -36,8 +41,7 @@ pool's bits.
 :class:`concurrent.futures.ProcessPoolExecutor`), started lazily at the first batch that needs it and reused for both
 rounds and every batch; without a worker count it starts only as many workers as the batch's work justifies (one per
 :data:`MIN_WORKER_CELLS` similarity cells, up to every CPU); ``None``, ``0`` or ``1`` as the aligner's ``pool`` runs
-the same task functions in-process. A worker
-that ends without returning its task (killed, e.g. by the out-of-memory killer, or unable to start) stops the run
+the same task functions in-process. A worker that ends without returning its task (killed, e.g. by the out-of-memory killer, or unable to start) stops the run
 with :class:`WorkerPoolError` instead of leaving it waiting. Spawn workers re-import the main module, so a script
 that runs this Stage 2 with a pool must guard its entry point with ``if __name__ == "__main__":`` (the ``fm-search``
 command does); without the guard the workers cannot start and the run fails with :class:`WorkerPoolError`.
@@ -48,7 +52,9 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import queue
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
@@ -75,10 +81,10 @@ PANEL_FIELDS = frozenset({"evalue", "bits", "q90", "rawadj"})
 DEFAULT_TASK_CELLS = 1 << 24
 TASK_CELLS_FLOOR = 1 << 20
 TASKS_PER_WORKER = 4
-#: A pool sized by default (``num_workers=None``) starts at most one worker per this many similarity cells of its
-#: first batch (about 40 ms of one EPYC core, against about 0.3 s to start a spawn worker), so a small query does not
-#: start a worker on every CPU; a later, larger batch grows it. 2^23 gives a 300-aa query with 100 candidates and the
-#: panel 14 workers.
+#: A pool sized by default (``num_workers=None``) starts at most one worker per this many similarity cells of a batch
+#: (about 40 ms of one EPYC core, against about 0.3 s to start a spawn worker), so a small query does not start a
+#: worker on every CPU; a later batch with more work grows it (by restart, at least doubling). 2^23 gives a 300-aa
+#: query with 100 candidates and the panel 14 workers.
 MIN_WORKER_CELLS = 1 << 23
 DEFAULT_QUERY_BATCH = 256
 _BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
@@ -566,6 +572,25 @@ class CodeAlignmentPool:
             for future in futures:
                 future.cancel()
 
+    def session(self, init: _WorkerInit, cells: int, tasks: int,
+                profile: Optional[stage2_profile.Stage2Profile] = None) -> "_Session":
+        """A :class:`_Session` for one aligner call whose first batch has ``cells`` similarity cells in ``tasks``
+        round-1 tasks: in-process (serial, or no pool running and the batch qualifies, as in :meth:`run`), else on
+        this pool, started or grown to :meth:`plan_workers` (a pool with another worker setup is restarted)."""
+        if self._pool is not None and self._init != init:
+            logger.info("esm-codes Stage 2: the worker setup changed; restarting the worker pool")
+            self.close()
+        want = self.plan_workers(cells)
+        if self._pool is None:
+            if self.serial or (min(want, tasks) <= 1 and _blas_limit_available()):
+                return _Session(self, init, True, profile)
+            self._start(init, want, profile)
+        elif want > self.workers:
+            logger.info(f"esm-codes Stage 2: this batch needs {want} workers; restarting the pool of {self.workers}")
+            self.close()
+            self._start(init, want, profile)
+        return _Session(self, init, False, profile)
+
     def _start(self, init: _WorkerInit, workers: int, profile=None):
         t0 = time.perf_counter()
         ctx = mp.get_context(self.start_method)
@@ -592,6 +617,95 @@ class CodeAlignmentPool:
         if self._in_process is not None and _STATE is not None and _STATE.init == self._in_process:
             _reset_worker_state()
         self._in_process = None
+
+
+class _Session:
+    """The tasks of one aligner call: submitted one at a time and their results taken in completion order, on the
+    pool's executor (at most :attr:`window` in flight: twice the pool's workers, so every worker has its next task
+    queued while the parent bounds what it holds) or in-process (each task runs when it is submitted, one in flight).
+    ``with`` it: leaving cancels the tasks not started yet. A worker that ends without returning its task raises
+    :class:`WorkerPoolError` (the pool is stopped)."""
+
+    def __init__(self, pool: CodeAlignmentPool, init: _WorkerInit, in_process: bool,
+                 profile: Optional[stage2_profile.Stage2Profile]):
+        self.pool, self.init, self.in_process, self.profile = pool, init, in_process, profile
+        self.done: "queue.SimpleQueue" = queue.SimpleQueue()
+        self.pending: set = set()
+        self.local: deque = deque()
+        self.inflight = 0
+        self._exit = None
+        if in_process:
+            if _STATE is None or _STATE.init != init or _STATE.error is not None:
+                _init_worker(init, raise_errors=True)
+            if pool._in_process is None and not _blas_limit_available():
+                logger.info("esm-codes Stage 2 runs in-process without threadpoolctl: BLAS keeps this process's "
+                            "thread count (set OMP/OPENBLAS/MKL/VECLIB_*_NUM_THREADS=1 for the bits of a worker pool; "
+                            "S16 holds either way)")
+            pool._in_process = init
+            self.workers, self.window = 1, 1
+        else:
+            self.workers = pool.workers
+            self.window = max(2 * pool.workers, 2)
+
+    def __enter__(self) -> "_Session":
+        if self.in_process:
+            blas, warn = _blas_one_thread_here(), _swkern_skip_warning_dropped()
+            blas.__enter__()
+            warn.__enter__()
+            self._exit = (warn, blas)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for future in self.pending:
+            future.cancel()
+        self.pending.clear()
+        if self._exit is not None:
+            for cm in self._exit:
+                cm.__exit__(None, None, None)
+            self._exit = None
+
+    @property
+    def full(self) -> bool:
+        return (len(self.local) if self.in_process else self.inflight) >= self.window
+
+    def submit(self, fn, task, tag, rnd: Optional[int] = None) -> None:
+        """Run ``fn(task)``; its result comes back from :meth:`next` with ``tag`` (``rnd``: the profile's round)."""
+        if self.in_process:
+            self.local.append((tag, fn(task)))
+            return
+        prof, executor = self.profile, self.pool._pool
+        if prof is not None:
+            prof.submitted(task, rnd)
+        try:
+            if self.pool.processes < self.pool.workers:
+                # the executor may spawn a worker for this task: it inherits *_NUM_THREADS=1 from here
+                with _single_threaded_blas_env():
+                    future = executor.submit(fn, task)
+            else:
+                future = executor.submit(fn, task)
+        except BrokenProcessPool as exc:
+            self.pool.close(terminate=True)
+            raise WorkerPoolError(_LOST_WORKER) from exc
+        self.pending.add(future)
+        self.inflight += 1
+        future.add_done_callback(lambda f, tag=tag: self.done.put((tag, f)))
+
+    def next(self):
+        """``(tag, result)`` of a finished task (the oldest in-process one, else the next to complete)."""
+        if self.local:
+            return self.local.popleft()
+        tag, future = self.done.get()
+        self.pending.discard(future)
+        self.inflight -= 1
+        try:
+            return tag, future.result()
+        except BrokenProcessPool as exc:
+            self.pool.close(terminate=True)
+            raise WorkerPoolError(_LOST_WORKER) from exc
+
+    @property
+    def idle(self) -> bool:
+        return not self.local and self.inflight == 0
 
 
 def _as_pool(pool) -> Tuple[CodeAlignmentPool, bool]:
@@ -735,7 +849,8 @@ class _PathStrings:
 class _Query:
     """One query of a batch: its encoding rows, candidates and the results of both rounds."""
     __slots__ = ("qid", "off", "n", "seq", "cand_ids", "cand_emb", "cand_off", "cand_len", "s_f", "s_r", "skipped",
-                 "panel_f", "panel_r", "q90", "s", "s_prime", "lne", "bits", "surv", "parts", "inside")
+                 "panel_f", "panel_r", "q90", "s", "s_prime", "lne", "bits", "surv", "parts", "inside", "r1_left",
+                 "r2_left", "sequences")
 
     def __init__(self, qid, off, n, seq, cand_ids, cand_emb, inside: bool):
         self.qid, self.off, self.n, self.seq = qid, off, n, seq
@@ -743,6 +858,8 @@ class _Query:
         self.inside = inside           # the query side of S13
         self.q90 = None
         self.parts: list = []
+        self.r1_left = self.r2_left = 0
+        self.sequences = None
 
 
 def _log_threshold(max_evalue) -> Optional[float]:
@@ -807,8 +924,9 @@ def align_candidates_esm_codes(
         prefilter_results: Stage-1 output ``{query_id: ([target_ids], [embedding scores])}``.
         code_store: the database's :class:`~foldmatch.search.residue_code_store.ResidueCodeStore` (complete;
             ``lookup()`` by id, its ``.bin`` mapped by the workers).
-        fetch_subject_sequences: ``ids -> {id: sequence}`` (``SequenceStore.fetch``), called once per batch for the
-            survivors only; every survivor's sequence must be there, with as many residues as its codes.
+        fetch_subject_sequences: ``ids -> {id: sequence}`` (``SequenceStore.fetch``), called once per query with
+            survivors, for its survivors only; every survivor's sequence must be there, with as many residues as its
+            codes.
         prepared: the :class:`~foldmatch.search.scoring_system.PreparedSystem` of the database's system.
         db_residues: N, the database's residue count (manifest ``total_residues``); E-values need N > 0.
         pool: a :class:`CodeAlignmentPool` (reused, not closed), a worker count (a pool for this call only) or
@@ -885,10 +1003,7 @@ def align_candidates_esm_codes(
             if need_panel:
                 _codes, panel_offsets = spec.load_panel()
                 run.set_panel(panel_offsets)
-            for b0 in range(0, len(queries), query_batch):
-                batch = queries[b0:b0 + query_batch]
-                run.batches += 1
-                _run_batch(batch, run, pool, init, code_store, fetch_subject_sequences, results)
+            _Dataflow(queries, run, pool, init, code_store, fetch_subject_sequences, results, query_batch).execute()
     except BaseException:
         if owned:
             pool.close(terminate=True)
@@ -1050,105 +1165,321 @@ def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run)
     return out
 
 
-def _run_batch(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit, code_store,
-               fetch_subject_sequences, results: Dict[str, List[Hit]]):
-    prof = run.prof
-    if prof is not None:
-        t0 = time.perf_counter()
-    # codes by id (the .bin order depends on the build's ranks)
-    entries = code_store.lookup(tid for q in batch for tid in q.cand_ids)
-    for q in batch:
-        q.cand_off = np.array([entries[t].offset for t in q.cand_ids], np.int64)
-        q.cand_len = np.array([entries[t].length for t in q.cand_ids], np.int64)
-    if prof is not None:
-        prof.add("lookup", time.perf_counter() - t0)
-    _round1(batch, run, pool, init)
-    if prof is not None:
-        t0 = time.perf_counter()
-    for q in batch:
-        _statistics(q, run)
-    if prof is not None:
-        prof.add("statistics", time.perf_counter() - t0)
-    survivors = [q for q in batch if q.surv.size]
-    if not survivors:
-        return
-    if prof is not None:
-        t0 = time.perf_counter()
-    wanted = {q.cand_ids[k] for q in survivors for k in q.surv.tolist()}
-    sequences = fetch_subject_sequences(wanted)
-    missing = sorted(t for t in wanted if t not in sequences)
-    if missing:
-        raise ValueError(f"{len(missing)} target(s) have residue codes but no sequence in the sequence store "
-                         f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database disagree")
-    if prof is not None:
-        prof.add("fetch", time.perf_counter() - t0)
-    _round2(survivors, run, pool, init)
-    if prof is not None:
-        prof.round2_parts(survivors)
-    for q in survivors:
-        results[q.qid] = _hits(q, run, sequences)
+class _Batch:
+    """One batch of queries in the dataflow: its round-1 task size, the queries not finished yet, its profile
+    rounds."""
+    __slots__ = ("index", "queries", "target", "open", "r1_round", "r2_round", "r1_left", "r2_left")
+
+    def __init__(self, index: int, queries: List[_Query]):
+        self.index, self.queries = index, queries
+        self.target = 0
+        self.open = len(queries)
+        self.r1_round = self.r2_round = None
+        self.r1_left = self.r2_left = 0
 
 
-def _round1(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit):
-    prof = run.prof
-    if prof is not None:
-        t0 = time.perf_counter()
-    total = sum(q.n * ((run.panel_residues if run.need_panel else 0) + int(q.cand_len.sum())) for q in batch)
-    workers = pool.plan_workers(total)
-    target = target_task_cells(total, workers, run.task_cells)
-    tasks, costs, table = [], [], []
-    panel_chunks: Dict[int, List[Tuple[int, int]]] = {}
-    for qi, q in enumerate(batch):
-        k = len(q.cand_ids)
-        q.s_f = np.full(k, np.nan, np.float32)
-        q.s_r = np.full(k, np.nan, np.float32)
-        q.skipped = np.zeros(k, bool)
-        if run.need_panel:
-            p = len(run.panel_lengths)
-            q.panel_f = np.full(p, np.nan, np.float32)
-            q.panel_r = np.full(p, np.nan, np.float32)
-            chunks = panel_chunks.get(q.n)
-            if chunks is None:
-                chunks = panel_chunks[q.n] = plan_chunks(q.n, run.panel_lengths, target)
-            for k0, k1 in chunks:
-                pairs = run.panel_pairs[k0:k1]
-                tasks.append((len(table), _PANEL, q.off, q.n, pairs))
-                costs.append(q.n * int(pairs[:, 1].sum()))
-                table.append((qi, _PANEL, k0, k1))
-            run.panel_pair_count += p
-        for k0, k1 in plan_chunks(q.n, q.cand_len.tolist(), target):
-            pairs = np.column_stack((q.cand_off[k0:k1], q.cand_len[k0:k1]))
-            tasks.append((len(table), _CODES, q.off, q.n, pairs))
-            costs.append(q.n * int(pairs[:, 1].sum()))
-            table.append((qi, _CODES, k0, k1))
-        run.candidate_pairs += k
-    run.round1_tasks += len(tasks)
-    ordered = _lpt(tasks, costs)
-    if prof is not None:
-        t1 = time.perf_counter()
-        prof.add("plan_r1", t1 - t0)
-        prof.begin_round("round1", min(workers, len(tasks)))
-    for res in pool.run(_round1_task, ordered, init, profile=prof, workers=workers):
+class _Dataflow:
+    """Stage 2 of one call as a dataflow on a :class:`_Session` instead of two barriers per batch:
+
+    * a batch's round-1 tasks (panel and candidate chunks of every query, longest first) are queued when the batch
+      is opened (code lookup, task plan); the next batch is opened, at most two at a time, while the workers still
+      have this one's tasks, so its lookup and plan overlap their work;
+    * a query whose round-1 tasks are all back gets its statistics (S, Q90, ln E, survivors) at once, its survivors'
+      sequences, and its round-2 tasks, queued ahead of any round-1 task;
+    * a query whose round-2 tasks are all back gets its hits at once (``_hits``), and its paths are released: the
+      parent holds the round-2 payload of the queries in flight only (at most the session's window of tasks), not of
+      a whole batch, and builds hits while the workers compute;
+    * a batch that needs more workers than the session has (the pool sized by default: more work than any batch
+      before; or an in-process session and a batch with more than one worker's share) is opened once the workers are
+      idle, on a session of the grown pool (at least twice the workers, up to the budget; :meth:`_grow`), so a
+      small first batch does not keep the whole call in-process or on a few workers.
+
+    Scheduling only: every pair is the same task function on the same worker setup, so the output is the same, bit for
+    bit, as with any other order, task size or worker count (S16)."""
+
+    def __init__(self, queries: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit, code_store,
+                 fetch_subject_sequences, results: Dict[str, List[Hit]], query_batch: int):
+        self.run, self.pool, self.init = run, pool, init
+        self.code_store, self.fetch, self.results = code_store, fetch_subject_sequences, results
+        self.pending = [queries[b0:b0 + query_batch] for b0 in range(0, len(queries), query_batch)]
+        self.pending.reverse()                       # pop() gives the next batch
+        self.round1: deque = deque()                 # (fn, task, tag, rnd) to submit, low priority
+        self.round2: deque = deque()                 # high priority
+        self.open_batches: List[_Batch] = []
+        self.tid = 0
+        self.session: Optional[_Session] = None
+
+    def _cells(self, batch_queries) -> int:
+        run = self.run
+        return sum(q.n * ((run.panel_residues if run.need_panel else 0) + int(q.cand_len.sum()))
+                   for q in batch_queries)
+
+    def execute(self):
+        run, prof = self.run, self.run.prof
+        first = self._lookup(self.pending.pop())
+        cells = self._cells(first)
+        self._enter_session(cells, self._round1_tasks_estimate(first, cells))
+        staged = None            # (batch, cells) of a batch waiting for the workers to be idle, to grow the pool
+        try:
+            self._open(first, cells)
+            while True:
+                session = self.session
+                if (staged is None and self.pending and len(self.open_batches) < 2
+                        and len(self.round1) < 4 * session.window):
+                    q = self._lookup(self.pending.pop())
+                    staged = self._open_or_stage(q, self._cells(q))
+                while not session.full and (self.round2 or self.round1):
+                    fn, task, tag, rnd = (self.round2 or self.round1).popleft()
+                    if prof is not None:
+                        prof.round_started(rnd)
+                    session.submit(fn, task, tag, rnd)
+                if session.idle:
+                    if self.open_batches:                   # every open query has a task in flight or queued
+                        raise InternalError(f"esm-codes Stage 2: {sum(b.open for b in self.open_batches)} queries "
+                                            "left unfinished with no task in flight")
+                    if staged is None:
+                        if not self.pending:
+                            break
+                        q = self._lookup(self.pending.pop())
+                        staged = self._open_or_stage(q, self._cells(q))
+                    if staged is not None:
+                        self._grow(*staged)
+                        self._open(*staged)
+                        staged = None
+                    continue
+                tag, res = session.next()
+                if prof is not None:
+                    res = prof.received(res, tag[1].r1_round if tag[0] == 1 else tag[1].r2_round)
+                if tag[0] == 1:
+                    self._round1_result(tag, res)
+                else:
+                    self._round2_result(tag, res)
+        except BaseException as exc:
+            self._exit_session(exc)
+            raise
+        self._exit_session(None)
+
+    # ---------------------------------------------------------------------------------------------------- sessions
+    def _enter_session(self, cells: int, tasks: int) -> None:
+        session = self.pool.session(self.init, cells, tasks, self.run.prof)
+        session.__enter__()
+        self.session = session
+
+    def _exit_session(self, exc: Optional[BaseException]) -> None:
+        session, self.session = self.session, None
+        if session is not None:
+            self.run.workers = max(self.run.workers, self.pool.processes)
+            session.__exit__(None if exc is None else type(exc), exc, None)
+
+    def _open_or_stage(self, batch: List[_Query], cells: int):
+        """Open ``batch`` on the current session, or return it as ``(batch, cells)`` when it needs a larger pool
+        (:meth:`_needs_growth`): it is then opened by :meth:`_grow` once the session's tasks are done."""
+        if self._needs_growth(batch, cells):
+            return batch, cells
+        self._open(batch, cells)
+        return None
+
+    def _needs_growth(self, batch: List[_Query], cells: int) -> bool:
+        """Whether ``batch`` needs more workers than the session has: an in-process session whose pool would start
+        workers for this batch (as :meth:`CodeAlignmentPool.session` decides at the first batch), or a pool sized by
+        default that plans more workers for this batch than it has."""
+        pool, session = self.pool, self.session
+        if pool.serial:
+            return False
+        want = pool.plan_workers(cells)
+        if session.in_process:
+            return min(want, self._round1_tasks_estimate(batch, cells)) > 1
+        return want > session.workers
+
+    def _grow(self, batch: List[_Query], cells: int) -> None:
+        """A new session for ``batch`` once the current one is idle, on a pool grown to at least twice the
+        session's workers (at most the budget; geometric, so a call restarts its pool only a few times)."""
+        workers = self.session.workers
+        self._exit_session(None)
+        self._enter_session(max(int(cells), 2 * workers * self.pool.min_worker_cells),
+                            max(2, self._round1_tasks_estimate(batch, cells)))
+
+    # ---------------------------------------------------------------------------------------------------- batches
+    def _lookup(self, batch: List[_Query]) -> List[_Query]:
+        """The candidates' code rows by id (the .bin order depends on the build's ranks)."""
+        prof = self.run.prof
         if prof is not None:
-            res = prof.received(res)
+            t0 = time.perf_counter()
+        entries = self.code_store.lookup(tid for q in batch for tid in q.cand_ids)
+        for q in batch:
+            q.cand_off = np.array([entries[t].offset for t in q.cand_ids], np.int64)
+            q.cand_len = np.array([entries[t].length for t in q.cand_ids], np.int64)
+        if prof is not None:
+            prof.add("lookup", time.perf_counter() - t0)
+        return batch
+
+    def _round1_tasks_estimate(self, batch: List[_Query], cells: int) -> int:
+        """How many round-1 tasks the first batch will have (for the in-process decision of a one-task batch)."""
+        if len(batch) > 1 or self.run.need_panel:
+            return 2
+        target = target_task_cells(cells, self.pool.plan_workers(cells), self.run.task_cells)
+        return len(plan_chunks(batch[0].n, batch[0].cand_len.tolist(), target))
+
+    def _open(self, batch_queries: List[_Query], cells: int):
+        run, prof, session = self.run, self.run.prof, self.session
+        if prof is not None:
+            t0 = time.perf_counter()
+        b = _Batch(run.batches, batch_queries)
+        run.batches += 1
+        workers = session.workers if session.in_process else min(self.pool.plan_workers(cells), session.workers)
+        b.target = target = target_task_cells(cells, workers, run.task_cells)
+        tasks, costs = [], []
+        panel_chunks: Dict[int, List[Tuple[int, int]]] = {}
+        for qi, q in enumerate(batch_queries):
+            k = len(q.cand_ids)
+            q.s_f = np.full(k, np.nan, np.float32)
+            q.s_r = np.full(k, np.nan, np.float32)
+            q.skipped = np.zeros(k, bool)
+            q.r1_left = 0
+            if run.need_panel:
+                p = len(run.panel_lengths)
+                q.panel_f = np.full(p, np.nan, np.float32)
+                q.panel_r = np.full(p, np.nan, np.float32)
+                chunks = panel_chunks.get(q.n)
+                if chunks is None:
+                    chunks = panel_chunks[q.n] = plan_chunks(q.n, run.panel_lengths, target)
+                for k0, k1 in chunks:
+                    pairs = run.panel_pairs[k0:k1]
+                    tasks.append(((self._next_tid(), _PANEL, q.off, q.n, pairs), (1, b, qi, _PANEL, k0, k1)))
+                    costs.append(q.n * int(pairs[:, 1].sum()))
+                    q.r1_left += 1
+                run.panel_pair_count += p
+            for k0, k1 in plan_chunks(q.n, q.cand_len.tolist(), target):
+                pairs = np.column_stack((q.cand_off[k0:k1], q.cand_len[k0:k1]))
+                tasks.append(((self._next_tid(), _CODES, q.off, q.n, pairs), (1, b, qi, _CODES, k0, k1)))
+                costs.append(q.n * int(pairs[:, 1].sum()))
+                q.r1_left += 1
+            run.candidate_pairs += k
+        run.round1_tasks += len(tasks)
+        b.r1_left = len(tasks)
+        if prof is not None:
+            prof.add("plan_r1", time.perf_counter() - t0)
+            b.r1_round = prof.begin_round("round1", min(workers, len(tasks)))
+        for task, tag in _lpt(tasks, costs):
+            self.round1.append((_round1_task, task, tag, b.r1_round))
+        self.open_batches.append(b)
+        for qi, q in enumerate(batch_queries):        # a query without round-1 tasks (no candidates: never here)
+            if q.r1_left == 0:
+                self._statistics_and_round2(b, qi)
+
+    def _next_tid(self) -> int:
+        self.tid += 1
+        return self.tid - 1
+
+    def _close_query(self, b: _Batch):
+        b.open -= 1
+        if b.open == 0:
+            self.open_batches.remove(b)
+            prof = self.run.prof
+            if prof is not None and b.r2_round is not None:
+                prof.add("round2", prof.end_round(None, self._round_workers(), b.r2_round))
+
+    def _round_workers(self) -> int:
+        return 1 if self.session.in_process else self.session.workers
+
+    # ---------------------------------------------------------------------------------------------------- round 1
+    def _round1_result(self, tag, res):
+        prof = self.run.prof
+        if prof is not None:
             tc = time.perf_counter()
+        _kind, b, qi, source, k0, k1 = tag
         tid, s_f, s_r, skipped = res
-        qi, source, k0, k1 = table[tid]
-        q = batch[qi]
+        q = b.queries[qi]
         if source == _PANEL:
             q.panel_f[k0:k1], q.panel_r[k0:k1] = s_f, s_r
             if np.any(skipped):
                 raise ValueError(f"query {q.qid!r} ({q.n} residues) is too long for the panel pass: its similarity "
-                                 f"with a panel member exceeds max_pair_cells={init.max_pair_cells} cells")
+                                 f"with a panel member exceeds max_pair_cells={self.init.max_pair_cells} cells")
         else:
             q.s_f[k0:k1], q.s_r[k0:k1], q.skipped[k0:k1] = s_f, s_r, skipped
+        q.r1_left -= 1
+        b.r1_left -= 1
         if prof is not None:
             prof.add("consume_r1", time.perf_counter() - tc)
-    run.workers = max(run.workers, pool.processes)
-    if prof is not None:
-        wall = time.perf_counter() - t1
-        prof.add("round1", wall)
-        prof.end_round(wall, pool.processes or 1)
+            if b.r1_left == 0:
+                prof.add("round1", prof.end_round(None, self._round_workers(), b.r1_round))
+        if q.r1_left == 0:
+            self._statistics_and_round2(b, qi)
+
+    def _statistics_and_round2(self, b: _Batch, qi: int):
+        run, prof = self.run, self.run.prof
+        q = b.queries[qi]
+        if prof is not None:
+            t0 = time.perf_counter()
+        _statistics(q, run)
+        q.panel_f = q.panel_r = None
+        if prof is not None:
+            prof.add("statistics", time.perf_counter() - t0)
+        if not q.surv.size:
+            self._close_query(b)
+            return
+        if prof is not None:
+            t0 = time.perf_counter()
+        wanted = {q.cand_ids[k] for k in q.surv.tolist()}
+        sequences = self.fetch(wanted)
+        missing = sorted(t for t in wanted if t not in sequences)
+        if missing:
+            raise ValueError(f"{len(missing)} target(s) have residue codes but no sequence in the sequence store "
+                             f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database disagree")
+        q.sequences = sequences
+        if prof is not None:
+            t1 = time.perf_counter()
+            prof.add("fetch", t1 - t0)
+        # round-2 tasks: the survivors in chunks of the batch's task size, longest first, ahead of round 1
+        q.parts = []
+        off, ln = q.cand_off[q.surv], q.cand_len[q.surv]
+        tasks, costs = [], []
+        for k0, k1 in plan_chunks(q.n, ln.tolist(), b.target):
+            pairs = np.column_stack((off[k0:k1], ln[k0:k1]))
+            tasks.append(((self._next_tid(), q.off, q.n, pairs), (2, b, qi, k0, k1)))
+            costs.append(q.n * int(pairs[:, 1].sum()))
+        q.r2_left = len(tasks)
+        b.r2_left += len(tasks)
+        run.round2_tasks += len(tasks)
+        if prof is not None:
+            prof.add("plan_r2", time.perf_counter() - t1)
+            if b.r2_round is None:
+                b.r2_round = prof.begin_round("round2", self._round_workers())
+        for task, tag in _lpt(tasks, costs):
+            self.round2.append((_round2_task, task, tag, b.r2_round))
+
+    # ---------------------------------------------------------------------------------------------------- round 2
+    def _round2_result(self, tag, res):
+        run, prof = self.run, self.run.prof
+        if prof is not None:
+            tc = time.perf_counter()
+        _kind, b, qi, k0, k1 = tag
+        tid, scores, ends, path, path_off, distinct, skipped = res
+        q = b.queries[qi]
+        want = q.s_f[q.surv[k0:k1]]
+        if np.any(skipped) or not np.array_equal(np.asarray(scores, np.float32).view(np.uint32),
+                                                 want.view(np.uint32)):
+            bad = np.flatnonzero(np.asarray(scores, np.float32).view(np.uint32) != want.view(np.uint32))
+            raise InternalError(
+                f"esm-codes Stage 2: the round-2 traceback score of query {q.qid!r} differs from its round-1 S_f "
+                f"(targets {[q.cand_ids[int(q.surv[k0 + i])] for i in bad[:_EXAMPLES].tolist()]}: "
+                f"{np.asarray(scores)[bad[:_EXAMPLES]].tolist()} vs {want[bad[:_EXAMPLES]].tolist()}); the reported "
+                "raw score would not be the one behind the E-value")
+        part = (k0, np.asarray(ends), np.asarray(path), np.asarray(path_off, np.int64), np.asarray(distinct, np.int64))
+        q.parts.append(part)
+        q.r2_left -= 1
+        b.r2_left -= 1
+        if prof is not None:
+            prof.round2_payload(sum(int(a.nbytes) for a in part[1:]), len(part[4]))
+            prof.add("consume_r2", time.perf_counter() - tc)
+        if q.r2_left == 0:
+            if prof is not None:
+                held = sum(int(a.nbytes) for p in q.parts for a in p[1:])
+            self.results[q.qid] = _hits(q, run, q.sequences)
+            q.sequences = None
+            if prof is not None:
+                prof.round2_payload(-held, -int(q.surv.size))
+            self._close_query(b)
 
 
 def _statistics(q: _Query, run: _Run):
@@ -1178,55 +1509,6 @@ def _statistics(q: _Query, run: _Run):
         surv = valid & (np.nan_to_num(q.lne, nan=np.inf) <= run.ln_max)
     q.surv = np.flatnonzero(surv)
     run.survivors += int(q.surv.size)
-
-
-def _round2(batch: List[_Query], run: _Run, pool: CodeAlignmentPool, init: _WorkerInit):
-    prof = run.prof
-    if prof is not None:
-        t0 = time.perf_counter()
-    total = sum(q.n * int(q.cand_len[q.surv].sum()) for q in batch)
-    workers = pool.plan_workers(total)
-    target = target_task_cells(total, workers, run.task_cells)
-    tasks, costs, table = [], [], []
-    for qi, q in enumerate(batch):
-        q.parts = []
-        off, ln = q.cand_off[q.surv], q.cand_len[q.surv]
-        for k0, k1 in plan_chunks(q.n, ln.tolist(), target):
-            pairs = np.column_stack((off[k0:k1], ln[k0:k1]))
-            tasks.append((len(table), q.off, q.n, pairs))
-            costs.append(q.n * int(pairs[:, 1].sum()))
-            table.append((qi, k0, k1))
-    run.round2_tasks += len(tasks)
-    ordered = _lpt(tasks, costs)
-    if prof is not None:
-        t1 = time.perf_counter()
-        prof.add("plan_r2", t1 - t0)
-        prof.begin_round("round2", min(workers, len(tasks)))
-    for res in pool.run(_round2_task, ordered, init, profile=prof, workers=workers):
-        if prof is not None:
-            res = prof.received(res)
-            tc = time.perf_counter()
-        tid, scores, ends, path, path_off, distinct, skipped = res
-        qi, k0, k1 = table[tid]
-        q = batch[qi]
-        want = q.s_f[q.surv[k0:k1]]
-        if np.any(skipped) or not np.array_equal(np.asarray(scores, np.float32).view(np.uint32),
-                                                 want.view(np.uint32)):
-            bad = np.flatnonzero(np.asarray(scores, np.float32).view(np.uint32) != want.view(np.uint32))
-            raise InternalError(
-                f"esm-codes Stage 2: the round-2 traceback score of query {q.qid!r} differs from its round-1 S_f "
-                f"(targets {[q.cand_ids[int(q.surv[k0 + i])] for i in bad[:_EXAMPLES].tolist()]}: "
-                f"{np.asarray(scores)[bad[:_EXAMPLES]].tolist()} vs {want[bad[:_EXAMPLES]].tolist()}); the reported "
-                "raw score would not be the one behind the E-value")
-        q.parts.append((k0, np.asarray(ends), np.asarray(path), np.asarray(path_off, np.int64),
-                        np.asarray(distinct, np.int64)))
-        if prof is not None:
-            prof.add("consume_r2", time.perf_counter() - tc)
-    run.workers = max(run.workers, pool.processes)
-    if prof is not None:
-        wall = time.perf_counter() - t1
-        prof.add("round2", wall)
-        prof.end_round(wall, pool.processes or 1)
 
 
 def _assemble(q: _Query):

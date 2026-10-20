@@ -11,7 +11,9 @@ breakdown in ``stats["profile"]`` (:meth:`Stage2Profile.summary`):
 
 ``parent``  seconds per parent phase: ``setup``, ``collect`` (query checks), per batch ``lookup`` (SQLite lookup of
             the candidates' codes), ``plan_r1`` / ``plan_r2`` (task lists), ``round1`` / ``round2`` (wall time from the
-            first submit to the last result, including the pool start-up of the first batch), ``consume_r1`` /
+            first submit to the last result of each batch's round, including the pool start-up of the first batch; the
+            rounds of a batch, and of consecutive batches, overlap: the aligner runs Stage 2 as a dataflow, so the
+            phases add up to more than ``total``), ``consume_r1`` /
             ``consume_r2`` (the parent's work on each result), ``statistics`` (S, Q90, ln E, bits, survivors),
             ``fetch`` (survivor sequences), ``hits_assemble`` / ``hits_metrics`` (vectorised S12 metrics) /
             ``hits_objects`` (one ``Hit`` per kept survivor, CIGAR and strings) / ``hits_sort``, ``finish``,
@@ -29,8 +31,8 @@ breakdown in ``stats["profile"]`` (:meth:`Stage2Profile.summary`):
             between tasks, and per round the worker utilisation ``busy / (workers x wall)``.
 ``pool``    executor creation, workers, and per worker the delay from the first submit to its module import, its
             initializer seconds and when it was ready.
-``memory``  the largest worker and parent peak RSS (:func:`max_rss_bytes`) and the largest round-2 path payload held
-            by the parent for one batch (bytes, and bytes per survivor).
+``memory``  the largest worker and parent peak RSS (:func:`max_rss_bytes`) and the peak round-2 path payload held by
+            the parent at any time (bytes, the survivors it belonged to, and bytes per survivor).
 ``tasks``   the per-task records (kind, pid, n, pairs, cells, start / end, components), for the benchmark.
 """
 from __future__ import annotations
@@ -150,47 +152,68 @@ class Stage2Profile:
         self.workers = 0
         self.r2_parts_peak_bytes = 0
         self.r2_parts_peak_survivors = 0
+        self._r2_bytes = self._r2_surv = 0
 
     # ---------------------------------------------------------------------------------------------------- parent
     def add(self, phase: str, seconds: float) -> None:
         self.parent[phase] = self.parent.get(phase, 0.0) + seconds
 
-    def begin_round(self, name: str, workers: int) -> None:
-        self._submit = {}
+    def begin_round(self, name: str, workers: int) -> int:
+        """A new round (``round1`` / ``round2`` of one batch); returns its index. Rounds of different batches may
+        overlap in time (the aligner runs Stage 2 as a dataflow)."""
         self._round = dict(name=name, workers=int(workers), start_unix=time.time(), first_submit_unix=None,
-                           tasks=0)
+                           tasks=0, t_start=None)
         self.rounds.append(self._round)
+        return len(self.rounds) - 1
 
-    def end_round(self, wall: float, workers: int) -> None:
-        if self._round is not None:
-            self._round.update(wall=wall, end_unix=time.time(), workers=max(int(workers), self._round["workers"]))
-        self._round = None
+    def round_started(self, rnd: int) -> None:
+        """The first task of round ``rnd`` is being submitted (or run in-process): its wall time starts here."""
+        rd = self.rounds[rnd]
+        if rd["t_start"] is None:
+            rd["t_start"] = time.perf_counter()
+            rd["start_unix"] = time.time()
 
-    def submitted(self, task) -> None:
-        """Called by the pool for each task as it is submitted: its time, and its pickled size (an estimate of the
-        pickling the executor does; the time this takes is counted as profiling overhead)."""
+    def end_round(self, wall: Optional[float], workers: int, rnd: Optional[int] = None) -> float:
+        """Round ``rnd`` (default: the latest) is complete; ``wall`` None measures it from :meth:`round_started`.
+        Returns the wall time."""
+        rd = self.rounds[-1 if rnd is None else rnd] if self.rounds else None
+        if rd is None:
+            return 0.0
+        if wall is None:
+            wall = time.perf_counter() - rd["t_start"] if rd["t_start"] is not None else 0.0
+        rd.update(wall=wall, end_unix=time.time(), workers=max(int(workers), rd["workers"]))
+        if rd is self._round:
+            self._round = None
+        return wall
+
+    def submitted(self, task, rnd: Optional[int] = None) -> None:
+        """Called for each task submitted to the pool: its time, and its pickled size (an estimate of the pickling
+        the executor does; the time this takes is counted as profiling overhead). ``rnd``: its round (default: the
+        latest)."""
         now = time.time()
         p0 = time.perf_counter()
         self.task_bytes += len(pickle.dumps(task, protocol=pickle.HIGHEST_PROTOCOL))
         dt = time.perf_counter() - p0
         self.task_pickle_s += dt
         self.add("profile_overhead", dt)
+        rd = self.rounds[-1 if rnd is None else rnd] if self.rounds else None
         self._submit[int(task[0])] = now
-        if self._round is not None:
-            self._round["tasks"] += 1
-            if self._round["first_submit_unix"] is None:
-                self._round["first_submit_unix"] = now
+        if rd is not None:
+            rd["tasks"] += 1
+            if rd["first_submit_unix"] is None:
+                rd["first_submit_unix"] = now
 
-    def received(self, result: tuple) -> tuple:
-        """A task result with its trailing record: the record is kept (with the submit and receipt times) and the
-        plain result returned."""
+    def received(self, result: tuple, rnd: Optional[int] = None) -> tuple:
+        """A task result with its trailing record: the record is kept (with the submit and receipt times and its
+        round ``rnd``, default the latest) and the plain result returned."""
         rec = result[-1]
         rec["receive_unix"] = time.time()
         rec["submit_unix"] = self._submit.pop(int(result[0]), None)
-        rec["round"] = len(self.rounds) - 1
+        rec["round"] = len(self.rounds) - 1 if rnd is None else rnd
         init = rec.pop("init", None)
         if init is not None:
-            init["first_submit_unix"] = self.rounds[-1]["first_submit_unix"] if self.rounds else None
+            first = [r["first_submit_unix"] for r in self.rounds if r["first_submit_unix"] is not None]
+            init["first_submit_unix"] = min(first) if first else None
             self.inits.append(init)
         self.tasks.append(rec)
         return result[:-1]
@@ -200,12 +223,14 @@ class Stage2Profile:
         self.executors += 1
         self.workers = max(self.workers, int(workers))
 
-    def round2_parts(self, queries) -> None:
-        """The round-2 payload (ends, paths, offsets, distinct counts) the parent holds for one batch."""
-        nbytes = sum(int(a.nbytes) for q in queries for part in q.parts for a in part[1:])
-        if nbytes > self.r2_parts_peak_bytes:
-            self.r2_parts_peak_bytes = nbytes
-            self.r2_parts_peak_survivors = sum(int(q.surv.size) for q in queries)
+    def round2_payload(self, nbytes: int, survivors: int) -> None:
+        """The parent received (positive) or released (negative, once the query's hits are built) round-2 payload
+        (ends, paths, offsets, distinct counts) of ``survivors`` survivors; the peak of what it holds is kept."""
+        self._r2_bytes += int(nbytes)
+        self._r2_surv += int(survivors)
+        if self._r2_bytes > self.r2_parts_peak_bytes:
+            self.r2_parts_peak_bytes = self._r2_bytes
+            self.r2_parts_peak_survivors = self._r2_surv
 
     # ---------------------------------------------------------------------------------------------------- summary
     def summary(self, workers: int) -> Dict[str, Any]:
