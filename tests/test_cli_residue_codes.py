@@ -477,7 +477,8 @@ class BuildTest(_WithBundle):
         message = self.refused(result, CodeStoreValidationError)
         self.assertEqual(result.exception.__cause__.failures["c"], (1, ("2uzi_A",)))
         self.assertIn("empty payload", message)
-        self.assertIn(f"kept in {self.shards} (run id p56)", message)
+        # The command resolves --tmp-embedding-folder: on macOS the default TMPDIR is under /var -> /private/var.
+        self.assertIn(f"kept in {self.shards.resolve()} (run id p56)", message)
         # The pass wrote the empty payload, so the advice is a fresh build, not --from-shards.
         self.assertIn("rebuilding from the same shards would fail the same way", message)
         self.assertNotIn("--from-shards", message)
