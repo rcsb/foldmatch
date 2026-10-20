@@ -652,6 +652,48 @@ def _gapped(idx: np.ndarray, seq: np.ndarray) -> str:
     return out.tobytes().decode("ascii")
 
 
+class _PathStrings:
+    """The CIGAR and gapped-string columns of many paths at once (``path`` int [P, 2] with path k at
+    ``path[path_off[k]:path_off[k + 1]]``): per path the same strings as :func:`swkern.cigar_from_path` and
+    :func:`_gapped` of its segment, from one vectorised pass over all the columns. ``q_bytes`` the sanitised query,
+    ``t_bytes`` the sanitised targets concatenated (target k from ``t_starts[k]``)."""
+
+    def __init__(self, path, path_off, q_bytes, t_bytes, t_starts, *, cigar: bool, qaln: bool, taln: bool):
+        path = np.asarray(path).reshape(-1, 2)
+        self.path_off = np.asarray(path_off, np.int64)
+        self.cigar_tokens = self.run_starts = self.qaln = self.taln = None
+        if cigar:
+            ops = swkern.path_ops(path)
+            boundary = np.ones(len(ops), bool)
+            if len(ops) > 1:
+                boundary[1:] = ops[1:] != ops[:-1]
+            heads = self.path_off[:-1][np.diff(self.path_off) > 0]
+            boundary[heads] = True                          # every path starts a run
+            starts = np.flatnonzero(boundary)
+            runs = np.diff(np.append(starts, len(ops)))
+            self.run_starts = starts
+            self.cigar_tokens = [f"{r}{chr(o)}" for r, o in zip(runs.tolist(), ops[starts].tolist())]
+        if qaln or taln:
+            qi, tj = path[:, 0], path[:, 1]
+            if qaln:
+                g = np.full(len(path), ord("-"), np.uint8)
+                res = qi >= 0
+                g[res] = q_bytes[qi[res]]
+                self.qaln = g.tobytes()
+            if taln:
+                g = np.full(len(path), ord("-"), np.uint8)
+                res = tj >= 0
+                seg = np.repeat(np.arange(len(self.path_off) - 1), np.diff(self.path_off))
+                g[res] = t_bytes[np.asarray(t_starts, np.int64)[seg[res]] + tj[res]]
+                self.taln = g.tobytes()
+
+    def cigar(self, lo: int, hi: int) -> str:
+        if hi <= lo:
+            return ""
+        a, b = np.searchsorted(self.run_starts, (lo, hi)).tolist()
+        return "".join(self.cigar_tokens[a:b])
+
+
 # =====================================================================================================================
 # the aligner
 # =====================================================================================================================
@@ -1171,7 +1213,9 @@ def _assemble(q: _Query):
 
 
 def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
-    """Metrics, ecal, filters and S14 order of one query's survivors."""
+    """Metrics, ecal, filters and S14 order of one query's survivors. The per-hit values come from the vectorised
+    arrays as Python lists (``tolist`` gives the same ints and floats as ``int()`` / ``float()`` of each element), so
+    the loop only builds the objects."""
     needs, d = run.needs, run.domain
     prof = run.prof
     if prof is not None:
@@ -1181,11 +1225,13 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
         t1 = time.perf_counter()
         prof.add("hits_assemble", t1 - t0)
     surv = q.surv
+    surv_l = surv.tolist()
     q_bytes = np.frombuffer(sanitized_bytes(q.seq), np.uint8)
-    t_seqs = [sequences[q.cand_ids[k]] for k in surv.tolist()]
+    t_seqs = [sequences[q.cand_ids[k]] for k in surv_l]
     t_clean = [sanitized_bytes(s) for s in t_seqs]
     t_len = q.cand_len[surv]
-    bad = [q.cand_ids[int(surv[i])] for i, b in enumerate(t_clean) if len(b) != int(t_len[i])]
+    t_len_l = t_len.tolist()
+    bad = [q.cand_ids[surv_l[i]] for i, b in enumerate(t_clean) if len(b) != t_len_l[i]]
     if bad:
         raise ValueError(f"{len(bad)} target(s) have residue codes of another length than their stored sequence "
                          f"(first: {', '.join(bad[:_EXAMPLES])}): the code store and the database disagree")
@@ -1200,58 +1246,77 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
         qcov = cols["q_aligned"] / q.n
         tcov = np.where(t_len > 0, cols["t_aligned"] / np.maximum(t_len, 1), 0.0)
     kept = (aln_len > 0) & (identity >= run.min_id) & (np.minimum(qcov, tcov) >= run.min_cov)
+    kidx = np.flatnonzero(kept)
+    hits: List[Hit] = []
+    if kidx.size:
+        # every kept path (aln_len > 0) must end at the kernel's best cell
+        seg_lo, seg_hi = path_off[kidx], path_off[kidx + 1]
+        off_end = ~np.all(ends[kidx] == path[seg_hi - 1] + 1, axis=1)
+        if off_end.any():
+            i = int(kidx[np.flatnonzero(off_end)[0]])
+            raise InternalError(f"esm-codes Stage 2: the path of query {q.qid!r} against {q.cand_ids[surv_l[i]]!r} "
+                                f"does not end at the kernel's best cell {ends[i].tolist()}")
+        ks = surv[kidx]
+        kidx_l, ks_l, m_l = kidx.tolist(), ks.tolist(), t_len[kidx].tolist()
+        lo_l, hi_l = seg_lo.tolist(), seg_hi.tolist()
+        ident_l, qcov_l, tcov_l = identity[kidx].tolist(), qcov[kidx].tolist(), tcov[kidx].tolist()
+        aln_l, nid_l, mis_l, gap_l = (cols[c][kidx].tolist() for c in ("aln_len", "n_ident", "mismatch", "gap_open"))
+        qs_l, qe_l, ts_l, te_l = (cols[c][kidx].tolist() for c in ("q_start", "q_end", "t_start", "t_end"))
+        sf_l, sr_l, dist_l = q.s_f[ks].tolist(), q.s_r[ks].tolist(), distinct[kidx].tolist()
+        if run.need_panel:
+            lne_l, bits_l, sp_l = q.lne[ks].tolist(), q.bits[ks].tolist(), q.s_prime[ks].tolist()
     if prof is not None:
         t2 = time.perf_counter()
         prof.add("hits_metrics", t2 - t1)
 
-    q_inside = q.inside
-    hits: List[Hit] = []
+    q_inside, n = q.inside, q.n
     hd = run.hit_domain
     q_str = q_bytes.tobytes().decode("ascii") if needs.qseq else None
-    for i in np.flatnonzero(kept).tolist():
-        k = int(surv[i])
-        m = int(t_len[i])
-        t_nonstd = nonstandard_count(t_seqs[i]) / m if m else 1.0
-        t_long, t_nonstandard = m > d.target_max_length, t_nonstd > d.max_nonstandard_fraction
-        t_low = int(distinct[i]) < d.target_min_distinct_codes
-        ecal = q_inside and not (t_long or t_nonstandard or t_low)
-        hd["hits"] += 1
-        if not ecal:
-            hd["ecal0"] += 1
-            hd["query_outside"] += int(not q_inside)
-            hd["target_long"] += int(t_long)
-            hd["target_nonstandard"] += int(t_nonstandard)
-            hd["target_low_distinct"] += int(t_low)
-        seg = path[path_off[i]:path_off[i + 1]]
-        if not np.array_equal(ends[i], seg[-1] + 1):
-            raise InternalError(f"esm-codes Stage 2: the path of query {q.qid!r} against {q.cand_ids[k]!r} does not "
-                                f"end at the kernel's best cell {ends[i].tolist()}")
-        cigar = q_aln = t_aln = None
-        if needs.cigar:
-            cigar = swkern.cigar_from_path(seg)
-        t_arr = t_bytes[t_starts[i]:t_starts[i] + m]
-        if needs.qaln:
-            q_aln = _gapped(seg[:, 0], q_bytes)
-        if needs.taln:
-            t_aln = _gapped(seg[:, 1], t_arr)
-        if run.need_panel:
-            lne = float(q.lne[k])
-            with np.errstate(over="ignore", under="ignore"):
+    t_max, ns_max, cap = d.target_max_length, d.max_nonstandard_fraction, d.target_min_distinct_codes
+    strings = None
+    if kidx.size and (needs.cigar or needs.qaln or needs.taln):
+        strings = _PathStrings(path, path_off, q_bytes, t_bytes, t_starts, cigar=needs.cigar, qaln=needs.qaln,
+                               taln=needs.taln)
+    cand_ids, cand_emb, q90 = q.cand_ids, q.cand_emb, q.q90
+    lne = evalue = bit_score = s_prime = None
+    with np.errstate(over="ignore", under="ignore"):
+        for j, i in enumerate(kidx_l if kidx.size else ()):
+            k, m = ks_l[j], m_l[j]
+            t_nonstd = nonstandard_count(t_seqs[i]) / m if m else 1.0
+            t_long, t_nonstandard = m > t_max, t_nonstd > ns_max
+            t_low = dist_l[j] < cap
+            ecal = q_inside and not (t_long or t_nonstandard or t_low)
+            hd["hits"] += 1
+            if not ecal:
+                hd["ecal0"] += 1
+                hd["query_outside"] += int(not q_inside)
+                hd["target_long"] += int(t_long)
+                hd["target_nonstandard"] += int(t_nonstandard)
+                hd["target_low_distinct"] += int(t_low)
+            cigar = q_aln = t_aln = None
+            if strings is not None:
+                lo, hi = lo_l[j], hi_l[j]
+                if needs.cigar:
+                    cigar = strings.cigar(lo, hi)
+                if needs.qaln:
+                    q_aln = strings.qaln[lo:hi].decode("ascii")
+                if needs.taln:
+                    t_aln = strings.taln[lo:hi].decode("ascii")
+            if run.need_panel:
+                lne = lne_l[j]
                 evalue = float(np.exp(lne))
-            bit_score, q90, s_prime = float(q.bits[k]), q.q90, float(q.s_prime[k])
-        else:
-            lne = evalue = bit_score = q90 = s_prime = None
-        n_ident = int(cols["n_ident"][i])
-        metrics = AlignmentMetrics(
-            identity_aln=float(identity[i]), identity_shorter=n_ident / min(q.n, m),
-            query_coverage=float(qcov[i]), subject_coverage=float(tcov[i]), aln_len=int(aln_len[i]),
-            score=float(q.s_f[k]), bit_score=bit_score, pvalue=None, evalue=evalue, query_len=q.n, subject_len=m,
-            n_ident=n_ident, mismatch=int(cols["mismatch"][i]), gap_open=int(cols["gap_open"][i]),
-            q_start=int(cols["q_start"][i]), q_end=int(cols["q_end"][i]), t_start=int(cols["t_start"][i]),
-            t_end=int(cols["t_end"][i]), cigar=cigar, q_aln=q_aln, t_aln=t_aln, q_seq=q_str,
-            t_seq=t_arr.tobytes().decode("ascii") if needs.tseq else None,
-            score_rev=float(q.s_r[k]), q90=q90, score_adj=s_prime, log_evalue=lne, ecal=bool(ecal))
-        hits.append(Hit(subject_id=q.cand_ids[k], emb_score=q.cand_emb[k], metrics=metrics))
+                bit_score, s_prime = bits_l[j], sp_l[j]
+            n_ident = nid_l[j]
+            metrics = AlignmentMetrics(
+                identity_aln=ident_l[j], identity_shorter=n_ident / min(n, m),
+                query_coverage=qcov_l[j], subject_coverage=tcov_l[j], aln_len=aln_l[j],
+                score=sf_l[j], bit_score=bit_score, pvalue=None, evalue=evalue, query_len=n, subject_len=m,
+                n_ident=n_ident, mismatch=mis_l[j], gap_open=gap_l[j],
+                q_start=qs_l[j], q_end=qe_l[j], t_start=ts_l[j], t_end=te_l[j], cigar=cigar, q_aln=q_aln,
+                t_aln=t_aln, q_seq=q_str, t_seq=t_clean[i].decode("ascii") if needs.tseq else None,
+                score_rev=sr_l[j], q90=q90 if run.need_panel else None, score_adj=s_prime, log_evalue=lne,
+                ecal=bool(ecal))
+            hits.append(Hit(subject_id=cand_ids[k], emb_score=cand_emb[k], metrics=metrics))
     if prof is not None:
         t3 = time.perf_counter()
         prof.add("hits_objects", t3 - t2)

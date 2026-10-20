@@ -651,6 +651,34 @@ class PathMetricsTest(unittest.TestCase):
         self.assertEqual(ca.nonstandard_count("ACDXBZ*_-"), 6)
         self.assertEqual(ca.nonstandard_count(STANDARD_AMINO_ACIDS), 0)
 
+    def test_vectorised_strings_equal_the_per_path_builders(self):
+        """_PathStrings over many paths at once == cigar_from_path / _gapped path by path (empty paths included)."""
+        rng = np.random.default_rng(8)
+        paths, t_seqs = [], []
+        q16 = _f1()[2]["q16"]
+        qseq = _random_seq(rng, len(q16))
+        for p in _f1()[:30]:
+            a = swkern.align(swkern.query_prep(q16), p["codes"], [0, len(p["codes"])], swkern.SETTING_D)
+            paths.append(a.path_of(0))
+            t_seqs.append(_random_seq(rng, len(p["codes"])))
+        paths.insert(3, np.zeros((0, 2), np.int32))
+        t_seqs.insert(3, _random_seq(rng, 12))
+        paths.append(np.zeros((0, 2), np.int32))
+        t_seqs.append(_random_seq(rng, 5))
+        path = np.concatenate(paths)
+        path_off = np.concatenate([[0], np.cumsum([len(p) for p in paths])])
+        t_starts = np.concatenate([[0], np.cumsum([len(t) for t in t_seqs])[:-1]])
+        q_bytes = np.frombuffer(qseq.encode(), np.uint8)
+        t_bytes = np.frombuffer("".join(t_seqs).encode(), np.uint8)
+        strings = ca._PathStrings(path, path_off, q_bytes, t_bytes, t_starts, cigar=True, qaln=True, taln=True)
+        for k, (p, tseq) in enumerate(zip(paths, t_seqs)):
+            lo, hi = int(path_off[k]), int(path_off[k + 1])
+            self.assertEqual(strings.cigar(lo, hi), swkern.cigar_from_path(p), k)
+            self.assertEqual(strings.qaln[lo:hi].decode(), ca._gapped(p[:, 0], q_bytes), k)
+            self.assertEqual(strings.taln[lo:hi].decode(), ca._gapped(p[:, 1], np.frombuffer(tseq.encode(), np.uint8)),
+                             k)
+        self.assertTrue(any("I" in swkern.cigar_from_path(p) or "D" in swkern.cigar_from_path(p) for p in paths))
+
     def test_distinct_codes_are_counted_up_to_the_s13_minimum(self):
         """The round-2 distinct-code count is min(distinct codes, cap), so 'fewer than cap' is decided exactly."""
         rng = np.random.default_rng(12)
