@@ -27,8 +27,8 @@ FMSW_API int probe_score_fwd_rev(const float *sim, int n, const int64_t *pair_of
     if (st) return st;
     if (K > 0 && (!s_fwd || !s_rev || !ws || !t)) return FMSW_ERR_ARGS;
     if (K > 0 && ws_len < fmsw_ws_floats(n, mmax)) return FMSW_ERR_WORKSPACE;
-    float *ra = ws, *rc = ws + n, *cb = ws + 2 * (size_t)n, *cd = ws + 2 * (size_t)n + (size_t)mmax;
-    float *dws = ws + 2 * ((size_t)n + (size_t)mmax);
+    float *ra, *rc, *cb, *cd, *dws;
+    ws_layout(ws, n, mmax, &ra, &rc, &cb, &cd, &dws);
     for (int k = 0; k < K; k++) {
         const int mk = m[k];
         int bi, bj;
@@ -61,8 +61,8 @@ FMSW_API int probe_align_tb(const float *sim, int n, const int64_t *pair_off, co
     if (K > 0 && (!scores || !ends || !ws || !path_off || !path_buf || !flags || !t)) return FMSW_ERR_ARGS;
     if (K > 0 && ws_len < fmsw_ws_floats(n, mmax)) return FMSW_ERR_WORKSPACE;
     if (K > 0 && flags_len < fmsw_flag_bytes(n, mmax)) return FMSW_ERR_WORKSPACE;
-    float *ra = ws, *rc = ws + n, *cb = ws + 2 * (size_t)n, *cd = ws + 2 * (size_t)n + (size_t)mmax;
-    float *dws = ws + 2 * ((size_t)n + (size_t)mmax);
+    float *ra, *rc, *cb, *cd, *dws;
+    ws_layout(ws, n, mmax, &ra, &rc, &cb, &cd, &dws);
     int64_t po = 0;
     path_off[0] = 0;
     for (int k = 0; k < K; k++) {

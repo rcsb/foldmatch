@@ -16,7 +16,9 @@
  *   4. generic vector-extension path (-DFMSW_GENERIC, and the #else of the ISA selection), vmax = a > b ? a : b;
  *   5. int64 pair offsets, int32 lengths, size_t workspace sizes;
  *   6. every entry point returns a status (0 ok, 1 workspace too small, 2 bad arguments);
- *   7. ABI and provenance exports (the source sha256 is injected by the build).
+ *   7. ABI and provenance exports (the source sha256 is injected by the build);
+ *   8. (P7.2) the vector arrays of the workspace (cb, cd, Sv, P) start on 64-byte boundaries: a layout change only,
+ *      the values and the DP golden hash are unchanged.
  * -0 results are canonicalised to +0 (S8).
  */
 #include "fmsw.h"
@@ -328,23 +330,41 @@ static int traceback(const uint8_t *fl, int m, int bi, int bj, int32_t *path)
 /*   lane r-1 of step t-2 (= the previous step's 'up' vector), left = lane r of step t-1.             */
 /*   No masks: virtual cells left of column 1 reproduce the boundary (H = V = 0); virtual cells right */
 /*   of column m / below row n score BIG_NEG and can never beat the strict running best.              */
-/*   Workspace (floats): Hrow, Xrow [m + WS + 1] each, Sv [(m + WS + 4) WS], P [WS PADW(m)].         */
+/*   Workspace (floats): Hrow, Xrow [m + WS + 1] each, Sv [(m + WS + 4) WS], P [WS PADW(m)]; Sv and P */
+/*   start on 64-byte boundaries (align64f).                                                         */
 /*   Flags (traceback): strip-major [nstrips][m + WS][WS] bytes.                                     */
 /* ------------------------------------------------------------------------------------------------ */
 #define BIG_NEG (-1e30f)
 #define PADW(m) ((m) + 48)
+#define ALIGN_SLACK 16   /* floats: up to 15 skipped to start an array on a 64-byte boundary */
+
+/* the first 64-byte boundary at or after p: the vector arrays of the workspace (Sv, P, cb, cd) start there, whatever
+   n, m and the caller's buffer address, so their 16- and 32-byte vectors never straddle a cache line (layout only:
+   no value depends on where the workspace arrays are) */
+static inline float *align64f(float *p) { return (float *)(((uintptr_t)p + 63u) & ~(uintptr_t)63u); }
 
 static size_t ad_ws_floats(int64_t m)
 {
     const size_t mm = (size_t)m;
-    return 2 * (mm + WS + 1) + (mm + WS + 4) * WS + (size_t)WS * (mm + 48) + 64;
+    return 2 * (mm + WS + 1) + (mm + WS + 4) * WS + (size_t)WS * (mm + 48) + 64 + 2 * ALIGN_SLACK;
 }
 
 FMSW_API size_t fmsw_ws_floats(int n, int64_t mmax)
 {
     if (n < 0) n = 0;
     if (mmax < 0) mmax = 0;
-    return 2 * ((size_t)n + (size_t)mmax) + ad_ws_floats(mmax);
+    return 2 * ((size_t)n + (size_t)mmax) + 3 * ALIGN_SLACK + ad_ws_floats(mmax);
+}
+
+/* the pair drivers' workspace: ra, rc [n] at ws, then cb, cd [mmax] and the DP workspace, each from a 64-byte
+   boundary (fmsw_ws_floats counts the slack) */
+static void ws_layout(float *ws, int n, int64_t mmax, float **ra, float **rc, float **cb, float **cd, float **dws)
+{
+    *ra = ws;
+    *rc = ws + n;
+    *cb = align64f(ws + 2 * (size_t)n);
+    *cd = align64f(*cb + (size_t)mmax);
+    *dws = align64f(*cd + (size_t)mmax);
 }
 
 FMSW_API size_t fmsw_flag_bytes(int n, int64_t mmax)
@@ -405,8 +425,8 @@ float ad_core(const float *S, int n, int m, int64_t ld,
     const float NINF = -INFINITY;
     const int T = m + WS;                                   /* steps t = 0 .. T - 1 per strip (0 unused) */
     float *Hrow = ws, *Xrow = ws + (m + WS + 1);
-    float *Sv = ws + 2 * ((size_t)m + WS + 1);
-    float *P = Sv + ((size_t)m + WS + 4) * WS;
+    float *Sv = align64f(ws + 2 * ((size_t)m + WS + 1));
+    float *P = align64f(Sv + ((size_t)m + WS + 4) * WS);
     for (int j = 0; j <= m + WS; j++) { Hrow[j] = 0.0f; Xrow[j] = NINF; }
     float best = 0.0f;
     int bi = 0, bj = 0;
@@ -511,8 +531,8 @@ FMSW_API int fmsw_score_fwd_rev(const float *sim, int n, const int64_t *pair_off
     if (st) return st;
     if (K > 0 && (!s_fwd || !s_rev || !ws)) return FMSW_ERR_ARGS;
     if (K > 0 && ws_len < fmsw_ws_floats(n, mmax)) return FMSW_ERR_WORKSPACE;
-    float *ra = ws, *rc = ws + n, *cb = ws + 2 * (size_t)n, *cd = ws + 2 * (size_t)n + (size_t)mmax;
-    float *dws = ws + 2 * ((size_t)n + (size_t)mmax);
+    float *ra, *rc, *cb, *cd, *dws;
+    ws_layout(ws, n, mmax, &ra, &rc, &cb, &cd, &dws);
     for (int k = 0; k < K; k++) {
         const int mk = m[k];
         int bi, bj;
@@ -542,8 +562,8 @@ FMSW_API int fmsw_align(const float *sim, int n, const int64_t *pair_off, const 
     if (traceback_on && (!path_off || (K > 0 && (!path_buf || !flags)))) return FMSW_ERR_ARGS;
     if (K > 0 && ws_len < fmsw_ws_floats(n, mmax)) return FMSW_ERR_WORKSPACE;
     if (traceback_on && K > 0 && flags_len < fmsw_flag_bytes(n, mmax)) return FMSW_ERR_WORKSPACE;
-    float *ra = ws, *rc = ws + n, *cb = ws + 2 * (size_t)n, *cd = ws + 2 * (size_t)n + (size_t)mmax;
-    float *dws = ws + 2 * ((size_t)n + (size_t)mmax);
+    float *ra, *rc, *cb, *cd, *dws;
+    ws_layout(ws, n, mmax, &ra, &rc, &cb, &cd, &dws);
     int64_t po = 0;
     if (path_off) path_off[0] = 0;
     for (int k = 0; k < K; k++) {
