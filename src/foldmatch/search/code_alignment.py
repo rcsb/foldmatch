@@ -1168,7 +1168,8 @@ def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run)
 class _Batch:
     """One batch of queries in the dataflow: its round-1 task size, the queries not finished yet, its profile
     rounds."""
-    __slots__ = ("index", "queries", "target", "open", "r1_round", "r2_round", "r1_left", "r2_left")
+    __slots__ = ("index", "queries", "target", "open", "r1_round", "r2_round", "r1_left", "r2_left", "sequences",
+                 "clean")
 
     def __init__(self, index: int, queries: List[_Query]):
         self.index, self.queries = index, queries
@@ -1176,6 +1177,8 @@ class _Batch:
         self.open = len(queries)
         self.r1_round = self.r2_round = None
         self.r1_left = self.r2_left = 0
+        self.sequences: Dict[str, str] = {}      # the batch's survivor sequences fetched so far (as one batch fetch)
+        self.clean: Dict[str, Tuple[bytes, int]] = {}   # and their sanitised bytes and non-standard counts
 
 
 class _Dataflow:
@@ -1422,13 +1425,18 @@ class _Dataflow:
             return
         if prof is not None:
             t0 = time.perf_counter()
-        wanted = {q.cand_ids[k] for k in q.surv.tolist()}
-        sequences = self.fetch(wanted)
-        missing = sorted(t for t in wanted if t not in sequences)
-        if missing:
-            raise ValueError(f"{len(missing)} target(s) have residue codes but no sequence in the sequence store "
-                             f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database disagree")
-        q.sequences = sequences
+        # the sequences of this query's survivors not fetched for the batch yet (queries of a batch share targets)
+        known = b.sequences
+        wanted = {t for t in (q.cand_ids[k] for k in q.surv.tolist()) if t not in known}
+        if wanted:
+            fetched = self.fetch(wanted)
+            missing = sorted(t for t in wanted if t not in fetched)
+            if missing:
+                raise ValueError(f"{len(missing)} target(s) have residue codes but no sequence in the sequence store "
+                                 f"(first: {', '.join(missing[:_EXAMPLES])}): the code store and the database "
+                                 "disagree")
+            known.update((t, fetched[t]) for t in wanted)
+        q.sequences = known
         if prof is not None:
             t1 = time.perf_counter()
             prof.add("fetch", t1 - t0)
@@ -1477,7 +1485,7 @@ class _Dataflow:
         if q.r2_left == 0:
             if prof is not None:
                 held = sum(int(a.nbytes) for p in q.parts for a in p[1:])
-            self.results[q.qid] = _hits(q, run, q.sequences)
+            self.results[q.qid] = _hits(q, run, q.sequences, b.clean)
             q.sequences = None
             if prof is not None:
                 prof.round2_payload(-held, -int(q.surv.size))
@@ -1530,10 +1538,12 @@ def _assemble(q: _Query):
     return ends, path, path_off, distinct
 
 
-def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
+def _hits(q: _Query, run: _Run, sequences: Mapping[str, str],
+          clean: Optional[Dict[str, Tuple[bytes, int]]] = None) -> List[Hit]:
     """Metrics, ecal, filters and S14 order of one query's survivors. The per-hit values come from the vectorised
     arrays as Python lists (``tolist`` gives the same ints and floats as ``int()`` / ``float()`` of each element), so
-    the loop only builds the objects."""
+    the loop only builds the objects. ``clean``: a cache of each target's sanitised bytes and non-standard count by
+    id, shared by a batch's queries."""
     needs, d = run.needs, run.domain
     prof = run.prof
     if prof is not None:
@@ -1545,8 +1555,19 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
     surv = q.surv
     surv_l = surv.tolist()
     q_bytes = np.frombuffer(sanitized_bytes(q.seq), np.uint8)
-    t_seqs = [sequences[q.cand_ids[k]] for k in surv_l]
-    t_clean = [sanitized_bytes(s) for s in t_seqs]
+    t_ids = [q.cand_ids[k] for k in surv_l]
+    t_seqs = [sequences[t] for t in t_ids]
+    if clean is None:
+        t_clean = [sanitized_bytes(s) for s in t_seqs]
+        t_ns = [nonstandard_count(s) for s in t_seqs]
+    else:
+        t_clean, t_ns = [], []
+        for t, seq in zip(t_ids, t_seqs):
+            c = clean.get(t)
+            if c is None:
+                c = clean[t] = (sanitized_bytes(seq), nonstandard_count(seq))
+            t_clean.append(c[0])
+            t_ns.append(c[1])
     t_len = q.cand_len[surv]
     t_len_l = t_len.tolist()
     bad = [q.cand_ids[surv_l[i]] for i, b in enumerate(t_clean) if len(b) != t_len_l[i]]
@@ -1581,6 +1602,7 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
         aln_l, nid_l, mis_l, gap_l = (cols[c][kidx].tolist() for c in ("aln_len", "n_ident", "mismatch", "gap_open"))
         qs_l, qe_l, ts_l, te_l = (cols[c][kidx].tolist() for c in ("q_start", "q_end", "t_start", "t_end"))
         sf_l, sr_l, dist_l = q.s_f[ks].tolist(), q.s_r[ks].tolist(), distinct[kidx].tolist()
+
         if run.need_panel:
             lne_l, bits_l, sp_l = q.lne[ks].tolist(), q.bits[ks].tolist(), q.s_prime[ks].tolist()
     if prof is not None:
@@ -1600,7 +1622,7 @@ def _hits(q: _Query, run: _Run, sequences: Mapping[str, str]) -> List[Hit]:
     with np.errstate(over="ignore", under="ignore"):
         for j, i in enumerate(kidx_l if kidx.size else ()):
             k, m = ks_l[j], m_l[j]
-            t_nonstd = nonstandard_count(t_seqs[i]) / m if m else 1.0
+            t_nonstd = t_ns[i] / m if m else 1.0
             t_long, t_nonstandard = m > t_max, t_nonstd > ns_max
             t_low = dist_l[j] < cap
             ecal = q_inside and not (t_long or t_nonstandard or t_low)
