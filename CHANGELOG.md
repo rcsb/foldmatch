@@ -88,6 +88,100 @@ While the major version is `0`, breaking changes are released in a minor bump.
   meanwhile), and a refused or interrupted rebuild leaves the old one as it
   was. Shards without codes, of another encoding, or whose entry count
   differs from the database's are refused before anything is changed.
+- **A split sequence build for multi-node GPU runs: `fm-search build
+  sequences-embed`, `build sequences-index` and `build sequences-seal`.**
+  After its ESM3 pass, `build sequences` builds the FAISS index, the sequence
+  store and the residue-code store in one process, while the other nodes of
+  the job stay allocated: in a build of 30 million sequences on 8 GPU nodes
+  this phase took 7.4 of the 20.6 hours. The split build ends the GPU job with
+  the pass and builds the database in a job of its own on one CPU node; `build
+  sequences` itself is unchanged. Step 1, `build sequences-embed`, takes the
+  input and pass options of `build sequences` (`--fasta-file`, `--min-res-n`,
+  `--accelerator`, `--devices`, `--num-nodes`, `--strategy`, `--batch-size`,
+  `--num-workers`, `--residue-codes`), runs its pre-flight and ESM3 pass on
+  every rank and keeps the embedding shards in `--shards-folder` (the
+  `--tmp-embedding-folder` of `build sequences`, renamed); rank 0 then checks
+  them and writes, last, a run record `emb_<run id>.run.json` beside them,
+  which holds the FASTA's size, sha256 and pre-flight counts, each shard's
+  rows and size, the pass and `--output-db`, the database step 2 is to build
+  (refused if any of its files exists). Step 1 writes no database file and
+  logs the command of step 2. Step 2, `build sequences-index`, runs in one
+  process, without ESM3, a GPU or a download: it builds from the run in
+  `--from-shards` (`--run-id` picks one when the folder holds more than one
+  run, unfinished ones included), with the index options of `build sequences`
+  (`--index-type`, `--ivf-nlist`, `--ivf-nprobe`, `--load-batch-size`,
+  `--use-gpu-index`), into `--output-db`, which may differ from the recorded
+  one. Its `--residue-codes` defaults to what the run computed;
+  `--no-residue-codes` leaves the code store out (`build residue-codes
+  --from-shards --run-id` adds it later), and `--cleanup-embeddings` deletes
+  the record, then the shards, once the database is built. Before it writes
+  any database file, step 2 checks the record, that the shards are the
+  recorded ones with their sizes and rows, their schema (with codes, those of
+  the system the record names, with this FoldMatch's digests), the FASTA
+  against the record (its size, then its sha256, then its pre-flight counts)
+  and the id of every shard row against the FASTA entry the pass gave it. Step
+  1 takes a stat of the FASTA on every rank before its pre-flight and after
+  its pass, and step 2 around its own reads, so a FASTA that changes during
+  either step is refused (step 2 then removes the files it wrote). A rank may
+  read a node-local copy of the FASTA, which must be a byte copy of rank 0's:
+  only rank 0's copy is hashed. A run embedded by another FoldMatch version is
+  built with a warning. A FAISS refusal (an `ivf_pq` setting the data cannot
+  take, say) costs no GPU time: rerun step 2 with other options. From the same
+  shards, the two steps write the files of `build sequences` byte for byte,
+  except `build.created_utc` and `build.run_id` in the residue-code manifest
+  (and the copy in its index) and the added `build.split: true`; `hnsw` and
+  `ivf_pq` indexes are byte-identical, as between any two builds, only at one
+  thread, and an `ivf_pq` index holds the path of its `.invlists`, so only at
+  the same `--output-db`. Every refusal of the three commands is a one-line
+  error with exit status 1 (2 for a usage error), with or without
+  `--residue-codes`. The recipe: run `fm-search download-models` once on a
+  login node first (no rank of a multi-node `--residue-codes` run downloads);
+  run step 1 in the GPU job as `srun --kill-on-bad-exit=1 ... fm-search build
+  sequences-embed ...`, with a generous wall time (step 1 cannot resume) and
+  one shards folder per build on storage that every node can write and that
+  outlives the job (such as `$SCRATCH`); and run step 2 as its own job on one
+  CPU node, submitted with `sbatch -C cpu -N 1 --dependency=afterok:<job 1>
+  --kill-on-invalid-dep=yes` and started without srun, with a generous wall
+  time too: the `faiss-cpu` 1.13.2 wheel bundles a single-threaded BLAS, so at
+  30 million sequences an `ivf_pq` index takes about 7 to 8 hours whatever the
+  thread count (7.1 hours in an 8-node build; in a replay, 1 h 50 min to train
+  and about 6.4 hours of adds): ask for 10 to 12 hours, more with
+  `--residue-codes`. With a FAISS built on a multi-threaded BLAS (FAISS 1.15.1
+  with MKL from the official `pytorch` conda channel), the same index took 43
+  minutes on one CPU node at 128 threads; the index phase logs a line, a
+  warning except on macOS, when FAISS's BLAS is single-threaded. A step 2
+  killed by its wall time cannot resume: it leaves `<output-db>.build.lock`
+  and partial database files, which the next step 2 lists and which must be
+  deleted before FAISS is rebuilt from scratch. A project with GPU hours only
+  may run step 2 on one GPU node, where `ivf_pq` fits (`flat` and `hnsw` may
+  not). To keep several builds in one folder, set `FOLDMATCH_RUN_ID` in job 1
+  and pass the same value to step 2 as its `--run-id`. Step 2 and the seal
+  refuse to run as one of several ranks, or in the batch step of a job of more
+  than one node, and warn in a one-task srun step of such a job and in a
+  one-node job with GPUs. Step 2 sets FAISS's OpenMP threads to the physical
+  cores it may use (and the threads of the BLAS libraries threadpoolctl finds,
+  which it logs), unless `OMP_NUM_THREADS` (for BLAS also
+  `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` or `VECLIB_MAXIMUM_THREADS`) is
+  set; on macOS it leaves them as they are. It holds a lock,
+  `<output-db>.build.lock`, while it builds, so a second step 2 into the same
+  database is refused; a lock left by a killed job is reported with its
+  content, the database files present and what to delete. `build
+  sequences-seal --fasta-file F --from-shards S --run-id X` recovers shards
+  that have no record: those of a step 1 whose rank 0 stopped after the pass
+  (wall time, out of memory, a full disk; when step 1 itself refuses then, its
+  error gives the command), and those a `build sequences` kept when its index
+  phase failed. In one process and without ESM3, it checks them against the
+  FASTA (the entry count, each rank's rows, the shard schema and the id of
+  every row, and with residue codes each row's `seq_sha1` against the sha1 of
+  its sequence) and writes their record, marked as sealed (step 2 then warns
+  that the shards are bound by these checks, not by the pass, and takes the
+  FoldMatch version of the pass from residue-code shards, the only ones that
+  record it). A run without residue codes needs the `--min-res-n` it used,
+  which its shards do not record. Shards written by FoldMatch 0.8.0 and
+  earlier embedded the FASTA's sequences before they were normalised, so a
+  database sealed from them matches a fresh build only when the FASTA's
+  sequences are uppercase with no whitespace inside their lines; otherwise
+  embed them again.
 - **`fm-search query sequences --scoring esm-codes`** (opt-in; `--scoring
   blosum62`, the BLOSUM62 Stage 2 as before, stays the default). Stage 2
   aligns each query with its Stage-1 candidates through their ESM3 residue
@@ -257,6 +351,28 @@ While the major version is `0`, breaking changes are released in a minor bump.
   reused `FOLDMATCH_RUN_ID`). After a FASTA pass, rank 0 checks that the shards
   hold exactly one embedding per entry, and a missing rank is now an error
   instead of being dropped silently.
+- **`fm-search build sequences` logs its index phase.** When rank 0 starts the
+  FAISS index it logs the FAISS version and OpenMP threads, how many of the
+  node's CPUs (and physical cores) the process may use, and `OMP_NUM_THREADS`,
+  with one line per thread pool threadpoolctl finds; a line naming FAISS's
+  BLAS library when it is single-threaded, as the `faiss-cpu` 1.13.2 wheel's
+  is (a warning, except on macOS: the `ivf_pq` training and adds then run on
+  one core, and a FAISS built on a multi-threaded BLAS builds a
+  30-million-entry `ivf_pq` index about 10 times faster); and, except on
+  macOS, a warning when FAISS has fewer threads than usable physical cores,
+  naming the cause: `OMP_NUM_THREADS`, which Lightning's DDP launcher sets
+  during a multi-device pass when it is unset (to the CPUs the rank may use
+  divided by the devices per node; the lines say so, and exporting
+  `OMP_NUM_THREADS` before the run chooses FAISS's threads); then the time
+  taken by the FAISS index, the sequence store and the residue-code store. A
+  build on more than one node (`--num-nodes`) also logs that the other nodes
+  stay allocated through this one-process phase, and that `build
+  sequences-embed` and `build sequences-index` (see *Added*) release them. The
+  outputs are unchanged.
+- **The `--load-batch-size` help of the build commands is corrected.** It said
+  that larger batches (65536 and more) use many-core nodes better during an
+  IVF-PQ build, but FAISS adds IVF-PQ vectors in chunks of 32768 whatever the
+  batch: a larger one only takes more memory.
 - **`--max-evalue` against an empty database is an error.** With an E-value
   filter (including the default `--max-evalue 1e-3`), `fm-search query
   sequences`, `fm-search query db` and `align_candidates` now refuse a database
