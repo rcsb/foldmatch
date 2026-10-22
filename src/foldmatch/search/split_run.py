@@ -756,6 +756,18 @@ def build_lock(db_path, record: Dict[str, Any], *, shards_folder=None) -> Iterat
             lock.unlink()
 
 
+def code_store_command(db_path, record: Dict[str, Any], shards_folder=None) -> Optional[str]:
+    """The ``fm-search build residue-codes`` command that adds the residue-code store to the database at ``db_path``
+    from the record's run (``shards_folder`` holds its shards), when the run computed residue codes and the database
+    is complete but for that store (a step-2 build stopped after its sequence store); else ``None``."""
+    db_path = str(db_path)
+    if record.get("residue_output") != RESIDUE_CODES or not _only_code_store_pending(db_path):
+        return None
+    db_folder, index_name, _ = parse_db_path(db_path)
+    return (f"fm-search build residue-codes {db_folder} {index_name} --from-shards "
+            f"{shards_folder if shards_folder is not None else 'SHARDS'} --run-id {record['run_id']}")
+
+
 def _lock_refusal(lock: Path, db_path: str, record: Dict[str, Any], shards_folder) -> str:
     try:
         held = " ".join(lock.read_text(encoding="utf-8").split())
@@ -767,11 +779,9 @@ def _lock_refusal(lock: Path, db_path: str, record: Dict[str, Any], shards_folde
         f"present: {', '.join(path.name for path in files) if files else 'none'}. If no such job runs, delete the "
         f"lock and these files, then rerun."
     )
-    if record.get("residue_output") == RESIDUE_CODES and _only_code_store_pending(db_path):
-        db_folder, index_name, _ = parse_db_path(db_path)
+    command = code_store_command(db_path, record, shards_folder)
+    if command is not None:
         message += (
-            f" The database is complete but for its residue-code store: 'fm-search build residue-codes {db_folder} "
-            f"{index_name} --from-shards {shards_folder if shards_folder is not None else 'SHARDS'} --run-id "
-            f"{record['run_id']}' adds it (delete the lock first)."
+            f" The database is complete but for its residue-code store: '{command}' adds it (delete the lock first)."
         )
     return message

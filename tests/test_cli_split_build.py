@@ -1,14 +1,22 @@
 """P8b: the split sequence build (``build sequences-embed``, ``build sequences-index``, ``build sequences-seal``) and
 the phases of ``build sequences`` it shares with the one-shot build.
 
-No ESM3: the pass is ``fake_chain_predict`` and the spies are those of ``test_cli_residue_codes``. ``OneShotPhasesTest``
+No ESM3 except in ``RealEsm3SplitTest`` and ``TwoRankSplitSmoke`` (so a run of this module loads ESM3 on CPU): elsewhere
+the pass is ``fake_chain_predict`` and the spies are those of ``test_cli_residue_codes``. ``OneShotPhasesTest``
 (P8b.1) checks that ``build sequences`` runs its phases in the old order with the old arguments, the run binding and
 the pre-flight of ``EmbeddingComputer``, the index-phase log lines and the CPU-affinity message. ``EmbedOptionTest``,
 ``EmbedStepTest`` and ``EmbedRefusalTest`` (P8b.3) check step 1, ``build sequences-embed``: its options, the shards and
 the run record it leaves, and each of its refusals E1-E12 at its place. Two ranks are the fake pass's two shards plus a
-patched ``_gather_rank_facts`` that returns two ranks' facts.
+patched ``_gather_rank_facts`` that returns two ranks' facts. ``IndexOptionTest``, ``IndexStepTest`` and
+``IndexRefusalTest`` (P8b.4) check step 2, ``build sequences-index``: its options, that the two steps build the
+one-shot's database (``assert_same_database``), its threads, and each of its refusals I1-I24 at its place; step 2 runs
+under the ESM3 spy with ``scoring_system.prepare`` refusing. ``RealEsm3SplitTest`` runs both builds with the real CPU
+pass, and ``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
 """
+import dataclasses
 import errno
+import gc
+import glob
 import hashlib
 import json
 import logging
@@ -16,17 +24,23 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import ExitStack, chdir, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from typer.testing import CliRunner
 
+import esm_codes_bundle
 import foldmatch
 import foldmatch.search.code_alignment as code_alignment
 from foldmatch.cli import search
@@ -35,14 +49,15 @@ from foldmatch.search import scoring_system as ss
 from foldmatch.search.embedding_computer import EmbeddingComputer
 from foldmatch.search.embedding_database import EmbeddingDatabase
 from foldmatch.search.faiss_database import FaissEmbeddingDatabase
-from foldmatch.search.residue_code_store import ResidueCodeStore
+from foldmatch.search.residue_code_store import CodeStoreValidationError, ResidueCodeStore
 from foldmatch.search.residue_shards import META_PASS, pass_record, read_shard_info
 from foldmatch.search.sequence_store import SequenceStore
 from foldmatch.types.api_types import Accelerator, IndexConfig, IndexType, Strategy
 from foldmatch.utils.esm.loaders import ESM_REVISION
 from foldmatch.utils.sequence import preflight_fasta
-from test_cli_residue_codes import OTHER_ENCODING, PLAN_HELP, _esm3_spy, _Tmp, _WithBundle, _build_args, _write, \
-    fake_chain_predict, invoke, launch_env
+from test_cli_residue_codes import A4_XCPU_BITS, OTHER_ENCODING, PLAN_HELP, _DDP_ENV, _DDP_ENV_PREFIXES, \
+    _LAUNCH_ENV, _SITECUSTOMIZE, _SRC, _TWO_RANK_CHILD_ENV, _bits_equal, _esm3_spy, _f2c, _fake_codes, _Tmp, \
+    _WithBundle, _build_args, _write, fake_chain_predict, invoke, launch_env
 
 _TEST_PATH = Path(__file__).parent
 _FASTA = _TEST_PATH / "resources" / "fasta" / "test_sequences.fasta"
@@ -1142,6 +1157,1284 @@ class EmbedRefusalTest(_WithBundle):
                 self.assertIn(name, message)
                 self.assertEqual((self.shards / name).read_text(), "another process\n")
                 self.assert_seal_hint(message)
+
+
+# =====================================================================================================================
+# P8b.4: build sequences-index
+# =====================================================================================================================
+#: Plan P8b (CLI), verbatim: step 2's command help and the help texts it does not take from 'build sequences'.
+INDEX_HELP = (
+    "Step 2 of a split 'build sequences': build the database from the shards of one 'build sequences-embed' run, "
+    "after checking against its run record that they are complete and were computed from this FASTA: the FAISS "
+    "index, the sequence store and, when the run computed residue codes, the residue-code store, as 'build "
+    "sequences' builds them after its ESM3 pass. No ESM3, GPU or download. One process: run it as its own job on a "
+    "CPU node, not inside the GPU job; FAISS uses the node's physical cores unless OMP_NUM_THREADS is set."
+)
+INDEX_OWN_HELP = {
+    "fasta_file": "The FASTA file the run embedded. Checked against the run record (size, sha256, pre-flight counts) "
+                  "and against the id of every shard row; it may have moved since.",
+    "output_db": "Path to save the FAISS database (as for 'build sequences'). Usually the run's --output-db, which "
+                 "the record holds; another path is allowed.",
+    "from_shards": "Folder holding the shards and the run record of a 'build sequences-embed' run (its "
+                   "--shards-folder).",
+    "run_id": "Run id of the run to build from (its record is emb_<run id>.run.json; 'build sequences-embed' logs "
+              "it). Needed when the folder holds more than one run, unfinished ones included.",
+    "residue_codes": "Build the residue-code store from the run's codes (enabling `query sequences --scoring "
+                     "esm-codes`). Default: exactly when the run computed them ('build sequences-embed "
+                     "--residue-codes'). --residue-codes refuses a run without codes; --no-residue-codes leaves the "
+                     "store out (add it later with 'build residue-codes --from-shards').",
+    "cleanup_embeddings": "Delete the run's record, then its shards, from --from-shards once the database is built. "
+                          "Use it only on the last build from this run. Refused together with --no-residue-codes on a "
+                          "run with residue codes. By default they are kept.",
+}
+#: SLURM job variables that launch_env leaves alone and step 2's launch checks read.
+_JOB_ENV = ("SLURM_JOB_NUM_NODES", "SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS")
+#: The build-block keys in which a split-built code store may differ from the one-shot's (plan P8b, Identical outputs).
+_EXEMPT = ("created_utc", "run_id", "split")
+
+
+def _index_args(fasta, db, shards, *extra):
+    return ("build", "sequences-index", "--fasta-file", fasta, "--output-db", db, "--from-shards", shards, *extra)
+
+
+def _tree(*folders) -> dict:
+    """``{path: sha256}`` of every file under ``folders`` (``None`` for a folder), and whether each folder exists."""
+    out = {}
+    for folder in map(Path, folders):
+        out[str(folder)] = folder.exists()
+        for path in sorted(folder.rglob("*")):
+            out[str(path)] = None if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
+def _database_files(db) -> dict:
+    """``{suffix: path}`` of the files of the database at ``db`` (``--output-db``)."""
+    db = Path(db)
+    return {path.name[len(db.name):]: path for path in db.parent.glob(f"{glob.escape(db.name)}.*")}
+
+
+def _code_store_index(path):
+    """``(entries rows, meta rows)`` of a ``.rescodes.idx``."""
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return (con.execute("SELECT * FROM entries ORDER BY id").fetchall(),
+                dict(con.execute("SELECT key, value FROM meta").fetchall()))
+    finally:
+        con.close()
+
+
+def assert_same_database(a, b, exempt=_EXEMPT):
+    """Plan P8b (Identical outputs): the databases at ``a`` and ``b`` (``--output-db`` paths) have the same files, each
+    byte-identical except the residue-code store's index and manifest, which are equal in content: the ``entries``
+    rows equal, the ``meta`` rows equal except ``build_json``, which decodes to its own manifest's ``build`` block,
+    and the manifests equal except the ``build`` keys in ``exempt`` (present on one side or not)."""
+    files = _database_files(a), _database_files(b)
+    if sorted(files[0]) != sorted(files[1]):
+        raise AssertionError(f"{a} and {b} have other files: {sorted(files[0])} != {sorted(files[1])}")
+    for suffix in sorted(files[0]):
+        if suffix not in (".rescodes.idx", ".rescodes.json") and \
+                files[0][suffix].read_bytes() != files[1][suffix].read_bytes():
+            raise AssertionError(f"{files[0][suffix]} and {files[1][suffix]} differ")
+    if ".rescodes.json" not in files[0]:
+        return
+    stores = []
+    for side in files:
+        manifest = json.loads(side[".rescodes.json"].read_text())
+        entries, meta = _code_store_index(side[".rescodes.idx"])
+        build = json.loads(meta.pop("build_json"))
+        if build != manifest["build"]:
+            raise AssertionError(f"{side['.rescodes.idx']}: build_json {build} is not its manifest's build block "
+                                 f"{manifest['build']}")
+        manifest["build"] = {key: value for key, value in build.items() if key not in exempt}
+        stores.append((entries, meta, manifest))
+    for k, what in enumerate(("entries rows", "meta rows", "manifest")):
+        if stores[0][k] != stores[1][k]:
+            raise AssertionError(f"the code stores of {a} and {b} differ in their {what}: {stores[0][k]} != "
+                                 f"{stores[1][k]}")
+
+
+def _resync(record_path):
+    """Write the record's shard sizes and rows as the shards now have them (a shard rewritten on purpose)."""
+    record = json.loads(record_path.read_text())
+    for shard in record["shards"]:
+        path = record_path.parent / shard["name"]
+        shard.update(bytes=path.stat().st_size, rows=pq.read_metadata(path).num_rows)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def _edit_record(record_path, change):
+    """Rewrite the record as ``change(record)`` (a dict changed in place)."""
+    record = json.loads(record_path.read_text())
+    change(record)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def _one_residue_changed(path):
+    """Rewrite the FASTA at ``path`` with the first residue of its first sequence line replaced by another standard
+    residue: the same size, ids and pre-flight counts, another sha256. Its mtime is moved on by 1 s (as well as by the
+    write), so that a clock coarser than the test cannot hide the change from a stat bracket."""
+    path = Path(path)
+    stat = path.stat()
+    data = bytearray(path.read_bytes())
+    position = data.index(b"\n", data.index(b">")) + 1
+    data[position] = ord("W") if data[position] != ord("W") else ord("G")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.write_bytes(bytes(data))
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10 ** 9))
+    assert path.stat().st_size == stat.st_size
+    assert hashlib.sha256(path.read_bytes()).hexdigest() != before
+    return path
+
+
+class _SplitBuild(_WithBundle):
+    """Step 1 with the fake pass, step 2 under the ESM3 spy with ``scoring_system.prepare`` refusing (no bundle), and
+    the one-shot build to compare them with. The database goes into ``out``; the SLURM job variables are unset."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.dict(os.environ))
+        for name in _JOB_ENV:
+            os.environ.pop(name, None)
+        # On Linux the real widening would change this test process's CPU mask for the rest of the session; tests of
+        # the widening patch it themselves.
+        self.enterContext(mock.patch.object(alignment, "_expand_cpu_affinity", return_value=os.cpu_count() or 1))
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+        self.db = self.out / "db"
+
+    def embed(self, *extra, ranks=1, run_id="run", fasta=_FASTA, db=None, shards=None, gather=None, **fake):
+        """Step 1 (as ``EmbedStepTest.embed``), which must succeed; returns its record's path."""
+        shards = shards or self.shards
+        with launch_env(FOLDMATCH_RUN_ID=run_id), ExitStack() as stack:
+            stack.enter_context(mock.patch("foldmatch.search.embedding_computer.chain_predict",
+                                           fake_chain_predict(ranks=ranks, **fake)))
+            if gather is not None or ranks > 1:
+                stack.enter_context(mock.patch.object(search, "_gather_rank_facts",
+                                                      side_effect=gather or _ranks(ranks)))
+            result = invoke(*_embed_args(fasta, db or self.db, shards, *extra))
+        self.assertEqual(result.exit_code, 0, result.output)
+        return Path(shards) / f"emb_{run_id}.run.json"
+
+    def index(self, *extra, fasta=_FASTA, db=None, shards=None, env=None):
+        """Step 2 under the ESM3 spy, the bundle refused, with ``env`` set; returns the result."""
+        with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")), \
+                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}):
+            result = invoke(*_index_args(fasta, db or self.db, shards or self.shards, *extra))
+        esm3.assert_not_called()
+        return result
+
+    def built(self, *extra, **kwargs):
+        """Step 2, which must succeed and leave no build lock."""
+        result = self.index(*extra, **kwargs)
+        self.assertEqual(result.exit_code, 0, f"{result.output} {result.exception!r}")
+        db = kwargs.get("db") or self.db
+        self.assertFalse(Path(f"{db}.build.lock").exists())
+        return result
+
+    def oneshot(self, *extra, run_id="oneshot", fasta=_FASTA, ranks=1, **fake):
+        """``build sequences`` on the same input, into its own folders; returns its database path."""
+        db = self.tmp / f"{run_id}-db" / "db"
+        shards = self.tmp / f"{run_id}-shards"
+        shards.mkdir()
+        with launch_env(FOLDMATCH_RUN_ID=run_id), \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict",
+                           fake_chain_predict(ranks=ranks, **fake)):
+            result = invoke(*_build_args(fasta, db, shards, *extra))
+        self.assertEqual(result.exit_code, 0, result.output)
+        return db
+
+    def logged(self, call):
+        """``call()``'s root-logger records as ``(level, message)`` (``set_log_level`` would replace assertLogs'
+        handler)."""
+        with mock.patch.object(search, "set_log_level"), self.assertLogs(level="INFO") as logs:
+            call()
+        return [(record.levelname, record.getMessage()) for record in logs.records]
+
+
+class IndexOptionTest(_Tmp):
+
+    def test_the_command_help(self):
+        self.assertEqual(_command("build", "sequences-index").help, INDEX_HELP)
+        output = CliRunner().invoke(search.app, ["build", "sequences-index", "--help"], env={"COLUMNS": "400"}).output
+        for text in (INDEX_HELP, *INDEX_OWN_HELP.values()):
+            with self.subTest(text=text[:40]):
+                self.assertIn(text, _flat(output))
+
+    def test_the_options(self):
+        """Exactly step 2's options; the index options and --log-level are the one-shot's (type, default, help), the
+        others have the plan's help; --residue-codes is a tri-state (default None, D24)."""
+        index = {param.name: param for param in _command("build", "sequences-index").params}
+        oneshot = {param.name: param for param in _command("build", "sequences").params}
+        self.assertEqual(sorted(index), sorted([
+            "fasta_file", "output_db", "from_shards", "run_id", "residue_codes", "cleanup_embeddings",
+            "use_gpu_index", "index_type", "ivf_nlist", "ivf_nprobe", "load_batch_size", "log_level"]))
+
+        def info(param, *drop):
+            out = param.to_info_dict()
+            for key in ("name", "opts", "help", *drop):
+                out.pop(key)
+            return out
+
+        for name, param in index.items():
+            with self.subTest(name=name):
+                self.assertEqual(param.help, INDEX_OWN_HELP.get(name, oneshot.get(name) and oneshot[name].help))
+                if name in oneshot and name != "residue_codes":
+                    self.assertEqual(info(param), info(oneshot[name]))
+        from_shards = index["from_shards"]
+        self.assertEqual((from_shards.opts, from_shards.required, from_shards.type.exists, from_shards.type.dir_okay,
+                          from_shards.type.file_okay), (["--from-shards"], True, True, True, False))
+        self.assertEqual((index["run_id"].default, index["run_id"].required, index["run_id"].type.name),
+                         (None, False, "text"))
+        codes = index["residue_codes"]
+        self.assertEqual((codes.opts, codes.secondary_opts, codes.default, codes.type.name),
+                         (["--residue-codes"], ["--no-residue-codes"], None, "boolean"))
+        self.assertEqual(index["cleanup_embeddings"].default, False)
+
+    def test_options_another_command_owns(self):
+        """The pass's options (there is no pass; --min-res-n comes from the record), --shards-folder and
+        --tmp-embedding-folder (use --from-shards): exit 2, nothing read or written. A malformed --run-id is exit 2 too
+        (I1)."""
+        for option in (("--min-res-n", "0"), ("--accelerator", "cpu"), ("--num-nodes", "1"), ("--devices", "1"),
+                       ("--strategy", "auto"), ("--batch-size", "1"), ("--num-workers", "0"),
+                       ("--shards-folder", self.shards), ("--tmp-embedding-folder", self.shards), ("--force",)):
+            with self.subTest(option=option[0]), _esm3_spy() as esm3:
+                result = invoke(*_index_args(_FASTA, self.tmp / "db", self.shards, *option))
+                self.usage_error(result, f"No such option: {option[0]}")
+                esm3.assert_not_called()
+        for bad in ("a b", "a/b", "a*"):
+            with self.subTest(run_id=bad), mock.patch.object(split_run, "find_run") as find_run:
+                self.usage_error(invoke(*_index_args(_FASTA, self.tmp / "db", self.shards, "--run-id", bad)),
+                                 "is not a run id")
+                find_run.assert_not_called()
+        self.usage_error(invoke("build", "sequences-index", "--fasta-file", _FASTA, "--output-db", self.tmp / "db"),
+                         "--from-shards")
+        self.assertEqual(list(self.shards.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("db*")), [])
+
+    def test_the_from_shards_help_names_step_1(self):
+        """'build residue-codes' names step 1's shards in its --from-shards help and in its command help."""
+        param = next(p for p in _command("build", "residue-codes").params if p.name == "from_shards")
+        self.assertIn("or those of a 'build sequences-embed --residue-codes' run (its --shards-folder).", param.help)
+        self.assertIn("from the embedding shards its 'build sequences --residue-codes' run kept, or those of the "
+                      "'build sequences-embed --residue-codes' run it was built from, without running ESM3 again",
+                      _command("build", "residue-codes").help)
+
+    def test_the_load_batch_size_help(self):
+        """--load-batch-size has one help in every build command: FAISS adds IVF-PQ vectors in chunks of 32768, so a
+        larger batch changes only the memory (the older text claimed that larger batches use more cores)."""
+        expected = ("Number of vectors per batch streamed into the FAISS index; larger batches use more memory (FAISS "
+                    "adds IVF-PQ vectors in chunks of 32768 whatever this value).")
+        for name in ("structures", "embeddings", "sequences", "sequences-index"):
+            with self.subTest(command=name):
+                param = next(p for p in _command("build", name).params if p.name == "load_batch_size")
+                self.assertEqual(param.help, expected)
+
+
+class IndexStepTest(_SplitBuild):
+
+    def test_two_steps_equal_the_one_shot(self):
+        """Plain and codes, on 1 and 2 ranks, with --min-res-n 0 and 100: step 1 plus step 2 with no extra option build
+        the one-shot's database (assert_same_database); the code store's manifest says the build was split."""
+        for codes in (False, True):
+            for ranks in (1, 2):
+                for min_res_n in (0, 100):
+                    name = f"{'codes' if codes else 'plain'}{ranks}-{min_res_n}"
+                    with self.subTest(codes=codes, ranks=ranks, min_res_n=min_res_n):
+                        extra = ("--min-res-n", min_res_n, *(("--residue-codes",) if codes else ()))
+                        shards = self.tmp / f"shards-{name}"
+                        shards.mkdir()
+                        db = self.tmp / f"split-{name}" / "db"
+                        self.embed(*extra, ranks=ranks, run_id=f"split-{name}", shards=shards, db=db)
+                        self.built(shards=shards, db=db)
+                        oneshot = self.oneshot(*extra, run_id=f"one-{name}", ranks=ranks)
+                        assert_same_database(oneshot, db)
+                        self.assertEqual(sorted(_database_files(db)),
+                                         sorted([".index", ".metadata", ".sequences",
+                                                 *((".rescodes.bin", ".rescodes.idx", ".rescodes.json") if codes
+                                                   else ())]))
+                        if codes:
+                            build = ResidueCodeStore(db.parent, "db").check_compatible()["build"]
+                            self.assertEqual((build["split"], build["from_shards"], build["run_id"],
+                                              build["devices"]), (True, False, f"split-{name}", ranks))
+                            self.assertNotIn("split",
+                                             ResidueCodeStore(oneshot.parent, "db").check_compatible()["build"])
+                        self.assertEqual(len(list(shards.glob("*.parquet"))), len(split_run.dealt_rows(
+                            2 if min_res_n == 0 else 1, ranks)))  # the shards are kept
+
+    def test_hnsw_at_one_thread(self):
+        """--index-type hnsw: byte-identical too, at one FAISS thread (set explicitly, with OMP_NUM_THREADS=1 so that
+        step 2 leaves it; setting the variable alone after FAISS started would not change its threads). HNSW over the
+        fixture's two vectors is the same at any thread count, so this checks the equality, not thread determinism."""
+        import faiss
+        self.embed()
+        previous = faiss.omp_get_max_threads()
+        self.addCleanup(faiss.omp_set_num_threads, previous)
+        faiss.omp_set_num_threads(1)
+        with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "1"}):
+            self.built("--index-type", "hnsw")
+            assert_same_database(self.oneshot("--index-type", "hnsw"), self.db)
+        self.assertEqual(faiss.omp_get_max_threads(), 1)
+
+    def test_assert_same_database_sees_a_difference(self):
+        """The helper's own controls: another index, a missing file, another manifest field, another build key (in the
+        manifest and the index's build_json), a build_json that is not its manifest's, another entry row."""
+        self.embed("--residue-codes")
+        self.built()
+        oneshot = self.oneshot("--residue-codes")
+        assert_same_database(oneshot, self.db)
+        copy = self.tmp / "copy"
+        cases = {
+            "another index": (lambda db: Path(f"{db}.index").write_bytes(Path(f"{db}.index").read_bytes() + b"\0"),
+                              "db.index differ"),
+            "a missing file": (lambda db: Path(f"{db}.sequences").unlink(), "have other files"),
+            "another manifest field": (lambda db: _edit_record(
+                Path(f"{db}.rescodes.json"), lambda m: m.update(nonstandard_entries=99)), "differ in their manifest"),
+            "another build key": (lambda db: (
+                _edit_record(Path(f"{db}.rescodes.json"), lambda m: m["build"].update(devices=7)),
+                _execute(Path(f"{db}.rescodes.idx"),
+                         "UPDATE meta SET value = json_set(value, '$.devices', 7) WHERE key = 'build_json'")),
+                "differ in their manifest"),
+            "a build_json that is not its manifest's": (lambda db: _edit_record(
+                Path(f"{db}.rescodes.json"), lambda m: m["build"].update(devices=7)),
+                "is not its manifest's build block"),
+            "another entry": (lambda db: _execute(Path(f"{db}.rescodes.idx"),
+                                                  "UPDATE entries SET length = length + 1"), "differ in their entries"),
+        }
+        for case, (change, text) in cases.items():
+            with self.subTest(case=case):
+                shutil.rmtree(copy, ignore_errors=True)
+                shutil.copytree(self.out, copy)
+                change(copy / "db")
+                with self.assertRaises(AssertionError) as ctx:
+                    assert_same_database(oneshot, copy / "db")
+                self.assertIn(text, str(ctx.exception))
+        assert_same_database(oneshot, self.db, exempt=_EXEMPT)
+        with self.assertRaises(AssertionError) as ctx:
+            assert_same_database(oneshot, self.db, exempt=("created_utc", "run_id"))
+        self.assertIn("'split': True", str(ctx.exception))
+
+    def test_the_tri_state(self):
+        """The default follows the run: a code store for a codes run, none for a plain run; --residue-codes on a codes
+        run builds what the default builds."""
+        self.embed("--residue-codes", run_id="codes")
+        self.built("--run-id", "codes")
+        self.assertTrue(ResidueCodeStore(self.out, "db").exists())
+        self.built("--residue-codes", db=self.tmp / "explicit" / "db")
+        assert_same_database(self.db, self.tmp / "explicit" / "db")
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.embed(run_id="plain", shards=plain, db=self.tmp / "p" / "db")
+        self.built(shards=plain, db=self.tmp / "p" / "db")
+        self.assertEqual(sorted(_database_files(self.tmp / "p" / "db")), [".index", ".metadata", ".sequences"])
+
+    def test_no_residue_codes_on_a_codes_run(self):
+        """--no-residue-codes on a codes run builds the plain one-shot's database; a later 'build residue-codes
+        --from-shards --run-id' adds the one-shot's code store (bin_sha256, entries_digest)."""
+        self.embed("--residue-codes")
+        self.built("--no-residue-codes")
+        assert_same_database(self.oneshot(run_id="plain"), self.db)
+        result = invoke("build", "residue-codes", self.out, "db", "--from-shards", self.shards, "--run-id", "run")
+        self.assertEqual(result.exit_code, 0, result.output)
+        direct = ResidueCodeStore(self.oneshot("--residue-codes", run_id="codes").parent, "db").manifest()
+        added = ResidueCodeStore(self.out, "db").check_compatible()
+        self.assertEqual((added["bin_sha256"], added["entries_digest"]),
+                         (direct["bin_sha256"], direct["entries_digest"]))
+        self.assertEqual(sorted(p.name for p in self.shards.iterdir()), ["emb_run-0.parquet", "emb_run.run.json"])
+
+    def test_no_residue_codes_with_a_system_unknown_here(self):
+        """A codes run whose system this FoldMatch does not register: the default is refused (I10), and
+        --no-residue-codes builds the plain database from the shards' own consistency."""
+        self.embed("--residue-codes")
+        with mock.patch.object(ss, "REGISTRY", MappingProxyType({})):
+            self.assertIn("unknown esm-codes scoring system", self.refused(self.index()))
+            self.built("--no-residue-codes")
+        assert_same_database(self.oneshot(run_id="plain"), self.db)
+
+    def test_two_builds_from_one_run(self):
+        """Two step-2 builds from one run into two folders: the same database, and the shards and record unchanged."""
+        self.embed("--residue-codes", ranks=2)
+        before = _tree(self.shards)
+        self.built()
+        self.built(db=self.tmp / "second" / "db")  # a folder that does not exist yet
+        self.assertEqual(_tree(self.shards), before)
+        assert_same_database(self.db, self.tmp / "second" / "db")
+
+    def test_a_copied_folder_and_a_moved_fasta(self):
+        """A copy of the shards folder builds the database (the record names its shards by file name), and so does a
+        copy of the FASTA elsewhere with the same bytes (logged at INFO)."""
+        self.embed("--residue-codes")
+        copied = self.tmp / "copied"
+        shutil.copytree(self.shards, copied)
+        shutil.rmtree(self.shards)
+        moved = self.tmp / "elsewhere" / "seqs.fasta"
+        moved.parent.mkdir()
+        shutil.copyfile(_FASTA, moved)
+        messages = self.logged(lambda: self.built(shards=copied, fasta=moved))
+        self.assertIn(("INFO", f"{moved.resolve()} has the size and sha256 of the FASTA run run embedded, with another "
+                               f"path and modification time (recorded: {_FASTA.resolve()}, mtime_ns "
+                               f"{_FASTA.stat().st_mtime_ns})"), messages)
+        assert_same_database(self.oneshot("--residue-codes"), self.db)
+
+    def test_cleanup_embeddings(self):
+        """--cleanup-embeddings deletes the record, then the shards, after the code store; no lock is left."""
+        for codes in (True, False):
+            with self.subTest(codes=codes):
+                for path in [*self.shards.iterdir(), *self.out.iterdir()]:
+                    path.unlink()
+                record = self.embed(*(("--residue-codes",) if codes else ()))
+                seen = []
+                remove_shards = EmbeddingComputer.remove_shards
+
+                def removing(computer):
+                    seen.append((record.exists(), ResidueCodeStore(self.out, "db").exists(),
+                                 sorted(p.name for p in self.shards.iterdir())))
+                    remove_shards(computer)
+
+                with mock.patch.object(EmbeddingComputer, "remove_shards", autospec=True, side_effect=removing):
+                    self.built("--cleanup-embeddings")
+                self.assertEqual(seen, [(False, codes, ["emb_run-0.parquet"])])
+                self.assertEqual(list(self.shards.iterdir()), [])
+                self.assertEqual(sorted(p.name for p in self.out.iterdir()),
+                                 sorted(f"db{s}" for s in (".index", ".metadata", ".sequences",
+                                                           *((".rescodes.bin", ".rescodes.idx", ".rescodes.json")
+                                                             if codes else ()))))
+
+    def test_no_residue_codes_and_cleanup_on_a_plain_run(self):
+        """--no-residue-codes --cleanup-embeddings is refused only on a run with codes (I9): a plain run builds and
+        deletes its record and shards."""
+        self.embed()
+        self.built("--no-residue-codes", "--cleanup-embeddings")
+        self.assertEqual(list(self.shards.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["db.index", "db.metadata", "db.sequences"])
+
+    def test_the_index_options_reach_the_index_phase(self):
+        """Step 2's index options go to the index phase as given (the phase mocked: --use-gpu-index needs faiss-gpu),
+        with the pre-flight bound to the computer, so that get_embedding_batches counts the shard rows again."""
+        self.embed()
+        seen = []
+
+        def phase(computer, preflight, **kwargs):
+            seen.append((kwargs["index"], computer.expected_count, computer.preflight is preflight,
+                         preflight.entries_kept))
+
+        with mock.patch.object(search, "_build_sequence_database", side_effect=phase):
+            self.built("--index-type", "ivf_pq", "--ivf-nlist", "256", "--ivf-nprobe", "4", "--load-batch-size", "1000",
+                       "--use-gpu-index")
+        self.assertEqual(seen, [(search._IndexOptions(True, IndexType.ivf_pq, 256, 4, 1000), 2, True, 2)])
+
+    def test_the_pre_flight_is_the_records(self):
+        """Step 2's pre-flight runs with the record's min_res_n and strictness: strict for a codes run."""
+        for codes in (True, False):
+            with self.subTest(codes=codes):
+                for path in [*self.shards.iterdir(), *self.out.iterdir()]:
+                    path.unlink()
+                self.embed("--min-res-n", "100", *(("--residue-codes",) if codes else ()))
+                with mock.patch.object(search, "_fasta_preflight", wraps=search._fasta_preflight) as preflight:
+                    self.built()
+                self.assertEqual([(c.args[1], c.kwargs["strict"]) for c in preflight.call_args_list], [(100, codes)])
+
+    def test_the_manifest_of_a_split_build(self):
+        """build.split is set and from_shards false; the ESM3 revision is the shards' pass record's, not this
+        installation's pin; the other build keys are the one-shot's (they describe the pass)."""
+        self.embed("--residue-codes")
+        with mock.patch("foldmatch.search.residue_code_store._installed_esm_revision",
+                        return_value="another-installation"):
+            self.built()
+        split = ResidueCodeStore(self.out, "db").check_compatible()
+        self.assertEqual(split["esm"]["revision"], ESM_REVISION)
+        self.assertEqual(read_shard_info(self.shards / "emb_run-0.parquet").pass_record["esm_revision"], ESM_REVISION)
+        direct = ResidueCodeStore(self.oneshot("--residue-codes").parent, "db").manifest()
+        self.assertEqual({k: v for k, v in split["build"].items() if k not in _EXEMPT},
+                         {k: v for k, v in direct["build"].items() if k not in _EXEMPT})
+        self.assertEqual((split["build"]["split"], split["build"]["from_shards"], split["min_res_n"]), (True, False, 0))
+
+    def test_the_log_lines(self):
+        """The FASTA hash and id-check times, the run it builds from, the threads, the end line; a WARNING for another
+        FoldMatch's run and for a sealed record, an INFO line for another --output-db."""
+        record = self.embed("--residue-codes", ranks=2)
+        messages = self.logged(lambda: self.built())
+        db, shards = self.db, self.shards.resolve()
+        size = _FASTA.stat().st_size
+        found = [m for _, m in messages]
+        prefixes = (f"FASTA sha256 of {_FASTA.resolve()} ({size} bytes) in ", "Ids of the 2 shard rows checked "
+                    "against ", f"Building {db} from run run in {shards}: ", "Index phase: ",
+                    f"Database {db} built from run run in ")
+        lines = [[m for m in found if m.startswith(prefix)] for prefix in prefixes]
+        self.assertEqual([len(line) for line in lines], [1] * 5, found)
+        created = split_run.read_run_record(record)["created_utc"]
+        self.assertEqual(lines[2][0], f"Building {db} from run run in {shards}: 2 entries in 2 shard(s), embedded "
+                                      f"{created} by FoldMatch {foldmatch.__version__} on 2 rank(s) (cpu), residue "
+                                      f"codes of {SYSTEM.name}")
+        self.assertRegex(lines[4][0], r" in \d+\.\d s$")
+        order = [found.index(line[0]) for line in lines]
+        self.assertEqual(order, sorted(order))
+        self.assertFalse([m for level, m in messages if level == "WARNING" and "FoldMatch" in m])
+        self.assertFalse([m for m in found if "not the --output-db the run recorded" in m])
+
+        # Another FoldMatch's step 1: D30.
+        _edit_record(record, lambda r: r.update(foldmatch_version="0.0.1"))
+        messages = self.logged(lambda: self.built(db=self.tmp / "older" / "db"))
+        warnings = [m for level, m in messages if level == "WARNING"]
+        self.assertTrue([m for m in warnings if m.startswith(f"Run run was embedded by FoldMatch 0.0.1, and this is "
+                                                             f"FoldMatch {foldmatch.__version__}")], warnings)
+        self.assertFalse([m for m in warnings if "sequences-seal" in m], warnings)
+        start = next(m for _, m in messages if m.startswith("Building ") and " from run run " in m)
+        self.assertIn(f"embedded {created} by FoldMatch 0.0.1 on 2 rank(s) (cpu), residue codes", start)
+
+        # A sealed record holds the seal's FoldMatch; a codes run's pass record holds the pass's, which D30 compares.
+        def sealed_by(seal_version, pass_version):
+            def change(record_):
+                record_.update(foldmatch_version=seal_version, command=split_run.SEAL_COMMAND, sealed=True,
+                               output_db=None, options={})
+                record_["pass"]["foldmatch_version"] = pass_version
+            return change
+
+        for k, (seal_version, pass_version) in enumerate((("0.0.2", "0.0.1"), ("0.0.2", foldmatch.__version__))):
+            with self.subTest(seal=seal_version, run_pass=pass_version):
+                _edit_record(record, sealed_by(seal_version, pass_version))
+                other = self.tmp / f"sealed{k}" / "db"
+                messages = self.logged(lambda: self.built("--no-residue-codes", db=other))
+                warnings = [m for level, m in messages if level == "WARNING"]
+                d30 = [m for m in warnings if m.startswith("Run run was embedded by FoldMatch ")]
+                self.assertEqual(d30, [] if pass_version == foldmatch.__version__ else [
+                    f"Run run was embedded by FoldMatch 0.0.1, and this is FoldMatch {foldmatch.__version__}: its "
+                    f"record, shard schemas and digests, pre-flight counts and ids were checked, and the database is "
+                    f"built by this FoldMatch."])
+                self.assertIn(f"The record of run run was written by 'build sequences-seal' (FoldMatch 0.0.2): it "
+                              f"binds the shards to the FASTA by their entry count, rows and ids (and seq_sha1 when "
+                              f"the residue-code store is validated), not by the pass that wrote them.", warnings)
+                start = next(m for _, m in messages if m.startswith(f"Building {other} from run"))
+                self.assertEqual(start, f"Building {other} from run run in {shards}: 2 entries in 2 shard(s), sealed "
+                                        f"{created} by FoldMatch 0.0.2; embedded by FoldMatch {pass_version} on 2 "
+                                        f"rank(s) (cpu), its residue codes of {SYSTEM.name} left out "
+                                        f"(--no-residue-codes); sealed record")
+                self.assertFalse([m for _, m in messages if "not the --output-db" in m])  # a sealed record names none
+        _edit_record(record, lambda r: r.update(output_db="/elsewhere/db"))
+        messages = self.logged(lambda: self.built("--no-residue-codes", db=self.tmp / "third" / "db"))
+        self.assertIn(("INFO", f"Building {self.tmp / 'third' / 'db'}, not the --output-db the run recorded "
+                               f"(/elsewhere/db)"), messages)
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        plain_record = self.embed(run_id="plain", shards=plain, db=self.tmp / "p" / "db")
+        messages = self.logged(lambda: self.built(shards=plain, db=self.tmp / "p" / "db"))
+        start = next(m for _, m in messages if m.startswith("Building ") and " from run plain " in m)
+        self.assertTrue(start.endswith("on 1 rank(s) (device not recorded), no residue codes"), start)
+        # A sealed plain run: its pass record is the seal's, so the pass's FoldMatch is unknown (no D30).
+        _edit_record(plain_record, lambda r: r.update(foldmatch_version="0.0.2", command=split_run.SEAL_COMMAND,
+                                                      sealed=True, output_db=None, options={}))
+        plain_created = split_run.read_run_record(plain_record)["created_utc"]
+        messages = self.logged(lambda: self.built(shards=plain, db=self.tmp / "p2" / "db"))
+        warnings = [m for level, m in messages if level == "WARNING"]
+        self.assertFalse([m for m in warnings if "was embedded by FoldMatch" in m], warnings)
+        self.assertIn("The record of run plain was written by 'build sequences-seal' (FoldMatch 0.0.2): it binds the "
+                      "shards to the FASTA by their entry count, rows and ids (and seq_sha1 when the residue-code "
+                      "store is validated), not by the pass that wrote them, whose FoldMatch version is not recorded "
+                      "(shards without residue codes do not record it).", warnings)
+        start = next(m for _, m in messages if m.startswith("Building ") and " from run plain " in m)
+        self.assertTrue(start.endswith(f"sealed {plain_created} by FoldMatch 0.0.2; embedded by a FoldMatch it does "
+                                       f"not record on 1 rank(s) (device not recorded), no residue codes; sealed "
+                                       f"record"), start)
+
+    def test_the_logged_next_command_runs_verbatim(self):
+        """Step 1's next command, split as a shell splits it (paths with spaces, a relative --output-db recorded
+        absolute), builds the database step 1 recorded."""
+        folder = self.tmp / "with space"
+        folder.mkdir()
+        fasta = Path(shutil.copyfile(_FASTA, folder / "my seqs.fasta"))
+        shards = folder / "shard s"
+        shards.mkdir()
+        with chdir(folder):
+            messages = self.logged(lambda: self.embed("--residue-codes", fasta=fasta, shards=shards,
+                                                      db=Path("rel dir") / "my db"))
+        line = next(m for _, m in messages if m.startswith("Build the database with: "))
+        argv = shlex.split(line[len("Build the database with: "):])
+        self.assertEqual(argv[:3], ["fm-search", "build", "sequences-index"])
+        with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")):
+            result = invoke(*argv[1:])
+        esm3.assert_not_called()
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(ResidueCodeStore(folder / "rel dir", "my db").check_compatible())
+
+    def test_launch_warnings(self):
+        """A one-task srun step of a multi-node job, and a one-node job with GPUs: built, with a WARNING (D34)."""
+        self.embed()
+        cases = {
+            "an srun step": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 2, "SLURM_STEP_ID": 3,
+                              "SLURM_STEP_NUM_TASKS": 1, "SLURM_NTASKS": 8},
+                             "'build sequences-index' runs in a one-task srun step of SLURM job 42, which holds 2 "
+                             "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
+                             "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
+                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."),
+            "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_GPUS_ON_NODE": 4},
+                     "SLURM job 42 has GPUs (SLURM_GPUS_ON_NODE=4), which 'build sequences-index' does not use: run it "
+                     "as its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it "
+                     "on one GPU node, where ivf_pq fits (flat and hnsw may not)."),
+        }
+        for k, (case, (env, text)) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                messages = self.logged(lambda: self.built(env=env, db=self.tmp / f"w{k}" / "db"))
+                warnings = [m for level, m in messages if level == "WARNING"]
+                self.assertIn(text, warnings)
+                self.assertFalse([m for m in warnings if "afterok:42" in m], warnings)  # the build runs in job 42
+        messages = self.logged(lambda: self.built(env={"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1},
+                                                  db=self.tmp / "w" / "db"))
+        self.assertFalse([m for level, m in messages if level == "WARNING" and "SLURM job" in m])
+
+    def test_offline_with_an_empty_hf_cache(self):
+        """Step 2 as a command, with HF_HUB_OFFLINE=1 and an empty Hugging Face cache: the code store is built from
+        the registry entry alone."""
+        self.embed("--residue-codes")
+        empty = self.tmp / "empty-hf-cache"
+        empty.mkdir()
+        env = {k: v for k, v in os.environ.items()
+               if k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+        env.update(HF_HUB_OFFLINE="1", HF_HUB_CACHE=str(empty), HF_HOME=str(empty),
+                   PYTHONPATH=os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p]))
+        run = subprocess.run([sys.executable, "-m", "foldmatch.cli.search", *map(str, _index_args(
+            _FASTA, self.db, self.shards))], env=env, capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+        self.assertTrue(ResidueCodeStore(self.out, "db").check_compatible())
+        self.assertEqual(list(empty.rglob("models--*")), [])  # nothing fetched (transformers writes a version.txt)
+
+    # -- D29: the threads of the index phase (FAISS's thread calls and threadpoolctl's limit mocked) ------------------
+    #: threadpoolctl's runtimes as a Linux node might list them: two BLAS libraries (one of them twice) and an OpenMP.
+    POOLS = [{"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
+              "filepath": "/site-packages/numpy.libs/libscipy_openblas64_-ff651d7f.so"},
+             {"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
+              "filepath": "/site-packages/scipy.libs/libscipy_openblas-68440149.so"},
+             {"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
+              "filepath": "/elsewhere/libscipy_openblas-68440149.so"},
+             {"user_api": "openmp", "internal_api": "openmp", "num_threads": 6,
+              "filepath": "/site-packages/faiss/../faiss_cpu.libs/libgomp-a34b3233.so.1.0.0"}]
+
+    def threads(self, platform="linux", pools=POOLS, **env):
+        """``_whole_node_threads`` with ``env`` (the thread variables otherwise unset) on ``platform``, threadpoolctl
+        listing ``pools``: ``(FAISS thread calls inside the block, after it, threadpool_limits calls, (limit left
+        inside, after), log)``."""
+        clean = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS}
+        clean.update(env)
+        with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(sys, "platform", platform), \
+                mock.patch.object(code_alignment, "_physical_cpus", return_value=6), \
+                mock.patch("faiss.omp_get_max_threads", return_value=3), \
+                mock.patch("faiss.omp_set_num_threads") as set_threads, \
+                mock.patch("threadpoolctl.threadpool_info", return_value=pools), \
+                mock.patch("threadpoolctl.threadpool_limits") as limits, self.assertLogs(level="INFO") as logs:
+            with search._whole_node_threads():
+                inside = list(set_threads.call_args_list)
+                exited = limits.return_value.__exit__.called
+            after = list(set_threads.call_args_list)
+        return inside, after, list(limits.call_args_list), (exited, limits.return_value.__exit__.called), \
+            [record.getMessage() for record in logs.records]
+
+    def test_d29_threads_with_the_variables_unset(self):
+        """FAISS gets the physical cores (the previous count restored after the block), and so does BLAS; the INFO line
+        names the BLAS libraries threadpoolctl found (the limit reaches no other), or says it found none."""
+        inside, after, limits, exited, log = self.threads()
+        self.assertEqual(inside, [mock.call(6)])
+        self.assertEqual(after, [mock.call(6), mock.call(3)])
+        self.assertEqual(limits, [mock.call(limits=6, user_api="blas")])
+        self.assertEqual(exited, (False, True))
+        self.assertEqual(len(log), 1)
+        self.assertRegex(log[0], r"^FAISS/BLAS threads set to 6 \(physical cores of the \d+ allowed CPUs\); BLAS "
+                                 r"libraries limited: libscipy_openblas-68440149\.so, "
+                                 r"libscipy_openblas64_-ff651d7f\.so$")
+        *_, log = self.threads(pools=self.POOLS[3:])
+        self.assertRegex(log[0], r"^FAISS/BLAS threads set to 6 \(physical cores of the \d+ allowed CPUs\); "
+                                 r"threadpoolctl found no BLAS library to limit$")
+
+    def test_d29_omp_num_threads_set(self):
+        inside, after, limits, _, log = self.threads(OMP_NUM_THREADS="2")
+        self.assertEqual((inside, after, limits), ([], [], []))
+        self.assertEqual(log, ["FAISS threads left to OMP_NUM_THREADS=2; BLAS threads left to OMP_NUM_THREADS=2"])
+
+    def test_d29_a_blas_variable_set(self):
+        for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            with self.subTest(name=name):
+                inside, after, limits, _, log = self.threads(**{name: "1"})
+                self.assertEqual((inside, limits), ([mock.call(6)], []))
+                self.assertRegex(log[0], rf"^FAISS threads set to 6 \(physical cores of the \d+ allowed CPUs\); "
+                                         rf"BLAS threads left to {name}=1$")
+
+    def test_d29_never_on_macos(self):
+        for env in ({}, {"OMP_NUM_THREADS": "1"}):
+            with self.subTest(env=env):
+                inside, after, limits, _, log = self.threads(platform="darwin", **env)
+                self.assertEqual((inside, after, limits), ([], [], []))
+                self.assertEqual(log, ["FAISS/BLAS threads left as they are on macOS (foldmatch pins "
+                                       "OMP_NUM_THREADS)"])
+
+    def test_d29_restored_on_an_exception(self):
+        clean = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS}
+        with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(code_alignment, "_physical_cpus", return_value=6), \
+                mock.patch("faiss.omp_get_max_threads", return_value=3), \
+                mock.patch("faiss.omp_set_num_threads") as set_threads, \
+                mock.patch("threadpoolctl.threadpool_info", return_value=self.POOLS), \
+                mock.patch("threadpoolctl.threadpool_limits") as limits, self.assertRaises(RuntimeError):
+            with search._whole_node_threads():
+                raise RuntimeError("the index phase failed")
+        self.assertEqual(set_threads.call_args_list, [mock.call(6), mock.call(3)])
+        self.assertTrue(limits.return_value.__exit__.called)
+
+    def test_d29_step_2_sets_the_threads(self):
+        """Through the command: the affinity is widened for 'the index phase' before the run is read; FAISS and BLAS
+        get the physical cores for the index phase, which runs inside the limit, and FAISS's count is restored."""
+        self.embed()
+        clean = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS}
+        manager = mock.Mock()
+        with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(code_alignment, "_physical_cpus", return_value=6), \
+                mock.patch("faiss.omp_set_num_threads") as set_threads, \
+                mock.patch("threadpoolctl.threadpool_limits") as limits, \
+                mock.patch("threadpoolctl.threadpool_info", return_value=[]), \
+                mock.patch.object(alignment, "_expand_cpu_affinity", return_value=8) as widen, \
+                mock.patch.object(split_run, "find_run", wraps=split_run.find_run) as find_run, \
+                mock.patch.object(search, "_build_sequence_database", wraps=search._build_sequence_database) as phase:
+            for name, spy in (("widen", widen), ("find_run", find_run), ("set_threads", set_threads),
+                              ("limits", limits), ("phase", phase)):
+                manager.attach_mock(spy, name)
+            self.built()
+        calls = [c[0] for c in manager.mock_calls if not c[0].startswith("limits().")]
+        self.assertEqual(calls, ["widen", "find_run", "set_threads", "limits", "phase", "set_threads"])
+        self.assertEqual(widen.call_args, mock.call(purpose="the index phase"))
+        self.assertEqual(set_threads.call_args_list[0], mock.call(6))
+        self.assertEqual(limits.call_args, mock.call(limits=6, user_api="blas"))
+        self.assertEqual(phase.call_args.kwargs["split"], split_run.read_run_record(self.shards / "emb_run.run.json"))
+        self.assertIs(phase.call_args.kwargs["refusals"], search._refusals)
+
+
+def _execute(path, sql):
+    con = sqlite3.connect(path)
+    try:
+        con.execute(sql)
+        con.commit()
+    finally:
+        con.close()
+
+
+class IndexRefusalTest(_SplitBuild):
+
+    def setUp(self):
+        super().setUp()
+        self.inputs = self.tmp / "in"
+        self.inputs.mkdir()
+        self.fasta = Path(shutil.copyfile(_FASTA, self.inputs / "seqs.fasta"))
+
+    def refused_index(self, *extra, cause=None, env=None, shards=None):
+        """Step 2 refused (exit 1, a RefusalError), before ESM3, leaving the shards folder and the database folder as
+        they were (no lock, no database file, nothing changed; I22/I23 remove what they wrote). Returns the
+        message."""
+        before = _tree(self.out, shards or self.shards)
+        result = self.index(*extra, fasta=self.fasta, shards=shards, env=env)
+        message = self.refused(result, cause)
+        self.assertEqual(_tree(self.out, shards or self.shards), before)
+        return message
+
+    def embed_run(self, *extra, **kwargs):
+        return self.embed(*extra, fasta=self.fasta, **kwargs)
+
+    # -- before the build lock ----------------------------------------------------------------------------------------
+    def test_i1_a_malformed_run_id(self):
+        self.embed_run()
+        self.usage_error(self.index("--run-id", "a b", fasta=self.fasta), "is not a run id")
+
+    def test_i2_one_of_several_ranks(self):
+        self.embed_run()
+        for env, launch in (({"WORLD_SIZE": 2}, "WORLD_SIZE=2"), ({"LOCAL_RANK": 1}, "LOCAL_RANK=1"),
+                            ({"SLURM_JOB_ID": 7, "SLURM_STEP_ID": 0, "SLURM_STEP_NUM_TASKS": 2},
+                             "SLURM_STEP_NUM_TASKS=2")):
+            with self.subTest(env=env), mock.patch.object(split_run, "find_run") as find_run, \
+                    mock.patch.object(alignment, "_expand_cpu_affinity") as widen:
+                message = self.refused_index(env=env)
+                find_run.assert_not_called()
+                widen.assert_not_called()
+            self.assertEqual(message, f"'build sequences-index' runs as one process ({launch}): launch it once, "
+                                      f"directly in the batch script or with srun -n 1.")
+
+    def test_i3_the_batch_step_of_a_multi_node_job(self):
+        self.embed_run()
+        with mock.patch.object(split_run, "find_run") as find_run:
+            message = self.refused_index(env={"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8})
+        find_run.assert_not_called()
+        self.assertIn("SLURM job 4711 holds 2 nodes", message)
+        # No dependency on the job being refused: its afterok would never be met.
+        self.assertTrue(message.endswith(
+            "Run it as its own one-node CPU job instead: once this job has ended, sbatch -C cpu -N 1 ... (no "
+            "dependency is needed then); next time, submit it from the GPU job's script before the job's work starts: "
+            "sbatch -C cpu -N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."), message)
+        self.assertNotIn("afterok:4711", message)
+
+    def test_i4_no_run_with_a_record(self):
+        record = self.embed_run()
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertIn("No run in", self.refused_index(shards=empty))
+        record.unlink()
+        message = self.refused_index()
+        self.assertIn("Run run in", message)
+        self.assertIn("has no run record (1 shard(s), no run record): it did not finish, or its shards were kept by "
+                      "'build sequences'", message)
+        self.assertIn("'fm-search build sequences-seal --fasta-file FASTA --from-shards", message)
+        for path in self.shards.iterdir():
+            path.unlink()
+        (self.shards / "emb_run.run.json.tmp").write_text("{}")
+        message = self.refused_index()
+        self.assertIn("an unfinished run record (.tmp)", message)
+        self.assertIn(f"delete {self.shards.resolve() / 'emb_run.run.json.tmp'} first", message)
+
+    def test_i5_several_runs(self):
+        self.embed_run()
+        self.embed_run(run_id="run2", db=self.tmp / "other")
+        (self.shards / "emb_run3-0.parquet").write_bytes(b"a run without a record")
+        message = self.refused_index()
+        self.assertIn("holds 3 runs: run (run record, 1 shard(s)); run2 (run record, 1 shard(s)); run3 (1 shard(s), "
+                      "no run record)", message)
+        self.assertIn("Pass --run-id", message)
+        self.built("--run-id", "run2", fasta=self.fasta)
+
+    def test_i6_a_run_id_without_a_record(self):
+        self.embed_run()
+        message = self.refused_index("--run-id", "nope")
+        self.assertIn("Run nope has no run record (emb_nope.run.json)", message)
+        self.assertIn("Runs with a record here: run.", message)
+
+    def test_i7_an_invalid_record(self):
+        record = self.embed_run()
+        original = record.read_text()
+        cases = {
+            "another kind": (lambda r: r.update(kind="other"), "kind is 'other'"),
+            "a newer version": (lambda r: r.update(record_version=2), "upgrade FoldMatch"),
+            "a missing key": (lambda r: r.pop("rows"), "the key rows is missing"),
+            "another run id": (lambda r: r.update(run_id="other"), "but the file is named for run 'run'"),
+        }
+        for case, (change, text) in cases.items():
+            with self.subTest(case=case):
+                record.write_text(original)
+                _edit_record(record, change)
+                self.assertIn(text, self.refused_index())
+        record.write_text("not json")
+        self.assertIn("it is not JSON", self.refused_index())
+
+    def test_i8_residue_codes_on_a_plain_run(self):
+        self.embed_run()
+        message = self.refused_index("--residue-codes")
+        self.assertIn("Run run computed no residue codes", message)
+        self.assertIn("run step 1 with --residue-codes", message)
+
+    def test_i9_no_residue_codes_and_cleanup_on_a_codes_run(self):
+        self.embed_run("--residue-codes")
+        message = self.refused_index("--no-residue-codes", "--cleanup-embeddings")
+        self.assertIn("would delete the only copy of run run's residue codes", message)
+
+    def test_i10_the_run_system(self):
+        record = self.embed_run("--residue-codes")
+        with mock.patch.object(ss, "REGISTRY", MappingProxyType({})):
+            message = self.refused_index(cause=ss.UnknownScoringSystemError)
+        self.assertIn(f"unknown esm-codes scoring system '{SYSTEM.name}'", message)
+        self.assertIn("--no-residue-codes builds the database without its residue codes.", message)
+        _edit_record(record, lambda r: r["system"].update(digest="0" * 64))
+        message = self.refused_index()
+        self.assertIn(f"with digest {'0' * 64} and encoding_digest {SYSTEM.encoding_digest()}, but this "
+                      f"FoldMatch's {SYSTEM.name} has digest {SYSTEM.digest()}", message)
+
+    # -- inside the build lock, before any database file --------------------------------------------------------------
+    def test_i11_a_build_lock(self):
+        self.embed_run("--residue-codes")
+        lock = Path(f"{self.db}.build.lock")
+        lock.write_text('{"pid": 1, "host": "elsewhere"}\n')
+        Path(f"{self.db}.index").touch()
+        message = self.refused_index()
+        self.assertIn(f"{lock} exists ({{\"pid\": 1, \"host\": \"elsewhere\"}})", message)
+        self.assertIn("files present: db.index.", message)
+        self.assertIn("delete the lock and these files, then rerun", message)
+        self.assertNotIn("build residue-codes", message)
+        Path(f"{self.db}.metadata").touch()
+        SequenceStore(self.out, "db").create(self.fasta)
+        message = self.refused_index()
+        self.assertIn(f"'fm-search build residue-codes {self.out} db --from-shards {self.shards.resolve()} --run-id "
+                      f"run' adds it (delete the lock first).", message)
+
+    def test_i12_an_output_exists(self):
+        """Refused inside the lock before the shards are read or the FASTA hashed (patched to fail), so not by the
+        pre-flight's own outputs check, which comes after both."""
+        self.embed_run("--residue-codes")
+        def early():
+            stack = ExitStack()
+            stack.enter_context(mock.patch.object(split_run, "check_run_shards",
+                                                  side_effect=AssertionError("shards read")))
+            stack.enter_context(mock.patch.object(split_run, "fasta_sha256",
+                                                  side_effect=AssertionError("FASTA hashed")))
+            return stack
+
+        for suffix in (".index", ".metadata", ".invlists", ".sequences", ".rescodes.bin", ".rescodes.idx",
+                       ".rescodes.json", ".rescodes.json.tmp"):
+            with self.subTest(suffix=suffix):
+                existing = Path(f"{self.db}{suffix}")
+                existing.touch()
+                try:
+                    with early():
+                        message = self.refused_index(cause=FileExistsError)
+                finally:
+                    existing.unlink()
+                self.assertIn(f"Database already exists at {self.db} (found: {existing})", message)
+                self.assertNotIn("build residue-codes", message)
+        for suffix in (".index", ".metadata"):
+            Path(f"{self.db}{suffix}").touch()
+        SequenceStore(self.out, "db").create(self.fasta)
+        with early():
+            message = self.refused_index()
+        self.assertTrue(message.endswith(
+            f"The database is complete but for its residue-code store: 'fm-search build residue-codes {self.out} db "
+            f"--from-shards {self.shards.resolve()} --run-id run' adds it."), message)
+
+    def test_i13_the_recorded_shards(self):
+        self.embed_run(ranks=2)
+        shard = self.shards / "emb_run-1.parquet"
+        data = shard.read_bytes()
+        shard.unlink()
+        self.assertIn("missing emb_run-1.parquet", self.refused_index())
+        shard.write_bytes(data)
+        shutil.copyfile(shard, self.shards / "emb_run-7.parquet")
+        self.assertIn("not in the record emb_run-7.parquet", self.refused_index())
+
+    def test_i14_a_changed_shard(self):
+        self.embed_run()
+        shard = self.shards / "emb_run-0.parquet"
+        data = shard.read_bytes()
+        pq.write_table(pq.read_table(shard), shard, compression="none")
+        message = self.refused_index()
+        self.assertIn("1 shard(s) of run run in", message)
+        self.assertIn("changed since the run: emb_run-0.parquet (", message)
+        shard.write_bytes(b"\0" * len(data))  # the recorded size, no footer
+        self.assertIn("the footer of a shard of run run cannot be read", self.refused_index())
+
+    def test_i15_the_footers(self):
+        """Codes: a pass record with another --min-res-n (the shard's size and rows written into the record); under
+        --no-residue-codes, shards of another system than the record's; plain: a shard that is not plain."""
+        def rewritten(record, change):
+            _rewrite(self.shards / "emb_run-0.parquet", change)
+            _resync(record)
+
+        record = self.embed_run("--residue-codes")
+        rewritten(record, _with_pass(min_res_n=5))
+        self.assertIn("emb_run-0.parquet (min_res_n 5, world_size 1)", self.refused_index())
+        self.assertIn("emb_run-0.parquet (min_res_n 5, world_size 1)", self.refused_index("--no-residue-codes"))
+        for path in self.shards.iterdir():
+            path.unlink()
+        record = self.embed_run("--residue-codes")
+        _edit_record(record, lambda r: r["system"].update(name="esm-codes-test-other"))
+        message = self.refused_index("--no-residue-codes")
+        self.assertIn(f"hold the residue codes of {SYSTEM.name}", message)
+        self.assertIn("not those of esm-codes-test-other", message)
+        for path in self.shards.iterdir():
+            path.unlink()
+        record = self.embed_run()
+        rewritten(record, lambda table: table.replace_schema_metadata({b"foldmatch.residue_output": b"x"}))
+        self.assertIn("are not plain embedding shards", self.refused_index())
+
+    def test_i16_another_size(self):
+        self.embed_run()
+        size = self.fasta.stat().st_size
+        with open(self.fasta, "a") as f:
+            f.write(">late\nACDE\n")
+        with mock.patch.object(split_run, "fasta_sha256", side_effect=AssertionError("hashed")):
+            message = self.refused_index()
+        self.assertIn(f"{self.fasta.resolve()} has {size + 11} bytes, but the FASTA run run embedded "
+                      f"({self.fasta.resolve()}) had {size}", message)
+
+    def test_the_folders_a_refused_build_created_are_removed(self):
+        """A database folder that did not exist is created for the build lock and removed again by a refusal (here
+        I16); one that existed stays."""
+        self.embed_run()
+        with open(self.fasta, "a") as f:
+            f.write(">late\nACDE\n")
+        new = self.tmp / "new"
+        result = self.index(fasta=self.fasta, db=new / "deeper" / "db")
+        self.assertIn("bytes, but the FASTA run run embedded", self.refused(result))
+        self.assertFalse(new.exists())
+        (new / "deeper").mkdir(parents=True)
+        self.refused(self.index(fasta=self.fasta, db=new / "deeper" / "db"))
+        self.assertEqual(list((new / "deeper").iterdir()), [])
+
+    def test_i17_another_sha256(self):
+        self.embed_run()
+        data = bytearray(self.fasta.read_bytes())
+        position = data.index(b"\n", data.index(b">")) + 1
+        data[position] = ord("A") if data[position] != ord("A") else ord("C")
+        self.fasta.write_bytes(bytes(data))
+        message = self.refused_index()
+        self.assertIn("is not the FASTA run run embedded", message)
+        self.assertIn("though it has its size", message)
+
+    def test_i17_the_given_fasta_is_hashed(self):
+        """--fasta-file is what step 2 hashes: a same-size copy with one residue changed, given while the recorded
+        FASTA is still in place, is refused; the recorded one is untouched."""
+        self.embed_run()
+        given = self.tmp / "other" / "seqs.fasta"
+        given.parent.mkdir()
+        _one_residue_changed(shutil.copyfile(self.fasta, given))
+        recorded = self.fasta.read_bytes()
+        before = _tree(self.out, self.shards)
+        message = self.refused(self.index(fasta=given))
+        self.assertIn(f"{given.resolve()} (sha256 ", message)
+        self.assertIn(f"is not the FASTA run run embedded ({self.fasta.resolve()}, sha256", message)
+        self.assertEqual((self.fasta.read_bytes(), _tree(self.out, self.shards)), (recorded, before))
+
+    def test_i18_the_pre_flight(self):
+        """The pre-flight's own refusal and nothing to build (mocked: the FASTA has the recorded bytes)."""
+        self.embed_run()
+        from foldmatch.utils import sequence
+        with mock.patch.object(sequence.FastaPreflight, "check", side_effect=ValueError("a pre-flight refusal")):
+            self.assertIn("a pre-flight refusal", self.refused_index(cause=ValueError))
+        real = sequence.preflight_fasta
+
+        def nothing(path, min_res_n):
+            return dataclasses.replace(real(path, min_res_n), entries_kept=0)
+
+        with mock.patch.object(sequence, "preflight_fasta", side_effect=nothing):
+            self.assertIn("there is nothing to build", self.refused_index(cause=ValueError))
+
+    def test_i19_other_counts(self):
+        self.embed_run()
+        from foldmatch.utils import sequence
+        real = sequence.preflight_fasta
+
+        def counting_otherwise(path, min_res_n):
+            found = real(path, min_res_n)
+            return dataclasses.replace(found, residues=found.residues + 1)
+
+        with mock.patch.object(sequence, "preflight_fasta", side_effect=counting_otherwise):
+            message = self.refused_index()
+        self.assertIn("counts residues 304, but run run's record holds residues 303", message)
+        self.assertIn("this FoldMatch's pre-flight counts differently", message)
+
+    def test_i20_ids_not_at_their_dealt_positions(self):
+        record = self.embed_run()
+        shard = self.shards / "emb_run-0.parquet"
+        _rewrite(shard, lambda table: table.set_column(0, table.schema.field("id"),
+                                                       pa.array(table.column("id").to_pylist()[::-1],
+                                                                table.schema.field("id").type)))
+        _resync(record)
+        message = self.refused_index()
+        self.assertIn("2 shard row(s) of run run do not hold the id of the entry", message)
+        self.assertIn("emb_run-0.parquet row 0 holds '2uzi_A', entry 0 is '1acb_E'", message)
+
+    # -- the index phase ----------------------------------------------------------------------------------------------
+    def test_i21_a_faiss_refusal(self):
+        """ivf_pq on the fake 8-d embeddings (PQ m = 64 does not divide 8): nothing written, rerun with other
+        options."""
+        self.embed_run("--residue-codes")
+        message = self.refused_index("--index-type", "ivf_pq", cause=ValueError)
+        self.assertIn("must divide embedding dim D=8", message)
+        self.assertIn("'build sequences-index' can be rerun with other index options, without a new ESM3 pass.",
+                      message)
+        self.built("--index-type", "flat", fasta=self.fasta)
+
+    def test_i22_the_store_does_not_match_the_pre_flight(self):
+        """The FASTA grows after FAISS, before the sequence store reads it: the database files are removed."""
+        self.embed_run()
+        create_db = EmbeddingDatabase.create_db
+
+        def then_grows(db, *args, **kwargs):
+            create_db(db, *args, **kwargs)
+            with open(self.fasta, "a") as f:
+                f.write(">late\nACDEFGHIKL\n")
+
+        with mock.patch.object(EmbeddingDatabase, "create_db", then_grows):
+            message = self.refused_index(cause=ValueError)
+        self.assertIn("does not match its pre-flight", message)
+        self.assertIn("The database files it wrote were removed (db.index, db.metadata, db.sequences)", message)
+
+    def test_i23_the_fasta_changed_during_the_build(self):
+        """The FASTA rewritten with one residue changed (the same size and counts, another sha256) while the sequence
+        store is built: refused by the stat bracket, the database files removed (also when the FASTA is gone)."""
+        self.embed_run("--residue-codes")
+        create = SequenceStore.create
+
+        def rewrite(store, *args, **kwargs):
+            create(store, *args, **kwargs)
+            _one_residue_changed(self.fasta)
+
+        with mock.patch.object(SequenceStore, "create", autospec=True, side_effect=rewrite):
+            message = self.refused_index()
+        self.assertIn(f"The FASTA changed during this build ({self.fasta.resolve()}: ", message)
+        self.assertIn("The database files it wrote were removed (db.index, db.metadata, db.sequences).", message)
+        shutil.copyfile(_FASTA, self.fasta)
+        os.utime(self.fasta, ns=(0, split_run.read_run_record(self.shards / "emb_run.run.json")["fasta"]["mtime_ns"]))
+
+        def removed(store, *args, **kwargs):
+            create(store, *args, **kwargs)
+            self.fasta.rename(self.inputs / "gone.fasta")
+
+        with mock.patch.object(SequenceStore, "create", autospec=True, side_effect=removed):
+            message = self.refused_index()
+        self.assertIn("cannot be stat'ed", message)
+        self.assertIn("The database files it wrote were removed", message)
+
+    def test_i23_the_bracket_opens_before_the_hash(self):
+        """The bracket starts with the stat taken before the FASTA is hashed: a change during the id check (after the
+        hash and the pre-flight, before the index phase) is refused at the sequence store, which read the new bytes;
+        no database file is left."""
+        self.embed_run()
+        check = split_run.check_dealt_ids
+
+        def then_changed(*args):
+            seconds = check(*args)
+            _one_residue_changed(self.fasta)
+            return seconds
+
+        with mock.patch.object(split_run, "check_dealt_ids", side_effect=then_changed):
+            message = self.refused_index()
+        self.assertIn(f"The FASTA changed during this build ({self.fasta.resolve()}: ", message)
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_i24_the_code_store_fails_validation(self):
+        """An entry with an empty payload: the code store is removed; the database, the record and the shards stay,
+        also with --cleanup-embeddings; no lock is left."""
+        def payload(name, sequence):
+            return np.empty((0, 8), np.uint8) if name == "2uzi_A" else _fake_codes(name, sequence)
+
+        self.embed_run("--residue-codes", payload=payload)
+        before = _tree(self.shards)
+        result = self.index("--cleanup-embeddings", fasta=self.fasta)
+        message = self.refused(result, CodeStoreValidationError)
+        self.assertIn("empty payload", message)
+        self.assertIn(f"This build's shards are kept in {self.shards.resolve()} (run id run).", message)
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["db.index", "db.metadata", "db.sequences"])
+        self.assertEqual(_tree(self.shards), before)
+
+
+# =====================================================================================================================
+# real ESM3 (CPU)
+# =====================================================================================================================
+class RealEsm3SplitTest(unittest.TestCase):
+    """The one-shot ``build sequences`` and the two steps on ``test_sequences.fasta`` with the real CPU pass at
+    --batch-size 2, plain and codes, with pinned run ids, one build after another."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        esm_codes_bundle.registry_files()
+        gc.collect()  # earlier tests' ESM3 models, if only reference cycles still hold them
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.results = {}
+        with mock.patch.dict(os.environ):
+            for name in _JOB_ENV:
+                os.environ.pop(name, None)
+            for kind, extra in (("codes", ("--residue-codes",)), ("plain", ())):
+                for step in ("one", "split"):
+                    (cls.tmp / f"{step}-{kind}-shards").mkdir()
+                with launch_env(FOLDMATCH_RUN_ID=f"one-{kind}"):
+                    cls.results[f"one-{kind}"] = invoke(*_build_args(
+                        _FASTA, cls.tmp / f"one-{kind}" / "db", cls.tmp / f"one-{kind}-shards", "--batch-size", "2",
+                        *extra))
+                gc.collect()  # the pass's ESM3 (5.6 GB) is only reachable through reference cycles
+                with launch_env(FOLDMATCH_RUN_ID=f"split-{kind}"):
+                    cls.results[f"embed-{kind}"] = invoke(*_embed_args(
+                        _FASTA, cls.tmp / f"split-{kind}" / "db", cls.tmp / f"split-{kind}-shards", "--batch-size",
+                        "2", *extra))
+                gc.collect()
+                with launch_env(), _esm3_spy(), \
+                        mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")):
+                    cls.results[f"index-{kind}"] = invoke(*_index_args(
+                        _FASTA, cls.tmp / f"split-{kind}" / "db", cls.tmp / f"split-{kind}-shards"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def setUp(self):
+        for name, result in self.results.items():
+            self.assertEqual(result.exit_code, 0, f"{name}: {result.output[-4000:]} {result.exception!r}")
+
+    def test_two_steps_equal_the_one_shot(self):
+        _, ids, _, codes_ref = _f2c()
+        for kind in ("codes", "plain"):
+            with self.subTest(kind=kind):
+                columns = ["id", "embedding", *(("residue_codes", "seq_sha1") if kind == "codes" else ())]
+                tables = [pq.read_table(self.tmp / f"{step}-{kind}-shards" / f"emb_{step}-{kind}-0.parquet",
+                                        columns=columns) for step in ("one", "split")]
+                self.assertTrue(tables[0].equals(tables[1]),
+                                "precondition: the one-shot's and step 1's passes wrote different shard tables")
+                assert_same_database(self.tmp / f"one-{kind}" / "db", self.tmp / f"split-{kind}" / "db")
+                if kind == "codes":
+                    store = ResidueCodeStore(self.tmp / f"split-{kind}", "db")
+                    manifest = store.check_compatible()
+                    self.assertEqual((manifest["entries"], manifest["total_residues"], manifest["build"]["split"]),
+                                     (2, 303, True))
+                    equal, n = _bits_equal(np.asarray(store.open_memmap()), codes_ref)
+                    print(f"\nsplit build F2c CPU code bits: {equal}/{n} = {equal / n:.6f}", file=sys.stderr)
+                    self.assertGreaterEqual(equal / n, A4_XCPU_BITS, f"F2c code bits {equal}/{n}")
+                record = split_run.read_run_record(self.tmp / f"split-{kind}-shards" / f"emb_split-{kind}.run.json")
+                self.assertEqual((record["rows"], record["preflight"]["residues"], record["world_size"],
+                                  record["pass"]["accelerator"]), (2, 303, 1, "cpu" if kind == "codes" else None))
+
+
+# =====================================================================================================================
+# two real ranks as commands (slow)
+# =====================================================================================================================
+@unittest.skipUnless(os.environ.get("FOLDMATCH_SLOW_TESTS") == "1",
+                     "slow: two ESM3 ranks on CPU, twice; set FOLDMATCH_SLOW_TESTS=1 to run")
+class TwoRankSplitSmoke(unittest.TestCase):
+    """``build sequences-embed --residue-codes --devices 2`` as a command (CPU, gloo: Lightning re-runs the command for
+    rank 1, and the real ``all_gather_object`` runs), then ``build sequences-index``, and a two-rank one-shot ``build
+    sequences --residue-codes`` to compare with (pattern of ``TwoRankCliSmoke``)."""
+
+    def test_two_rank_split_build(self):
+        esm_codes_bundle.registry_files()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for name in ("shards", "oneshot-shards", "site", "log-embed", "log-oneshot", "empty-hf-cache"):
+                (tmp / name).mkdir()
+            (tmp / "site" / "sitecustomize.py").write_text(_SITECUSTOMIZE)
+            env = {k: v for k, v in os.environ.items()
+                   if k not in _LAUNCH_ENV and k not in _DDP_ENV and k not in _JOB_ENV
+                   and not k.startswith(_DDP_ENV_PREFIXES)}
+            env["PYTHONPATH"] = os.pathsep.join([str(tmp / "site"), _SRC] +
+                                                [p for p in [os.environ.get("PYTHONPATH")] if p])
+            if sys.platform == "darwin":
+                env["OMP_NUM_THREADS"] = "1"
+
+            def run(args, **extra_env):
+                command = [sys.executable, "-m", "foldmatch.cli.search", *map(str, args)]
+                if "--devices" in command:
+                    command[command.index("--devices") + 1] = "2"
+                return subprocess.run(command, env={**env, **extra_env}, capture_output=True, text=True,
+                                      timeout=1800)
+
+            split_db, oneshot_db = tmp / "split" / "db", tmp / "oneshot" / "db"
+            embed = run(_embed_args(_FASTA, split_db, tmp / "shards", "--residue-codes"),
+                        **{_TWO_RANK_CHILD_ENV: str(tmp / "log-embed")})
+            self.assertEqual(embed.returncode, 0, embed.stderr[-4000:])
+            records = sorted((tmp / "shards").glob("*.run.json"))
+            self.assertEqual(len(records), 1, sorted(p.name for p in (tmp / "shards").iterdir()))
+            record = split_run.read_run_record(records[0])
+            calls = {p.name: json.loads(p.read_text()) for p in (tmp / "log-embed").iterdir()}
+
+            refused = run(_index_args(_FASTA, split_db, tmp / "shards"), WORLD_SIZE="2")
+            self.assertEqual(refused.returncode, 1, refused.stderr[-4000:])
+            self.assertIn("runs as one process (WORLD_SIZE=2)", refused.stderr)
+            self.assertFalse(split_db.parent.exists())
+
+            index = run(_index_args(_FASTA, split_db, tmp / "shards"), HF_HUB_OFFLINE="1",
+                        HF_HUB_CACHE=str(tmp / "empty-hf-cache"))
+            self.assertEqual(index.returncode, 0, index.stderr[-4000:])
+            oneshot = run(_build_args(_FASTA, oneshot_db, tmp / "oneshot-shards", "--residue-codes"),
+                          **{_TWO_RANK_CHILD_ENV: str(tmp / "log-oneshot")})
+            self.assertEqual(oneshot.returncode, 0, oneshot.stderr[-4000:])
+            tables = [[pq.read_table(path).select(["id", "embedding", "residue_codes", "seq_sha1"])
+                       for path in sorted(folder.glob("*.parquet"))] for folder in (tmp / "oneshot-shards",
+                                                                                     tmp / "shards")]
+            same_shards = len(tables[0]) == len(tables[1]) and all(a.equals(b) for a, b in zip(*tables))
+            self.assertTrue(same_shards, "precondition: the two passes wrote different shard tables")
+            assert_same_database(oneshot_db, split_db)
+            manifest = ResidueCodeStore(split_db.parent, "db").check_compatible()
+        self.assertEqual(calls, {"prepare-0.json": {"local_files_only": False},
+                                 "prepare-1.json": {"local_files_only": True}})
+        self.assertEqual((record["world_size"], len(record["shards"]), record["rows"]), (2, 2, 2))
+        self.assertEqual((manifest["entries"], manifest["build"]["devices"], manifest["build"]["split"]), (2, 2, True))
 
 
 if __name__ == "__main__":

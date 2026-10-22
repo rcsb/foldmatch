@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import time
 import typer
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,7 +137,8 @@ _RESIDUE_CODES_HELP = (
 _FROM_SHARDS_HELP = (
     "Folder holding the embedding shards that this database's 'build sequences "
     "--residue-codes' run kept (its --tmp-embedding-folder; a build keeps them "
-    "unless --cleanup-embeddings)."
+    "unless --cleanup-embeddings), or those of a 'build sequences-embed "
+    "--residue-codes' run (its --shards-folder)."
 )
 
 # Plan P8b (CLI): the split build's step 1, verbatim but for --kill-on-invalid-dep=yes (without it, the job of step 2
@@ -162,6 +163,51 @@ _SHARDS_FOLDER_HELP = (
     "sequences-index --from-shards' reads. It must be on storage every node can write "
     "and that outlives the job (e.g. $SCRATCH), with room for about 6 KiB per entry "
     "plus 8 B per residue with --residue-codes. Use one folder per build."
+)
+
+# Plan P8b (CLI), verbatim: the split build's step 2.
+_INDEX_HELP = (
+    "Step 2 of a split 'build sequences': build the database from the shards of one "
+    "'build sequences-embed' run, after checking against its run record that they are "
+    "complete and were computed from this FASTA: the FAISS index, the sequence store and, "
+    "when the run computed residue codes, the residue-code store, as 'build sequences' "
+    "builds them after its ESM3 pass. No ESM3, GPU or download. One process: run it as its "
+    "own job on a CPU node, not inside the GPU job; FAISS uses the node's physical cores "
+    "unless OMP_NUM_THREADS is set."
+)
+
+_INDEX_FASTA_HELP = (
+    "The FASTA file the run embedded. Checked against the run record (size, sha256, "
+    "pre-flight counts) and against the id of every shard row; it may have moved since."
+)
+
+_INDEX_OUTPUT_DB_HELP = (
+    "Path to save the FAISS database (as for 'build sequences'). Usually the run's "
+    "--output-db, which the record holds; another path is allowed."
+)
+
+_INDEX_FROM_SHARDS_HELP = (
+    "Folder holding the shards and the run record of a 'build sequences-embed' run (its "
+    "--shards-folder)."
+)
+
+_INDEX_RUN_ID_HELP = (
+    "Run id of the run to build from (its record is emb_<run id>.run.json; 'build "
+    "sequences-embed' logs it). Needed when the folder holds more than one run, unfinished "
+    "ones included."
+)
+
+_INDEX_RESIDUE_CODES_HELP = (
+    "Build the residue-code store from the run's codes (enabling `query sequences --scoring "
+    "esm-codes`). Default: exactly when the run computed them ('build sequences-embed "
+    "--residue-codes'). --residue-codes refuses a run without codes; --no-residue-codes "
+    "leaves the store out (add it later with 'build residue-codes --from-shards')."
+)
+
+_INDEX_CLEANUP_EMBEDDINGS_HELP = (
+    "Delete the run's record, then its shards, from --from-shards once the database is "
+    "built. Use it only on the last build from this run. Refused together with "
+    "--no-residue-codes on a run with residue codes. By default they are kept."
 )
 
 
@@ -230,9 +276,9 @@ def build_database_from_structures(
             help='Cells probed per query for ivf_pq (defaults to nlist // 64).'
         )] = None,
         load_batch_size: Annotated[int, typer.Option(
-            help='Number of vectors per batch streamed into the FAISS index. Larger '
-                 'batches (e.g. 65536+) better saturate many-core nodes during '
-                 'IVF-PQ build; smaller batches use less memory.'
+            help='Number of vectors per batch streamed into the FAISS index; larger '
+                 'batches use more memory (FAISS adds IVF-PQ vectors in chunks of '
+                 '32768 whatever this value).'
         )] = 32768,
         cleanup_embeddings: Annotated[bool, typer.Option(
             help=_CLEANUP_EMBEDDINGS_HELP
@@ -330,9 +376,9 @@ def build_database_from_embeddings(
             help='Cells probed per query for ivf_pq (defaults to nlist // 64).'
         )] = None,
         load_batch_size: Annotated[int, typer.Option(
-            help='Number of vectors per batch streamed into the FAISS index. Larger '
-                 'batches (e.g. 65536+) better saturate many-core nodes during '
-                 'IVF-PQ build; smaller batches use less memory.'
+            help='Number of vectors per batch streamed into the FAISS index; larger '
+                 'batches use more memory (FAISS adds IVF-PQ vectors in chunks of '
+                 '32768 whatever this value).'
         )] = 32768,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging level.'
@@ -415,9 +461,9 @@ def build_database_from_fasta(
             help='Cells probed per query for ivf_pq (defaults to nlist // 64).'
         )] = None,
         load_batch_size: Annotated[int, typer.Option(
-            help='Number of vectors per batch streamed into the FAISS index. Larger '
-                 'batches (e.g. 65536+) better saturate many-core nodes during '
-                 'IVF-PQ build; smaller batches use less memory.'
+            help='Number of vectors per batch streamed into the FAISS index; larger '
+                 'batches use more memory (FAISS adds IVF-PQ vectors in chunks of '
+                 '32768 whatever this value).'
         )] = 32768,
         cleanup_embeddings: Annotated[bool, typer.Option(
             help=_CLEANUP_EMBEDDINGS_HELP
@@ -566,10 +612,114 @@ def build_sequences_embed(
 
 
 @build_db_app.command(
+    name="sequences-index",
+    help=_INDEX_HELP
+)
+def build_sequences_index(
+        fasta_file: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+            help=_INDEX_FASTA_HELP
+        )],
+        output_db: Annotated[str, typer.Option(
+            help=_INDEX_OUTPUT_DB_HELP
+        )],
+        from_shards: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_INDEX_FROM_SHARDS_HELP
+        )],
+        run_id: Annotated[Optional[str], typer.Option(
+            help=_INDEX_RUN_ID_HELP
+        )] = None,
+        residue_codes: Annotated[Optional[bool], typer.Option(
+            "--residue-codes/--no-residue-codes",
+            help=_INDEX_RESIDUE_CODES_HELP
+        )] = None,
+        cleanup_embeddings: Annotated[bool, typer.Option(
+            help=_INDEX_CLEANUP_EMBEDDINGS_HELP
+        )] = False,
+        use_gpu_index: Annotated[bool, typer.Option(
+            help='Use GPU for FAISS index (requires faiss-gpu).'
+        )] = False,
+        index_type: Annotated[IndexType, typer.Option(
+            help='FAISS index variant: auto (legacy heuristic), flat, hnsw, or ivf_pq (on-disk).'
+        )] = IndexType.auto,
+        ivf_nlist: Annotated[int, typer.Option(
+            help='IVF cell count for ivf_pq index.'
+        )] = 16384,
+        ivf_nprobe: Annotated[Optional[int], typer.Option(
+            help='Cells probed per query for ivf_pq (defaults to nlist // 64).'
+        )] = None,
+        load_batch_size: Annotated[int, typer.Option(
+            help='Number of vectors per batch streamed into the FAISS index; larger '
+                 'batches use more memory (FAISS adds IVF-PQ vectors in chunks of '
+                 '32768 whatever this value).'
+        )] = 32768,
+        log_level: Annotated[LogLevel, typer.Option(
+            help='Logging level.'
+        )] = LogLevel.info
+):
+    """Step 2 of a split sequence build: one process checks a run's shards against its record and the FASTA, then
+    builds the database from them as 'build sequences' does after its pass. No ESM3, GPU or download."""
+
+    # Every refusal is a RefusalError, in both modes (D32). Up to the index phase nothing is written but the build lock
+    # (and the database's folder when it is missing), which a refusal removes.
+    set_log_level(log_level)
+    start = time.monotonic()
+    from foldmatch.utils.dist import is_run_id
+    if run_id is not None and not is_run_id(run_id):
+        raise typer.BadParameter(
+            f"{run_id!r} is not a run id: letters, digits, '.', '_' and '-' only, "
+            f"starting with a letter or digit.", param_hint="--run-id"
+        )
+    _refuse_multi_node_job("build sequences-index")
+    # Before torch, FAISS or pyarrow start a thread pool: the threads they start inherit this mask (D29).
+    from foldmatch.search.alignment import _expand_cpu_affinity
+    _expand_cpu_affinity(purpose="the index phase")
+
+    from foldmatch.search import split_run
+    with _refusals():
+        run_id, record_path = split_run.find_run(from_shards, run_id)
+        record = split_run.read_run_record(record_path)
+        codes, system = _split_code_store(record, record_path, residue_codes=residue_codes,
+                                          cleanup_embeddings=cleanup_embeddings)
+    db_path = parse_db_path(output_db)[2]
+    with _database_folder(output_db), split_run.build_lock(db_path, record, shards_folder=from_shards):
+        with _refusals():
+            paths, preflight, fasta_stat = _split_index_checks(record, fasta_file=fasta_file, output_db=output_db,
+                                                               from_shards=from_shards, codes=codes, system=system)
+        _log_split_build(record, db_path=db_path, from_shards=from_shards, shards=len(paths), codes=codes)
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        computer = EmbeddingComputer(from_shards, run=run_id)
+        with _refusals():
+            computer.attach_preflight(fasta_file, record["min_res_n"], preflight)
+        with _whole_node_threads():
+            _build_sequence_database(
+                computer, preflight, fasta_file=fasta_file, output_db=output_db, min_res_n=record["min_res_n"],
+                system=system if codes else None,
+                index=_IndexOptions(use_gpu_index, index_type, ivf_nlist, ivf_nprobe, load_batch_size),
+                refusals=_refusals, split=record,
+                after_sequence_store=_fasta_unchanged_guard(fasta_file, fasta_stat, output_db),
+            )
+        if cleanup_embeddings:
+            # The record first: no record outlives its shards.
+            with _refusals():
+                record_path.unlink()
+                computer.remove_shards()
+    logging.info(f"Database {db_path} built from run {run_id} in {time.monotonic() - start:.1f} s")
+
+
+@build_db_app.command(
     name="residue-codes",
     help="Build the residue-code store of a sequence database from the embedding "
-         "shards its 'build sequences --residue-codes' run kept, without running "
-         "ESM3 again, and validate it against the database. DB_FOLDER and "
+         "shards its 'build sequences --residue-codes' run kept, or those of the "
+         "'build sequences-embed --residue-codes' run it was built from, without "
+         "running ESM3 again, and validate it against the database. DB_FOLDER and "
          "INDEX_NAME name the database (its --output-db was DB_FOLDER/INDEX_NAME)."
 )
 def build_residue_codes(
@@ -1617,14 +1767,18 @@ def _build_sequence_database(embedding_computer, preflight, *, fasta_file: Path,
 
     ``refusals`` is the mode's refusal wrapper (``_SequencePass.refusals``). ``after_sequence_store``, if given, is
     called once the sequence store has passed :func:`_check_store_matches_preflight`, before the code store.
-    ``split`` is the run record of a split build (``build sequences-index``); ``None`` for ``build sequences``.
+    ``split`` is the run record of a split build (``build sequences-index``); ``None`` for ``build sequences``. With
+    it, a refusal of the FAISS index says that step 2 can be rerun with other index options (I21), and the code
+    store's manifest says the build was split (D26).
     """
     from foldmatch.search.embedding_database import EmbeddingDatabase
     embedding_db = EmbeddingDatabase(
         db_path=output_db
     )
     _log_index_phase(omp_env_at_start)
-    with refusals():
+    with refusals() if split is None else _refusals(
+            note=f"The shards and the record of run {split['run_id']} are kept: 'build sequences-index' can be "
+                 f"rerun with other index options, without a new ESM3 pass."):
         start = time.monotonic()
         embedding_db.create_db(
             embedding_batches=embedding_computer.get_embedding_batches(load_batch_size=index.load_batch_size),
@@ -1659,7 +1813,7 @@ def _build_sequence_database(embedding_computer, preflight, *, fasta_file: Path,
     start = time.monotonic()
     manifest = _build_residue_code_store(
         embedding_computer, embedding_db, store, preflight, system,
-        min_res_n=min_res_n, load_batch_size=index.load_batch_size,
+        min_res_n=min_res_n, load_batch_size=index.load_batch_size, split=split is not None,
     )
     logging.info(f"Residue-code store built in {time.monotonic() - start:.1f} s")
     return manifest
@@ -1879,9 +2033,6 @@ def _check_rank_fasta_facts(fasta_file: Path, facts: List[dict], final) -> None:
     bracketed on its own rank."""
     from foldmatch.search.split_run import PREFLIGHT_KEYS
 
-    def shown(stat) -> str:
-        return f"{stat.bytes} bytes, mtime_ns {stat.mtime_ns}, inode {stat.ino}"
-
     errors = [f"rank {rank}: {rank_facts['error']}" for rank, rank_facts in enumerate(facts) if rank_facts["error"]]
     if errors:
         raise RefusalError(
@@ -1894,7 +2045,7 @@ def _check_rank_fasta_facts(fasta_file: Path, facts: List[dict], final) -> None:
     if changed:
         raise RefusalError(
             f"The FASTA was modified during the pass ("
-            + "; ".join(f"rank {rank}: before {shown(a)}, after {shown(b)}" for rank, a, b in changed[:10])
+            + "; ".join(f"rank {rank}: before {_stat_text(a)}, after {_stat_text(b)}" for rank, a, b in changed[:10])
             + f"): the shards may not be the embeddings of {fasta_file} as it is now."
         )
     first = facts[0]
@@ -1911,6 +2062,319 @@ def _check_rank_fasta_facts(fasta_file: Path, facts: List[dict], final) -> None:
             f"The ranks did not read the same FASTA ({'; '.join(differ[:10])}): {fasta_file} was modified during the "
             f"pass, or the ranks' copies of it differ."
         )
+
+
+def _stat_text(stat) -> str:
+    """A :class:`~foldmatch.search.split_run.FastaStat` as a refusal shows it."""
+    return f"{stat.bytes} bytes, mtime_ns {stat.mtime_ns}, inode {stat.ino}"
+
+
+def _refuse_multi_node_job(command: str) -> None:
+    """The launch checks of a command that runs as one process (``build sequences-index``, ``build sequences-seal``),
+    from the launch environment alone.
+
+    Refused: a process that is one of several ranks (I2, :func:`~foldmatch.utils.dist.multi_rank_launch`, which names
+    the variable), and the batch step of a SLURM job of more than one node (I3, D34): the job's other nodes would stay
+    allocated while one process works. A one-task srun step of such a job, and a one-node job with GPUs, get a
+    WARNING. The advice never makes the command's job depend on this job, which it refuses (its ``afterok`` would
+    never be met) or in which it keeps running: it is submitted once this job has ended, or next time from the GPU
+    job's script before its work, with ``$SLURM_JOB_ID`` left for that script's shell.
+    """
+    from foldmatch.utils.dist import _whole_number, multi_rank_launch, srun_step_id
+    launch = multi_rank_launch()
+    if launch is not None:
+        raise RefusalError(
+            f"'{command}' runs as one process ({launch}): launch it once, directly in the batch script or with "
+            f"srun -n 1."
+        )
+    job = os.environ.get("SLURM_JOB_ID", "").strip()
+    if not job:
+        return
+    nodes = _whole_number("SLURM_JOB_NUM_NODES")
+    if nodes is not None and nodes > 1:
+        chained = ("submit it from the GPU job's script before the job's work starts: sbatch -C cpu -N 1 "
+                   "--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ...")
+        if srun_step_id() is None:
+            raise RefusalError(
+                f"SLURM job {job} holds {nodes} nodes, and '{command}' runs in one process on one of them: the others "
+                f"would stay allocated until it ends. Run it as its own one-node CPU job instead: once this job has "
+                f"ended, sbatch -C cpu -N 1 ... (no dependency is needed then); next time, {chained}"
+            )
+        logging.warning(
+            f"'{command}' runs in a one-task srun step of SLURM job {job}, which holds {nodes} nodes: the others stay "
+            f"allocated until it ends. Next time, run it as its own one-node CPU job: {chained}"
+        )
+        return
+    gpus = [f"{name}={os.environ[name].strip()}" for name in ("SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS")
+            if os.environ.get(name, "").strip()]
+    if gpus:
+        logging.warning(
+            f"SLURM job {job} has GPUs ({', '.join(gpus)}), which '{command}' does not use: run it as its own job on a "
+            f"CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it on one GPU node, where "
+            f"ivf_pq fits (flat and hnsw may not)."
+        )
+
+
+def _split_code_store(record: dict, record_path: Path, *, residue_codes: Optional[bool],
+                      cleanup_embeddings: bool) -> Tuple[bool, Any]:
+    """``(codes, system)``: whether ``build sequences-index`` builds the residue-code store, and the registry entry of
+    the run's system when it does (else ``None``).
+
+    ``--residue-codes`` unset follows the run (D24). Refused: ``--residue-codes`` on a run without codes (I8);
+    ``--no-residue-codes --cleanup-embeddings`` on a run with codes (I9), which would delete the only input of a later
+    ``build residue-codes --from-shards``; a run system this FoldMatch does not register, or registers with other
+    digests (I10). Only the registry entry is needed: no bundle.
+    """
+    from foldmatch.search import scoring_system
+    from foldmatch.search.residue_shards import RESIDUE_CODES
+    run_id = record["run_id"]
+    run_codes = record["residue_output"] == RESIDUE_CODES
+    codes = run_codes if residue_codes is None else residue_codes
+    if codes and not run_codes:
+        raise RefusalError(
+            f"Run {run_id} computed no residue codes (its record {record_path} has no residue output), so there is no "
+            f"residue-code store to build from its shards: run step 1 with --residue-codes ('build sequences-embed "
+            f"--residue-codes'), or build without --residue-codes."
+        )
+    if run_codes and not codes and cleanup_embeddings:
+        raise RefusalError(
+            f"--no-residue-codes with --cleanup-embeddings would delete the only copy of run {run_id}'s residue codes "
+            f"(its shards in {record_path.parent}), which 'build residue-codes --from-shards' needs to add the "
+            f"residue-code store later. Drop --cleanup-embeddings, or build the store too."
+        )
+    if not codes:
+        return False, None
+    recorded = record["system"]
+    plain = "--no-residue-codes builds the database without its residue codes."
+    with _refusals(note=f"Run {run_id}'s residue codes are of {recorded['name']}: {plain}"):
+        system = scoring_system.get(recorded["name"])
+    if (system.digest(), system.encoding_digest()) != (recorded["digest"], recorded["encoding_digest"]):
+        raise RefusalError(
+            f"Run {run_id}'s residue codes are of {recorded['name']} with digest {recorded['digest']} and "
+            f"encoding_digest {recorded['encoding_digest']}, but this FoldMatch's {system.name} has digest "
+            f"{system.digest()} and encoding_digest {system.encoding_digest()}: they are another FoldMatch's codes of "
+            f"that name. {plain}"
+        )
+    return True, system
+
+
+@contextmanager
+def _database_folder(output_db: str):
+    """The folder of ``--output-db``, created with its parents when it is missing (as the builders of ``build
+    sequences`` create it), so that the build lock can be taken there; the folders created here are removed again,
+    if still empty, when the block raises."""
+    folder = Path(parse_db_path(output_db)[0])
+    created = []
+    for parent in (folder, *folder.parents):
+        if parent.exists():
+            break
+        created.append(parent)
+    with _refusals():
+        folder.mkdir(parents=True, exist_ok=True)
+    try:
+        yield folder
+    except BaseException:
+        for path in created:  # the deepest first
+            try:
+                path.rmdir()
+            except OSError:
+                break
+        raise
+
+
+def _split_index_checks(record: dict, *, fasta_file: Path, output_db: str, from_shards: Path, codes: bool,
+                        system) -> Tuple[List[Path], Any, Any]:
+    """The checks ``build sequences-index`` makes inside its build lock, before any database file is written; returns
+    ``(shard paths, pre-flight, FASTA stat)``.
+
+    In this order: no output exists (I12, with the ``build residue-codes`` hint when only the code store is missing);
+    the run's shards are the recorded ones, of the recorded size and rows (I13, I14); their footers (I15): the codes
+    of ``system``, or under ``--no-residue-codes`` the codes of the record's system (self-consistency only, so that a
+    system unknown here still gives the plain database), or plain shards; the FASTA's size (I16, not hashed when it
+    differs), then its sha256 (I17), against the record; its pre-flight, with the record's ``min_res_n`` and
+    strictness (I18), and the counts the record holds (I19); the id of every shard row at its dealt position (I20).
+    The stat taken before the FASTA is read brackets this build's FASTA reads with :func:`_fasta_unchanged_guard`.
+    """
+    from foldmatch.search import split_run
+    from foldmatch.search.residue_shards import RESIDUE_CODES
+    run_id = record["run_id"]
+    command = split_run.code_store_command(parse_db_path(output_db)[2], record, from_shards)
+    with _refusals(note=None if command is None else
+                   f"The database is complete but for its residue-code store: '{command}' adds it."):
+        _refuse_existing_outputs(output_db, _SEQUENCE_DB_SUFFIXES, sidecar_globs=(".rescodes.*",))
+    paths = split_run.check_run_shards(from_shards, record)
+    footing = {"min_res_n": record["min_res_n"], "world_size": record["world_size"]}
+    if codes:
+        split_run.check_codes_footers(paths, system=system, **footing)
+    elif record["residue_output"] == RESIDUE_CODES:
+        split_run.check_codes_footers(paths, expect=record["system"], **footing)
+    else:
+        split_run.check_plain_footers(paths)
+
+    fasta = record["fasta"]
+    stat = split_run.fasta_stat(fasta_file)
+    if stat.bytes != fasta["bytes"]:
+        raise RefusalError(
+            f"{fasta_file} has {stat.bytes} bytes, but the FASTA run {run_id} embedded ({fasta['path']}) had "
+            f"{fasta['bytes']}: it is not the FASTA of this run."
+        )
+    sha256, seconds = split_run.fasta_sha256(fasta_file)
+    logging.info(f"FASTA sha256 of {fasta_file} ({stat.bytes} bytes) in {seconds:.1f} s")
+    if sha256 != fasta["sha256"]:
+        raise RefusalError(
+            f"{fasta_file} (sha256 {sha256}) is not the FASTA run {run_id} embedded ({fasta['path']}, sha256 "
+            f"{fasta['sha256']}), though it has its size."
+        )
+    moved = [what for what, differs in (("path", str(Path(fasta_file).resolve()) != fasta["path"]),
+                                        ("modification time", stat.mtime_ns != fasta["mtime_ns"])) if differs]
+    if moved:
+        logging.info(
+            f"{fasta_file} has the size and sha256 of the FASTA run {run_id} embedded, with another "
+            f"{' and '.join(moved)} (recorded: {fasta['path']}, mtime_ns {fasta['mtime_ns']})"
+        )
+    preflight = _fasta_preflight(fasta_file, record["min_res_n"], strict=record["strict"], output_db=output_db)
+    counts = split_run.preflight_counts(preflight)
+    differ = [key for key in split_run.PREFLIGHT_KEYS if counts[key] != record["preflight"][key]]
+    if differ:
+        raise RefusalError(
+            f"The pre-flight of {fasta_file} counts " + ", ".join(f"{key} {counts[key]}" for key in differ)
+            + f", but run {run_id}'s record holds " + ", ".join(f"{key} {record['preflight'][key]}" for key in differ)
+            + f" for the same bytes: this FoldMatch's pre-flight counts differently from the one that ran step 1 "
+              f"(FoldMatch {record['foldmatch_version']}). Run step 1 again with this FoldMatch."
+        )
+    seconds = split_run.check_dealt_ids(paths, record, preflight)
+    logging.info(f"Ids of the {record['rows']} shard rows checked against {fasta_file} in {seconds:.1f} s")
+    return paths, preflight, stat
+
+
+def _log_split_build(record: dict, *, db_path: str, from_shards: Path, shards: int, codes: bool) -> None:
+    """The start of ``build sequences-index``'s index phase: a WARNING when the run was embedded by another FoldMatch
+    (D30) or its record was sealed, an INFO line when the database goes elsewhere than the recorded ``--output-db``
+    (D28), then the run it is built from.
+
+    The FoldMatch of the pass is the record's ``foldmatch_version`` for a record step 1 wrote. A sealed record holds
+    the seal's version there, and for a plain run also in its pass record, which the seal filled from its own process;
+    only residue-code shards record their pass's version (``pass.foldmatch_version``). For a sealed plain run that
+    version is unknown, and the sealed WARNING says so."""
+    run_id = record["run_id"]
+    sealed = record["sealed"]
+    if not sealed:
+        pass_version = record["foldmatch_version"]
+    elif record["residue_output"] is not None and isinstance(record["pass"].get("foldmatch_version"), str):
+        pass_version = record["pass"]["foldmatch_version"]
+    else:
+        pass_version = None
+    if pass_version is not None and pass_version != __version__:
+        logging.warning(
+            f"Run {run_id} was embedded by FoldMatch {pass_version}, and this is FoldMatch {__version__}: its record, "
+            f"shard schemas and digests, pre-flight counts and ids were checked, and the database is built by this "
+            f"FoldMatch."
+        )
+    if sealed:
+        logging.warning(
+            f"The record of run {run_id} was written by 'build sequences-seal' (FoldMatch "
+            f"{record['foldmatch_version']}): it binds the shards to the FASTA by their entry count, rows and ids (and "
+            f"seq_sha1 when the residue-code store is validated), not by the pass that wrote them"
+            + ("." if pass_version is not None else
+               ", whose FoldMatch version is not recorded (shards without residue codes do not record it).")
+        )
+    if record["output_db"] is not None and record["output_db"] != os.path.abspath(db_path):
+        logging.info(f"Building {db_path}, not the --output-db the run recorded ({record['output_db']})")
+    if codes:
+        built = f"residue codes of {record['system']['name']}"
+    elif record["system"] is not None:
+        built = f"its residue codes of {record['system']['name']} left out (--no-residue-codes)"
+    else:
+        built = "no residue codes"
+    if sealed:
+        when = (f"sealed {record['created_utc']} by FoldMatch {record['foldmatch_version']}; embedded by "
+                + (f"FoldMatch {pass_version}" if pass_version is not None else "a FoldMatch it does not record"))
+    else:
+        when = f"embedded {record['created_utc']} by FoldMatch {record['foldmatch_version']}"
+    logging.info(
+        f"Building {db_path} from run {run_id} in {from_shards}: {record['rows']} entries in {shards} shard(s), "
+        f"{when} on {record['world_size']} rank(s) ({record['pass']['accelerator'] or 'device not recorded'}), {built}"
+        + ("; sealed record" if sealed else "")
+    )
+
+
+def _fasta_unchanged_guard(fasta_file: Path, stat, output_db: str):
+    """The ``after_sequence_store`` hook of ``build sequences-index`` (I23): once the sequence store is built, the
+    FASTA must still have ``stat``, taken before it was hashed. Otherwise the database files this build wrote are
+    removed and the build is refused."""
+    def guard() -> None:
+        from foldmatch.search.split_run import fasta_stat
+        try:
+            now = fasta_stat(fasta_file)
+            shown = _stat_text(now)
+        except OSError as exc:
+            now, shown = None, f"cannot be stat'ed ({exc})"
+        if now == stat:
+            return
+        removed = _remove_outputs(output_db, _SEQUENCE_DB_SUFFIXES)
+        raise RefusalError(
+            f"The FASTA changed during this build ({fasta_file}: {_stat_text(stat)} when it was checked, now "
+            f"{shown}), so the database may not hold the FASTA the run embedded. The database files it wrote were "
+            f"removed ({', '.join(path.name for path in removed)})."
+        )
+    return guard
+
+
+# The variables that set a BLAS runtime's threads; any of them set leaves BLAS to it (D29).
+_BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+
+@contextmanager
+def _whole_node_threads():
+    """FAISS's OpenMP and the BLAS thread pools at the usable physical cores for the block (D29), restored on exit.
+
+    FAISS gets ``faiss.omp_set_num_threads(n)`` unless ``OMP_NUM_THREADS`` is set; BLAS a ``threadpoolctl`` limit of
+    ``n`` unless one of :data:`_BLAS_THREAD_VARS` is set, which reaches only the BLAS libraries threadpoolctl finds
+    (the INFO line names them). Nothing is raised on macOS, where ``foldmatch`` pins ``OMP_NUM_THREADS=1`` against the
+    second libomp. ``n`` is :func:`~foldmatch.search.code_alignment._physical_cpus` of the affinity mask, so call it
+    after the mask was widened. Gains for ivf_pq (its training and the encoding of its adds), not for flat, whose adds
+    are copies after an L2 normalisation of 1000 rows per call (below the size FAISS parallelises); HNSW adds 100
+    vectors per call and scales poorly.
+    """
+    import faiss
+    from foldmatch.search.code_alignment import _physical_cpus
+    n = _physical_cpus()
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except AttributeError:  # no affinity masks (macOS)
+        allowed = os.cpu_count() or 1
+    if sys.platform == "darwin":
+        logging.info("FAISS/BLAS threads left as they are on macOS (foldmatch pins OMP_NUM_THREADS)")
+        yield
+        return
+    raised, kept = [], []
+    with ExitStack() as stack:
+        if "OMP_NUM_THREADS" in os.environ:
+            kept.append(f"FAISS threads left to OMP_NUM_THREADS={os.environ['OMP_NUM_THREADS']}")
+        else:
+            previous = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(n)
+            stack.callback(faiss.omp_set_num_threads, previous)
+            raised.append("FAISS")
+        blas_set = [f"{name}={os.environ[name]}" for name in _BLAS_THREAD_VARS if name in os.environ]
+        limited = None
+        if blas_set:
+            kept.append(f"BLAS threads left to {', '.join(blas_set)}")
+        else:
+            import threadpoolctl
+            stack.enter_context(threadpoolctl.threadpool_limits(limits=n, user_api="blas"))
+            raised.append("BLAS")
+            try:  # diagnostics only: the libraries the limit reached
+                limited = sorted({os.path.basename(str(runtime.get("filepath")))
+                                  for runtime in threadpoolctl.threadpool_info() if runtime.get("user_api") == "blas"})
+            except Exception as exc:
+                logging.debug(f"threadpoolctl could not list the thread pools: {exc}")
+        set_to = [f"{'/'.join(raised)} threads set to {n} (physical cores of the {allowed} allowed CPUs)"]
+        if limited is not None:
+            set_to.append(f"BLAS libraries limited: {', '.join(limited)}" if limited else
+                          "threadpoolctl found no BLAS library to limit")
+        logging.info("; ".join((set_to if raised else []) + kept))
+        yield
 
 
 def _residue_codes_preflight(fasta_file: Path, min_res_n: int, output_db: str,
@@ -1937,7 +2401,7 @@ def _residue_codes_preflight(fasta_file: Path, min_res_n: int, output_db: str,
     return preflight, embedding_computer, prepared
 
 
-def _code_store_build(run_id: str, shard_infos, *, from_shards: bool):
+def _code_store_build(run_id: str, shard_infos, *, from_shards: bool, split: bool = False):
     """``(pass record, manifest build block)`` of a code store built from a run's shards.
 
     The build block describes the ESM3 pass that computed the codes, from the
@@ -1945,7 +2409,9 @@ def _code_store_build(run_id: str, shard_infos, *, from_shards: bool):
     the device type and its ESM3 precision, the ranks (``devices``), the
     encoder precision and the software versions of the pass. ``from_shards``
     tells whether the store was built by the pass's own command or later by
-    ``build residue-codes --from-shards``.
+    ``build residue-codes --from-shards``; ``split`` adds ``"split": true``
+    for the index phase of a split build (``build sequences-index``, D26),
+    and the key is absent otherwise.
     """
     from foldmatch.search.residue_shards import shards_pass_record
     record = shards_pass_record(shard_infos)
@@ -1961,11 +2427,13 @@ def _code_store_build(run_id: str, shard_infos, *, from_shards: bool):
         "esm": record["esm"],
         "platform": record["platform"],
     }
+    if split:
+        build["split"] = True
     return record, build
 
 
 def _build_residue_code_store(embedding_computer, embedding_db, sequence_store, preflight, system, *,
-                              min_res_n: int, load_batch_size: int):
+                              min_res_n: int, load_batch_size: int, split: bool = False):
     """Rank 0, after the FAISS index and the sequence store: the residue-code store from this run's shards.
 
     ``create`` streams the shards' codes into the pending ``.rescodes.bin``
@@ -1973,7 +2441,11 @@ def _build_residue_code_store(embedding_computer, embedding_db, sequence_store, 
     store, the pre-flight and the FAISS count, then moves them into place and
     writes the manifest last. The manifest's ``build`` block comes from the
     shards' pass record. A refusal removes only the code store and keeps the
-    shards.
+    shards. ``split`` (``build sequences-index``): the pass ran in another
+    process, so the manifest records the ESM3 revision of the shards' pass
+    record, as ``build residue-codes --from-shards`` does; ``build
+    sequences`` records this installation's pin, the same value under one
+    installation.
     """
     from foldmatch.search.residue_code_store import ResidueCodeStore
     from foldmatch.search.residue_shards import RESIDUE_CODES, check_shards
@@ -1982,10 +2454,11 @@ def _build_residue_code_store(embedding_computer, embedding_db, sequence_store, 
             f"(run id {embedding_computer.run_id}).")
     with _refusals(note=kept):
         infos = check_shards(embedding_computer.shard_files(), RESIDUE_CODES, system)
-        _, build = _code_store_build(embedding_computer.run_id, infos, from_shards=False)
+        run_pass, build = _code_store_build(embedding_computer.run_id, infos, from_shards=False, split=split)
+        revision = {"esm_revision": run_pass["esm_revision"]} if split else {}
         code_store.create(
             embedding_computer.iter_residue_codes(system, load_batch_size=load_batch_size),
-            system, min_res_n=min_res_n, build=build,
+            system, min_res_n=min_res_n, build=build, **revision,
         )
         manifest = code_store.validate(sequence_store, len(embedding_db.db.chain_ids), preflight=preflight)
     logging.info(
