@@ -1,15 +1,17 @@
 import glob
 import os
 import logging
+import shlex
 import sqlite3
 import sys
 import time
 import typer
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Any, List, Mapping, Optional
+from typing import Annotated, Any, List, Mapping, Optional, Tuple
 
 from foldmatch import __version__
 from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, \
@@ -136,6 +138,30 @@ _FROM_SHARDS_HELP = (
     "Folder holding the embedding shards that this database's 'build sequences "
     "--residue-codes' run kept (its --tmp-embedding-folder; a build keeps them "
     "unless --cleanup-embeddings)."
+)
+
+# Plan P8b (CLI): the split build's step 1, verbatim but for --kill-on-invalid-dep=yes (without it, the job of step 2
+# stays pending for ever once step 1 fails).
+_EMBED_HELP = (
+    "Step 1 of a split 'build sequences' for multi-node GPU runs: the pre-flight and "
+    "the ESM3 pass (chain embeddings, and residue codes with --residue-codes) on every "
+    "rank, writing the embedding shards and, last, a run record into --shards-folder. "
+    "No database file is written. Then build the database with 'build sequences-index' "
+    "as its own one-process job on a CPU node (e.g. sbatch --dependency=afterok:<this "
+    "job> --kill-on-invalid-dep=yes), so that these nodes are released."
+)
+
+_EMBED_OUTPUT_DB_HELP = (
+    "Path of the database 'build sequences-index' will build (as --output-db of 'build "
+    "sequences'). Refused if any of its files exist; recorded in the run record."
+)
+
+_SHARDS_FOLDER_HELP = (
+    "Folder for this step's output: the embedding shards (emb_<run id>-<rank>.parquet) "
+    "and, written last, the run record (emb_<run id>.run.json) that 'build "
+    "sequences-index --from-shards' reads. It must be on storage every node can write "
+    "and that outlives the job (e.g. $SCRATCH), with room for about 6 KiB per entry "
+    "plus 8 B per residue with --residue-codes. Use one folder per build."
 )
 
 
@@ -435,6 +461,108 @@ def build_database_from_fasta(
     )
     if cleanup_embeddings:
         run.embedding_computer.remove_shards()
+
+
+@build_db_app.command(
+    name="sequences-embed",
+    help=_EMBED_HELP
+)
+def build_sequences_embed(
+        fasta_file: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+            help='FASTA file containing protein sequences.'
+        )],
+        output_db: Annotated[str, typer.Option(
+            help=_EMBED_OUTPUT_DB_HELP
+        )],
+        shards_folder: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_SHARDS_FOLDER_HELP
+        )],
+        min_res_n: Annotated[int, typer.Option(
+            min=0,
+            help='Consider only sequences with at least <min_res_n> residues.'
+        )] = 0,
+        accelerator: Annotated[Accelerator, typer.Option(
+            help='Device used for inference.'
+        )] = Accelerator.auto,
+        num_nodes: Annotated[int, typer.Option(
+            help='Number of nodes to use for inference.'
+        )] = 1,
+        devices: Annotated[List[str], typer.Option(
+            help='The devices to use. Can be set to a positive number or "auto".'
+        )] = ['auto'],
+        strategy: Annotated[Strategy, typer.Option(
+            help='Lightning strategy to control distribution of inference.'
+        )] = Strategy.auto,
+        batch_size: Annotated[int, typer.Option(
+            help='Number of samples processed together for residue embedding inference.'
+        )] = 1,
+        num_workers: Annotated[int, typer.Option(
+            help='Number of subprocesses to use for data loading.'
+        )] = 0,
+        residue_codes: Annotated[bool, typer.Option(
+            "--residue-codes/--no-residue-codes",
+            help=_RESIDUE_CODES_HELP
+        )] = False,
+        log_level: Annotated[LogLevel, typer.Option(
+            help='Logging level.'
+        )] = LogLevel.info
+):
+    """Step 1 of a split sequence build: the pre-flight and the ESM3 pass on every rank, then rank 0 checks the shards
+    and writes the run's record last. No database file."""
+
+    # Every rank, read-only, before ESM3. Every refusal is a RefusalError, in both modes (D32).
+    set_log_level(log_level)
+    from foldmatch.search import split_run
+    before, before_error = _fasta_stat_or_error(fasta_file, "before the pre-flight")
+    start = time.monotonic()
+    with _refusals():
+        run = _sequence_build_preflight(fasta_file, min_res_n, output_db, shards_folder, num_nodes, residue_codes)
+    preflight_seconds = time.monotonic() - start
+    with _refusals():
+        split_run.refuse_existing_record(shards_folder, run.embedding_computer.run_id)
+
+    # Every rank: the pass of the one-shot build, up to its barrier.
+    with _refusals():
+        _run_sequence_pass(run, fasta_file=fasta_file, min_res_n=min_res_n, batch_size=batch_size,
+                           num_workers=num_workers, num_nodes=num_nodes, accelerator=accelerator, devices=devices,
+                           strategy=strategy)
+    after, after_error = _fasta_stat_or_error(fasta_file, "after the pass")
+    facts = _gather_rank_facts({
+        "before": before,
+        "after": after,
+        "error": "; ".join(error for error in (before_error, after_error) if error) or None,
+        "size": None if before is None else before.bytes,
+        "preflight": split_run.preflight_counts(run.preflight),
+        "seconds": preflight_seconds,
+    })
+    if not _is_rank_zero():
+        return
+
+    options = {"accelerator": accelerator.value, "devices": list(devices), "num_nodes": num_nodes,
+               "strategy": strategy.value, "batch_size": batch_size, "num_workers": num_workers}
+    record, path = _record_embed_run(run, facts, fasta_file=fasta_file, output_db=output_db,
+                                     shards_folder=shards_folder, min_res_n=min_res_n, options=options)
+    codes = f", residue codes of {record['system']['name']}" if record["system"] is not None else ""
+    logging.info(
+        f"Run {record['run_id']} complete: {record['rows']} entries in {len(record['shards'])} shard(s) of "
+        f"{record['world_size']} rank(s){codes}; record {path}"
+    )
+    logging.info("Build the database with: " + shlex.join([
+        "fm-search", "build", "sequences-index", "--fasta-file", str(fasta_file), "--output-db", record["output_db"],
+        "--from-shards", str(shards_folder), "--run-id", record["run_id"],
+    ]))
+    logging.info(
+        f"Add --index-type to choose its FAISS index: auto picks hnsw at {_AUTO_HNSW_ENTRIES:,} entries or more; flat "
+        f"and hnsw hold every embedding in memory, about 12 KiB per entry at peak; ivf_pq is bounded."
+    )
 
 
 @build_db_app.command(
@@ -1617,6 +1745,171 @@ def _log_index_phase(omp_env_at_start=_OMP_ENV_NOT_RECORDED) -> None:
         logging.warning(
             f"FAISS has {omp_threads} OpenMP thread(s) for {physical} usable physical cores, because of {cause}: "
             f"the index phase may be slower than this node allows.{remedy}"
+        )
+
+
+# FaissEmbeddingDatabase.N_EMBEDDINGS_DB_THR, where --index-type auto switches from flat to hnsw (the module imports
+# FAISS, which step 1 never needs).
+_AUTO_HNSW_ENTRIES = 10000
+
+
+def _fasta_stat_or_error(fasta_file: Path, when: str):
+    """``(FastaStat, None)``, or ``(None, error text)`` when the FASTA cannot be stat'ed: step 1 keeps a rank's stat
+    error in its facts for rank 0 to refuse (E11), so that every rank still reaches the gather."""
+    from foldmatch.search.split_run import fasta_stat
+    try:
+        return fasta_stat(fasta_file), None
+    except OSError as exc:
+        return None, f"stat {when}: {exc}"
+
+
+def _gather_rank_facts(facts: dict) -> List[dict]:
+    """Every rank's ``facts``, in rank order: ``torch.distributed.all_gather_object`` when the pass ran in a process
+    group (it outlives the pass, whose barrier every rank has just left; under NCCL the objects travel on the device
+    Lightning set for the rank), else ``[facts]``. ``build sequences-embed`` calls it on every rank right after the
+    pass, with nothing before it that can raise, so no rank waits in it for a rank that refused."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()):
+        return [facts]
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, facts)
+    return gathered
+
+
+def _record_embed_run(run: _SequencePass, facts: List[dict], *, fasta_file: Path, output_db: str, shards_folder: Path,
+                      min_res_n: int, options: dict) -> Tuple[dict, Path]:
+    """Rank 0 of ``build sequences-embed``, after the pass: the post-pass checks, then the run record, written last;
+    returns ``(record, path)``.
+
+    The world is the ranks that gathered their ``facts`` (:func:`_gather_rank_facts`). Refused, each leaving no record
+    and the shards in place: the embedding count and the deal of the kept entries over those ranks (E9), the shard
+    footers (E10), the FASTA, hashed here, against every rank's stat bracket, size and pre-flight counts (E11), and
+    the record's own staging, check and commit (E12). From E11 on, the refusal also names the ``build sequences-seal``
+    command that records the shards once the cause is fixed.
+    """
+    from foldmatch.search import split_run
+    from foldmatch.search.residue_shards import RESIDUE_CODES, pass_record
+    computer = run.embedding_computer
+    run_id = computer.run_id
+    world_size = len(facts)
+    seconds = [rank_facts["seconds"] for rank_facts in facts]
+    logging.info(f"Pre-flight on {world_size} rank(s): min {min(seconds):.1f} s, max {max(seconds):.1f} s")
+    kept = f"No run record was written; the shards are kept in {shards_folder} as run {run_id}."
+    seal = shlex.join(["fm-search", "build", "sequences-seal", "--fasta-file", str(fasta_file), "--from-shards",
+                       str(shards_folder), "--run-id", run_id, "--min-res-n", str(min_res_n)])
+    with _refusals(note=kept):
+        computer.check_embedding_count()
+        paths = computer.shard_files()
+        shards = split_run.shard_entries(paths)
+        _check_shards_are_the_deal(shards, run.preflight.entries_kept, world_size, shards_folder, run_id)
+        if run.residue_codes:
+            run_pass = split_run.check_codes_footers(paths, system=run.prepared.system, min_res_n=min_res_n,
+                                                     world_size=world_size)
+        else:
+            from foldmatch.utils.esm.loaders import ESM_REVISION
+            split_run.check_plain_footers(paths)
+            run_pass = pass_record(min_res_n=min_res_n, esm_revision=ESM_REVISION, world_size=world_size)
+    with _refusals(note=f"{kept} Once the cause is fixed, 'build sequences-seal' can record them: {seal}"):
+        sha256, hash_seconds = split_run.fasta_sha256(fasta_file)
+        final = split_run.fasta_stat(fasta_file)
+        logging.info(f"FASTA sha256 of {fasta_file} ({final.bytes} bytes) in {hash_seconds:.1f} s")
+        _check_rank_fasta_facts(fasta_file, facts, final)
+        system = None if run.prepared is None else run.prepared.system
+        record = {
+            "kind": split_run.RUN_RECORD_KIND,
+            "record_version": split_run.RUN_RECORD_VERSION,
+            "run_id": run_id,
+            "command": split_run.EMBED_COMMAND,
+            "sealed": False,
+            "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "foldmatch_version": __version__,
+            "fasta": {"path": str(Path(fasta_file).resolve()), "bytes": final.bytes, "mtime_ns": final.mtime_ns,
+                      "sha256": sha256},
+            "min_res_n": min_res_n,
+            "strict": run.residue_codes,
+            "preflight": split_run.preflight_counts(run.preflight),
+            # The user's string is what step 2 gives create_db; the record holds the path it names.
+            "output_db": os.path.abspath(parse_db_path(output_db)[2]),
+            "residue_output": RESIDUE_CODES if run.residue_codes else None,
+            "system": None if system is None else {
+                "name": system.name, "digest": system.digest(), "encoding_digest": system.encoding_digest(),
+            },
+            "world_size": world_size,
+            "pass": run_pass,
+            "options": options,
+            "shards": shards,
+            "rows": sum(shard["rows"] for shard in shards),
+        }
+        path = split_run.write_run_record(shards_folder, record)
+    return record, path
+
+
+def _check_shards_are_the_deal(shards: List[dict], entries: int, world_size: int, folder: Path, run_id: str) -> None:
+    """Refuse (E9) unless the shards' ranks and rows are the pass's deal of ``entries`` over ``world_size`` ranks
+    (:func:`~foldmatch.search.split_run.dealt_rows`): a rank of the world that wrote no shard, a shard of a rank the
+    deal gives nothing, or a rank with other rows."""
+    from foldmatch.search.split_run import dealt_rows
+    deal = dealt_rows(entries, world_size)
+    found = {shard["rank"]: shard["rows"] for shard in shards}
+    if found == deal:
+        return
+    missing = sorted(set(deal) - set(found))
+    extra = sorted(set(found) - set(deal))
+    other = [rank for rank in sorted(set(deal) & set(found)) if found[rank] != deal[rank]]
+
+    def listed(ranks) -> str:
+        return ", ".join(map(str, ranks[:10])) + (", ..." if len(ranks) > 10 else "")
+
+    problems = []
+    if missing:
+        problems.append(f"no shard of rank(s) {listed(missing)}")
+    if extra:
+        problems.append(f"a shard of rank(s) {listed(extra)}, which the deal gives no entry")
+    problems.extend(f"rank {rank} has {found[rank]} row(s), not {deal[rank]}" for rank in other[:10])
+    raise RefusalError(
+        f"The {len(shards)} shard(s) of run {run_id} in {folder} are not the deal of its {entries} entries over the "
+        f"{world_size} rank(s) of the pass ({'; '.join(problems)}): the shards cannot be indexed."
+    )
+
+
+def _check_rank_fasta_facts(fasta_file: Path, facts: List[dict], final) -> None:
+    """Refuse (E11) unless every rank read the same, unchanged FASTA: no rank's stat failed; rank 0's stat before its
+    pre-flight equals ``final`` (its stat after hashing), and every other rank's equals its stat after the pass; every
+    rank's size and pre-flight counts are rank 0's. A rank may read a node-local copy (another inode): each copy is
+    bracketed on its own rank."""
+    from foldmatch.search.split_run import PREFLIGHT_KEYS
+
+    def shown(stat) -> str:
+        return f"{stat.bytes} bytes, mtime_ns {stat.mtime_ns}, inode {stat.ino}"
+
+    errors = [f"rank {rank}: {rank_facts['error']}" for rank, rank_facts in enumerate(facts) if rank_facts["error"]]
+    if errors:
+        raise RefusalError(
+            f"The FASTA {fasta_file} could not be stat'ed on every rank ({'; '.join(errors[:10])}), so it cannot be "
+            f"shown unchanged during the pass."
+        )
+    changed = [(0, facts[0]["before"], final)] if facts[0]["before"] != final else []
+    changed.extend((rank, rank_facts["before"], rank_facts["after"]) for rank, rank_facts in enumerate(facts)
+                   if rank > 0 and rank_facts["before"] != rank_facts["after"])
+    if changed:
+        raise RefusalError(
+            f"The FASTA was modified during the pass ("
+            + "; ".join(f"rank {rank}: before {shown(a)}, after {shown(b)}" for rank, a, b in changed[:10])
+            + f"): the shards may not be the embeddings of {fasta_file} as it is now."
+        )
+    first = facts[0]
+    differ = []
+    for rank, rank_facts in enumerate(facts[1:], 1):
+        if rank_facts["size"] != first["size"]:
+            differ.append(f"rank {rank}: {rank_facts['size']} bytes, rank 0: {first['size']}")
+        counts = [key for key in PREFLIGHT_KEYS if rank_facts["preflight"].get(key) != first["preflight"].get(key)]
+        if counts:
+            differ.append(f"rank {rank}: " + ", ".join(f"{key} {rank_facts['preflight'].get(key)}" for key in counts)
+                          + ", rank 0: " + ", ".join(f"{key} {first['preflight'].get(key)}" for key in counts))
+    if differ:
+        raise RefusalError(
+            f"The ranks did not read the same FASTA ({'; '.join(differ[:10])}): {fasta_file} was modified during the "
+            f"pass, or the ranks' copies of it differ."
         )
 
 
