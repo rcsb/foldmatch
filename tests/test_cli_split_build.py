@@ -10,8 +10,11 @@ the run record it leaves, and each of its refusals E1-E12 at its place. Two rank
 patched ``_gather_rank_facts`` that returns two ranks' facts. ``IndexOptionTest``, ``IndexStepTest`` and
 ``IndexRefusalTest`` (P8b.4) check step 2, ``build sequences-index``: its options, that the two steps build the
 one-shot's database (``assert_same_database``), its threads, and each of its refusals I1-I24 at its place; step 2 runs
-under the ESM3 spy with ``scoring_system.prepare`` refusing. ``RealEsm3SplitTest`` runs both builds with the real CPU
-pass, and ``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
+under the ESM3 spy with ``scoring_system.prepare`` refusing. ``SealOptionTest``, ``SealTest`` and ``SealRefusalTest``
+(P8b.5) check the recovery, ``build sequences-seal``, under the same spies: its options, that the shards a failed
+one-shot kept or a step 1 left without a record are sealed and then built into the one-shot's database, and each of its
+refusals S1-S11, which write nothing. ``RealEsm3SplitTest`` runs both builds with the real CPU pass, and
+``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
 """
 import dataclasses
 import errno
@@ -1701,8 +1704,8 @@ class IndexStepTest(_SplitBuild):
                     f"record, shard schemas and digests, pre-flight counts and ids were checked, and the database is "
                     f"built by this FoldMatch."])
                 self.assertIn(f"The record of run run was written by 'build sequences-seal' (FoldMatch 0.0.2): it "
-                              f"binds the shards to the FASTA by their entry count, rows and ids (and seq_sha1 when "
-                              f"the residue-code store is validated), not by the pass that wrote them.", warnings)
+                              f"binds the shards to the FASTA by their entry count, rows and ids (and, with residue "
+                              f"codes, their seq_sha1), not by the pass that wrote them.", warnings)
                 start = next(m for _, m in messages if m.startswith(f"Building {other} from run"))
                 self.assertEqual(start, f"Building {other} from run run in {shards}: 2 entries in 2 shard(s), sealed "
                                         f"{created} by FoldMatch 0.0.2; embedded by FoldMatch {pass_version} on 2 "
@@ -1727,9 +1730,9 @@ class IndexStepTest(_SplitBuild):
         warnings = [m for level, m in messages if level == "WARNING"]
         self.assertFalse([m for m in warnings if "was embedded by FoldMatch" in m], warnings)
         self.assertIn("The record of run plain was written by 'build sequences-seal' (FoldMatch 0.0.2): it binds the "
-                      "shards to the FASTA by their entry count, rows and ids (and seq_sha1 when the residue-code "
-                      "store is validated), not by the pass that wrote them, whose FoldMatch version is not recorded "
-                      "(shards without residue codes do not record it).", warnings)
+                      "shards to the FASTA by their entry count, rows and ids (and, with residue codes, their "
+                      "seq_sha1), not by the pass that wrote them, whose FoldMatch version is not recorded (shards "
+                      "without residue codes do not record it).", warnings)
         start = next(m for _, m in messages if m.startswith("Building ") and " from run plain " in m)
         self.assertTrue(start.endswith(f"sealed {plain_created} by FoldMatch 0.0.2; embedded by a FoldMatch it does "
                                        f"not record on 1 rank(s) (device not recorded), no residue codes; sealed "
@@ -2302,6 +2305,615 @@ class IndexRefusalTest(_SplitBuild):
         self.assertIn(f"This build's shards are kept in {self.shards.resolve()} (run id run).", message)
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["db.index", "db.metadata", "db.sequences"])
         self.assertEqual(_tree(self.shards), before)
+
+
+# =====================================================================================================================
+# P8b.5: build sequences-seal
+# =====================================================================================================================
+#: Plan P8b (CLI), verbatim: the seal's command help and the help texts it does not take from 'build sequences'.
+SEAL_HELP = (
+    "Recovery: write the run record of embedding shards that have none, so that 'build sequences-index' can build from "
+    "them: a 'build sequences-embed' run whose rank 0 stopped after the pass (wall time, out of memory, a full disk), "
+    "or the shards a 'build sequences' run kept when its index phase failed. Checks the shards against the FASTA "
+    "(entry count, each rank's rows, the shard schema and the id of every row) without ESM3 or a GPU, in one process. "
+    "The record says it was sealed: it binds the shards by these checks, not by the pass."
+)
+SEAL_OWN_HELP = {
+    "fasta_file": "The FASTA file the run embedded.",
+    "from_shards": "Folder holding the run's shards.",
+    "run_id": "Run id of the shards to seal (emb_<run id>-<rank>.parquet).",
+    "min_res_n": "The --min-res-n the run used. Required for a run without residue codes, whose shards do not record "
+                 "it; for a run with codes it is read from the shards, and a different value is refused.",
+}
+#: The record fields a seal writes otherwise than step 1 (plan P8b.5, step 10).
+_SEALED = {"sealed": True, "command": "build sequences-seal", "options": {}, "output_db": None}
+
+
+def _seal_args(fasta, shards, run_id, *extra):
+    return ("build", "sequences-seal", "--fasta-file", fasta, "--from-shards", shards, "--run-id", run_id, *extra)
+
+
+def _codes_flag(codes):
+    return ("--residue-codes",) if codes else ()
+
+
+class _Sealing(_SplitBuild):
+    """``_SplitBuild`` plus the seal, under the ESM3 spy with ``scoring_system.prepare`` refusing, and runs that have
+    no record."""
+
+    def seal(self, *extra, fasta=_FASTA, shards=None, run_id="run", env=None):
+        """``build sequences-seal`` with ``env`` set; returns the result."""
+        with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")), \
+                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}):
+            result = invoke(*_seal_args(fasta, shards or self.shards, run_id, *extra))
+        esm3.assert_not_called()
+        return result
+
+    def sealed(self, *extra, shards=None, run_id="run", **kwargs):
+        """The seal, which must succeed; returns its record's path."""
+        result = self.seal(*extra, shards=shards, run_id=run_id, **kwargs)
+        self.assertEqual(result.exit_code, 0, f"{result.output} {result.exception!r}")
+        return Path(shards or self.shards) / f"emb_{run_id}.run.json"
+
+    def unrecorded(self, *extra, **kwargs):
+        """Step 1 whose rank 0 stopped after the pass: its record deleted. Returns that record."""
+        path = self.embed(*extra, **kwargs)
+        record = split_run.read_run_record(path)
+        path.unlink()
+        return record
+
+
+class SealOptionTest(_Tmp):
+
+    def test_the_command_help(self):
+        self.assertEqual(_command("build", "sequences-seal").help, SEAL_HELP)
+        output = CliRunner().invoke(search.app, ["build", "sequences-seal", "--help"], env={"COLUMNS": "400"}).output
+        for text in (SEAL_HELP, *SEAL_OWN_HELP.values()):
+            with self.subTest(text=text[:40]):
+                self.assertIn(text, _flat(output))
+
+    def test_the_options(self):
+        """Exactly the seal's options, with the plan's help; --fasta-file and --from-shards are step 2's (required,
+        must exist), --log-level the one-shot's; --run-id is required; --min-res-n is optional and at least 0."""
+        seal = {param.name: param for param in _command("build", "sequences-seal").params}
+        oneshot = {param.name: param for param in _command("build", "sequences").params}
+        index = {param.name: param for param in _command("build", "sequences-index").params}
+        self.assertEqual(sorted(seal), sorted(["fasta_file", "from_shards", "run_id", "min_res_n", "log_level"]))
+
+        def info(param):
+            out = param.to_info_dict()
+            for key in ("name", "help"):
+                out.pop(key)
+            return out
+
+        for name, param in seal.items():
+            with self.subTest(name=name):
+                self.assertEqual(param.help, SEAL_OWN_HELP[name] if name in SEAL_OWN_HELP else oneshot[name].help)
+        for name, same in (("fasta_file", index), ("from_shards", index), ("log_level", oneshot)):
+            with self.subTest(name=name):
+                self.assertEqual(info(seal[name]), info(same[name]))
+        run_id = seal["run_id"]
+        self.assertEqual((run_id.opts, run_id.required, run_id.type.name), (["--run-id"], True, "text"))
+        min_res_n = seal["min_res_n"]
+        self.assertEqual((min_res_n.opts, min_res_n.required, min_res_n.default, min_res_n.type.min,
+                          min_res_n.type.max), (["--min-res-n"], False, None, 0, None))
+
+    def test_options_another_command_owns(self):
+        """Every pass, index and output option, --residue-codes (the shards say whether they hold codes) and
+        --cleanup-embeddings: exit 2, nothing read or written. S1: a malformed --run-id, a negative --min-res-n and
+        no --run-id are exit 2 too."""
+        for option in (("--output-db", self.tmp / "db"), ("--shards-folder", self.shards),
+                       ("--tmp-embedding-folder", self.shards), ("--accelerator", "cpu"), ("--num-nodes", "1"),
+                       ("--devices", "1"), ("--strategy", "auto"), ("--batch-size", "1"), ("--num-workers", "0"),
+                       ("--use-gpu-index",), ("--index-type", "flat"), ("--ivf-nlist", "256"), ("--ivf-nprobe", "4"),
+                       ("--load-batch-size", "1000"), ("--residue-codes",), ("--no-residue-codes",),
+                       ("--cleanup-embeddings",), ("--force",)):
+            with self.subTest(option=option[0]), _esm3_spy() as esm3:
+                result = invoke(*_seal_args(_FASTA, self.shards, "run", *option))
+                self.usage_error(result, f"No such option: {option[0]}")
+                esm3.assert_not_called()
+        for bad in ("a b", "a/b", "a*"):
+            with self.subTest(run_id=bad), mock.patch.object(split_run, "refuse_existing_record") as refuse:
+                self.usage_error(invoke(*_seal_args(_FASTA, self.shards, bad)), "is not a run id")
+                refuse.assert_not_called()
+        self.usage_error(invoke(*_seal_args(_FASTA, self.shards, "run", "--min-res-n", "-1")), "--min-res-n")
+        self.usage_error(invoke("build", "sequences-seal", "--fasta-file", _FASTA, "--from-shards", self.shards),
+                         "--run-id")
+        self.assertEqual(list(self.shards.iterdir()), [])
+
+
+class SealTest(_Sealing):
+
+    def test_the_shards_a_failed_one_shot_kept(self):
+        """A 'build sequences' whose index phase fails after the pass (ivf_pq on the fake 8-d embeddings), plain (the
+        seal given --min-res-n) and codes (the seal reads it from the shards), on 1 and 2 ranks, with --min-res-n 0 and
+        100: sealed, then step 2 with a flat index builds the database of a flat one-shot."""
+        for codes in (False, True):
+            for ranks in (1, 2):
+                for min_res_n in (0, 100):
+                    name = f"{'codes' if codes else 'plain'}{ranks}-{min_res_n}"
+                    with self.subTest(codes=codes, ranks=ranks, min_res_n=min_res_n):
+                        extra = ("--min-res-n", min_res_n, *_codes_flag(codes))
+                        shards = self.tmp / f"kept-{name}"
+                        shards.mkdir()
+                        with launch_env(FOLDMATCH_RUN_ID=f"kept-{name}"), \
+                                mock.patch("foldmatch.search.embedding_computer.chain_predict",
+                                           fake_chain_predict(ranks=ranks)):
+                            failed = invoke(*_build_args(_FASTA, self.tmp / f"failed-{name}" / "db", shards, *extra,
+                                                         "--index-type", "ivf_pq"))
+                        self.assertEqual(failed.exit_code, 1, failed.output)
+                        self.assertIn("must divide embedding dim D=8", str(failed.exception))
+                        path = self.sealed(*(() if codes else ("--min-res-n", min_res_n)), shards=shards,
+                                           run_id=f"kept-{name}")
+                        record = split_run.read_run_record(path)
+                        kept = 2 if min_res_n == 0 else 1
+                        self.assertEqual((record["sealed"], record["min_res_n"], record["rows"], record["world_size"]),
+                                         (True, min_res_n, kept, ranks if codes else min(ranks, kept)))
+                        db = self.tmp / f"split-{name}" / "db"
+                        self.built("--index-type", "flat", shards=shards, db=db)
+                        assert_same_database(self.oneshot(*extra, "--index-type", "flat", run_id=f"one-{name}",
+                                                          ranks=ranks), db)
+
+    def test_a_lost_record(self):
+        """A step-1 run whose record was deleted, plain and codes, on 1 and 2 ranks, with --min-res-n 0 and 100 (one
+        entry, so one shard): the sealed record is the lost one except sealed, command, options, output_db and
+        created_utc and, plain, the pass's ESM3 revision (no plain shard records it); the record is the only new
+        file."""
+        for codes in (False, True):
+            for ranks, min_res_n in ((1, 0), (2, 0), (1, 100)):
+                name = f"{'codes' if codes else 'plain'}{ranks}-{min_res_n}"
+                with self.subTest(codes=codes, ranks=ranks, min_res_n=min_res_n):
+                    shards = self.tmp / f"shards-{name}"
+                    shards.mkdir()
+                    lost = self.unrecorded("--min-res-n", min_res_n, *_codes_flag(codes), ranks=ranks, run_id=name,
+                                           shards=shards, db=self.tmp / f"db-{name}")
+                    before = _tree(shards)
+                    path = self.sealed(*(() if codes else ("--min-res-n", min_res_n)), shards=shards, run_id=name)
+                    sealed = split_run.read_run_record(path)
+                    self.assertEqual(json.loads(path.read_text()), sealed)
+                    self.assertEqual({k: v for k, v in _tree(shards).items() if k != str(path)}, before)
+                    created = datetime.strptime(sealed["created_utc"], "%Y-%m-%dT%H:%M:%SZ")
+                    self.assertLess(abs(datetime.now(timezone.utc).replace(tzinfo=None) - created),
+                                    timedelta(minutes=5))
+                    expected = {**lost, **_SEALED, "created_utc": sealed["created_utc"]}
+                    if not codes:
+                        self.assertEqual(lost["pass"]["esm_revision"], ESM_REVISION)
+                        expected["pass"] = {**lost["pass"], "esm_revision": None}
+                    self.assertEqual(sealed, expected)
+
+    def test_the_seal_command_step_1_names(self):
+        """Step 1 on 2 ranks refused after it hashed the FASTA (E12: a full disk while the record is staged): the seal
+        command its refusal names, run verbatim (paths with spaces), records the shards, and step 2 builds the
+        one-shot's database. Plain and codes (the command gives --min-res-n in both modes)."""
+        for codes in (False, True):
+            name = "codes" if codes else "plain"
+            with self.subTest(codes=codes):
+                shards = self.tmp / f"shard s {name}"
+                shards.mkdir()
+                with launch_env(FOLDMATCH_RUN_ID=name), \
+                        mock.patch("foldmatch.search.embedding_computer.chain_predict", fake_chain_predict(ranks=2)), \
+                        mock.patch.object(search, "_gather_rank_facts", side_effect=_ranks(2)), \
+                        mock.patch.object(split_run, "_write_all",
+                                          side_effect=OSError(errno.ENOSPC, "No space left on device")):
+                    result = invoke(*_embed_args(_FASTA, self.tmp / f"db-{name}", shards, *_codes_flag(codes)))
+                message = self.refused(result)
+                hint = "Once the cause is fixed, 'build sequences-seal' can record them: "
+                argv = shlex.split(message[message.index(hint) + len(hint):])
+                self.assertEqual(argv[:3], ["fm-search", "build", "sequences-seal"])
+                self.assertEqual(split_run.record_run_ids(shards), [])
+                with _esm3_spy() as esm3, mock.patch.object(ss, "prepare",
+                                                            side_effect=AssertionError("bundle fetched")):
+                    sealed = invoke(*argv[1:])
+                esm3.assert_not_called()
+                self.assertEqual(sealed.exit_code, 0, f"{sealed.output} {sealed.exception!r}")
+                self.assertEqual(split_run.read_run_record(shards / f"emb_{name}.run.json")["world_size"], 2)
+                db = self.tmp / f"split-{name}" / "db"
+                self.built(shards=shards, db=db)
+                assert_same_database(self.oneshot(*_codes_flag(codes), run_id=f"one-{name}", ranks=2), db)
+
+    def test_a_world_larger_than_its_entries(self):
+        """A pass on 3 ranks over 2 entries writes 2 shards: a codes run's sealed record keeps its pass's world of 3, a
+        plain run's world is its 2 shards (the same deal). Both build the one-shot's database."""
+        for codes in (False, True):
+            name = "codes" if codes else "plain"
+            with self.subTest(codes=codes):
+                shards = self.tmp / f"shards-{name}"
+                shards.mkdir()
+                lost = self.unrecorded(*_codes_flag(codes), ranks=3, run_id=name, shards=shards,
+                                       db=self.tmp / f"x-{name}")
+                self.assertEqual((lost["world_size"], len(lost["shards"])), (3, 2))
+                sealed = split_run.read_run_record(self.sealed(*(() if codes else ("--min-res-n", "0")),
+                                                               shards=shards, run_id=name))
+                self.assertEqual((sealed["world_size"], sealed["pass"]["world_size"]), (3, 3) if codes else (2, 2))
+                self.assertEqual(sealed["shards"], lost["shards"])
+                db = self.tmp / f"split-{name}" / "db"
+                self.built(shards=shards, db=db)
+                assert_same_database(self.oneshot(*_codes_flag(codes), run_id=f"one-{name}", ranks=3), db)
+
+    def test_the_log_lines_and_the_next_command(self):
+        """The FASTA hash and the id check are timed; then the run sealed, the WARNING that the record binds the
+        shards by these checks (and seq_sha1 with codes), and step 2's command, which builds the database once DB is
+        given (paths with spaces, split as a shell splits them)."""
+        folder = self.tmp / "with space"
+        folder.mkdir()
+        fasta = Path(shutil.copyfile(_FASTA, folder / "my seqs.fasta"))
+        for codes in (True, False):
+            with self.subTest(codes=codes):
+                shards = folder / f"shard s {codes}"
+                shards.mkdir()
+                self.unrecorded(*_codes_flag(codes), ranks=2, fasta=fasta, shards=shards, db=self.tmp / f"db-{codes}")
+                messages = self.logged(lambda: self.sealed(*(() if codes else ("--min-res-n", "0")), fasta=fasta,
+                                                           shards=shards))
+                found = [m for _, m in messages]
+                size = fasta.stat().st_size
+                prefixes = (f"FASTA sha256 of {fasta.resolve()} ({size} bytes) in ",
+                            f"Ids{' and seq_sha1' if codes else ''} of the 2 shard rows checked against "
+                            f"{fasta.resolve()} in ", "Run run sealed: ", "The record of run run is sealed: ",
+                            "Build the database DB with: ")
+                lines = [[m for m in found if m.startswith(prefix)] for prefix in prefixes]
+                self.assertEqual([len(line) for line in lines], [1] * 5, found)
+                lines = [line[0] for line in lines]
+                order = [found.index(line) for line in lines]
+                self.assertEqual(order, sorted(order))
+                for line in lines[:2]:
+                    self.assertRegex(line, r" in \d+\.\d s$")
+                self.assertEqual(lines[2], f"Run run sealed: 2 entries in 2 shard(s) of 2 rank(s)"
+                                           f"{f', residue codes of {SYSTEM.name}' if codes else ''}; record "
+                                           f"{shards.resolve() / 'emb_run.run.json'}")
+                self.assertIn(("WARNING", lines[3]), messages)
+                self.assertIn(f"binds the shards to {fasta.resolve()} by their entry count, each rank's rows and the "
+                              f"id of every row", lines[3])
+                self.assertEqual("seq_sha1" in lines[3], codes)
+                self.assertEqual(" and its seq_sha1, the sha1 of the entry's sequence, not by the pass" in lines[3],
+                                 codes)
+                self.assertTrue(lines[3].endswith(", not by the pass that wrote them, which 'build sequences-seal' did "
+                                                  "not see."), lines[3])
+                argv = shlex.split(lines[4][len("Build the database DB with: "):])
+                self.assertEqual(argv, ["fm-search", "build", "sequences-index", "--fasta-file", str(fasta.resolve()),
+                                        "--output-db", "DB", "--from-shards", str(shards.resolve()), "--run-id", "run"])
+                db = folder / f"my db {codes}"
+                argv[argv.index("DB")] = str(db)
+                with _esm3_spy() as esm3, mock.patch.object(ss, "prepare",
+                                                            side_effect=AssertionError("bundle fetched")):
+                    result = invoke(*argv[1:])
+                esm3.assert_not_called()
+                self.assertEqual(result.exit_code, 0, result.output)
+                assert_same_database(self.oneshot(*_codes_flag(codes), run_id=f"one-{codes}", fasta=fasta, ranks=2), db)
+
+    def test_offline_with_an_empty_hf_cache(self):
+        """The seal as a command, with HF_HUB_OFFLINE=1 and an empty Hugging Face cache: a codes run is sealed from its
+        shards' footers, without the bundle."""
+        self.unrecorded("--residue-codes")
+        empty = self.tmp / "empty-hf-cache"
+        empty.mkdir()
+        env = {k: v for k, v in os.environ.items()
+               if k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+        env.update(HF_HUB_OFFLINE="1", HF_HUB_CACHE=str(empty), HF_HOME=str(empty),
+                   PYTHONPATH=os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p]))
+        run = subprocess.run([sys.executable, "-m", "foldmatch.cli.search", *map(str, _seal_args(
+            _FASTA, self.shards, "run"))], env=env, capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+        self.assertEqual(split_run.read_run_record(self.shards / "emb_run.run.json")["system"]["name"], SYSTEM.name)
+        self.assertEqual(list(empty.rglob("models--*")), [])
+
+    def test_a_system_unknown_here(self):
+        """The seal needs no registry entry: a codes run whose system this FoldMatch does not register is sealed;
+        step 2 then refuses it (I10) or builds the plain database (--no-residue-codes)."""
+        self.unrecorded("--residue-codes")
+        with mock.patch.object(ss, "REGISTRY", MappingProxyType({})):
+            self.sealed()
+            self.assertIn("unknown esm-codes scoring system", self.refused(self.index()))
+            self.built("--no-residue-codes")
+        assert_same_database(self.oneshot(run_id="plain"), self.db)
+
+    def test_the_foldmatch_of_a_sealed_pass(self):
+        """Step 1 by another FoldMatch, its record lost, sealed by this one: the sealed record holds the seal's version,
+        and step 2 takes the pass's from the codes shards' pass record (D30 WARNING, start line). A plain run's pass
+        version is not recorded anywhere (its pass record is the seal's): no D30 WARNING, and the sealed WARNING says
+        the version is unknown."""
+        for codes in (True, False):
+            with self.subTest(codes=codes):
+                for path in [*self.shards.iterdir(), *self.out.iterdir()]:
+                    path.unlink()
+                with mock.patch.object(foldmatch, "__version__", "0.7.0-old"), \
+                        mock.patch.object(search, "__version__", "0.7.0-old"):
+                    lost = self.unrecorded(*_codes_flag(codes))
+                self.assertEqual((lost["foldmatch_version"], lost["pass"]["foldmatch_version"]), ("0.7.0-old",) * 2)
+                record = split_run.read_run_record(self.sealed(*(() if codes else ("--min-res-n", "0"))))
+                self.assertEqual((record["foldmatch_version"], record["pass"]["foldmatch_version"]),
+                                 (foldmatch.__version__, "0.7.0-old" if codes else foldmatch.__version__))
+                messages = self.logged(lambda: self.built())
+                warnings = [m for level, m in messages if level == "WARNING"]
+                d30 = [m for m in warnings if m.startswith("Run run was embedded by FoldMatch ")]
+                self.assertEqual([m.split(",")[0] for m in d30], ["Run run was embedded by FoldMatch 0.7.0-old"]
+                                 if codes else [])
+                sealed = next(m for m in warnings if "written by 'build sequences-seal'" in m)
+                self.assertIn(f"(FoldMatch {foldmatch.__version__})", sealed)
+                self.assertEqual(sealed.endswith("whose FoldMatch version is not recorded (shards without residue "
+                                                 "codes do not record it)."), not codes)
+                start = next(m for _, m in messages if m.startswith(f"Building {self.db} from run run "))
+                self.assertIn(f"sealed {record['created_utc']} by FoldMatch {foldmatch.__version__}; embedded by "
+                              + ("FoldMatch 0.7.0-old on" if codes else "a FoldMatch it does not record on"), start)
+
+
+class SealRefusalTest(_Sealing):
+
+    def setUp(self):
+        super().setUp()
+        self.inputs = self.tmp / "in"
+        self.inputs.mkdir()
+        self.fasta = Path(shutil.copyfile(_FASTA, self.inputs / "seqs.fasta"))
+
+    def refused_seal(self, *extra, cause=None, env=None, shards=None, run_id="run", fasta=None):
+        """The seal refused (exit 1, a RefusalError), before ESM3, writing nothing: the shards folder and the database
+        folder as they were. Returns the message."""
+        before = _tree(self.out, shards or self.shards)
+        result = self.seal(*extra, fasta=fasta or self.fasta, shards=shards, run_id=run_id, env=env)
+        message = self.refused(result, cause)
+        self.assertEqual(_tree(self.out, shards or self.shards), before)
+        return message
+
+    def unrecorded_run(self, *extra, **kwargs):
+        return self.unrecorded(*extra, **{"fasta": self.fasta, **kwargs})
+
+    def clear(self):
+        for path in self.shards.iterdir():
+            path.unlink()
+
+    def shard(self, rank=0):
+        return self.shards / f"emb_run-{rank}.parquet"
+
+    def test_s1_the_flags(self):
+        self.unrecorded_run()
+        self.usage_error(self.seal("--min-res-n", "-1", fasta=self.fasta), "--min-res-n")
+        self.usage_error(self.seal(fasta=self.fasta, run_id="a b"), "is not a run id")
+        self.assertEqual(split_run.record_run_ids(self.shards), [])
+
+    def test_s2_the_launch(self):
+        """One of several ranks (I2), and the batch step of a multi-node job (I3): refused before the folder is
+        read."""
+        self.unrecorded_run()
+        for env, text in (({"WORLD_SIZE": 2}, "'build sequences-seal' runs as one process (WORLD_SIZE=2): launch it "
+                                              "once, directly in the batch script or with srun -n 1."),
+                          ({"LOCAL_RANK": 1}, "(LOCAL_RANK=1)"),
+                          ({"SLURM_JOB_ID": 7, "SLURM_STEP_ID": 0, "SLURM_STEP_NUM_TASKS": 2},
+                           "(SLURM_STEP_NUM_TASKS=2)"),
+                          ({"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8},
+                           "SLURM job 4711 holds 2 nodes, and 'build sequences-seal' runs in one process")):
+            with self.subTest(env=env), mock.patch.object(split_run, "refuse_existing_record") as refuse:
+                self.assertIn(text, self.refused_seal(env=env))
+                refuse.assert_not_called()
+
+    def test_s3_a_record_or_tmp(self):
+        """A run with a record: use it. A record whose writer stopped (.tmp only): delete it, then seal again."""
+        record = self.embed(fasta=self.fasta)
+        message = self.refused_seal()
+        self.assertIn(f"{self.shards.resolve() / 'emb_run.run.json'} exists: run run in {self.shards.resolve()} has "
+                      f"its run record already, so there is nothing to seal.", message)
+        self.assertIn(f"Use it: 'build sequences-index --from-shards {self.shards.resolve()} --run-id run'", message)
+        record.rename(self.shards / "emb_run.run.json.tmp")
+        message = self.refused_seal()
+        self.assertIn(f"{self.shards.resolve() / 'emb_run.run.json.tmp'} exists", message)
+        self.assertIn("Delete the .tmp, then run 'build sequences-seal' again.", message)
+
+    def test_s4_no_shards_of_the_run(self):
+        self.unrecorded_run()
+        self.embed(fasta=self.fasta, run_id="done", db=self.tmp / "other")
+        message = self.refused_seal(run_id="nope")
+        self.assertIn(f"No embedding shards of run nope (emb_nope-<rank>.parquet) in {self.shards.resolve()}, so there "
+                      f"is nothing to seal. It holds run done (run record, 1 shard(s)); run run (1 shard(s), no run "
+                      f"record).", message)
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertTrue(self.refused_seal(shards=empty).endswith("It holds no run."))
+
+    def test_s5_the_footers(self):
+        """Plain and codes shards mixed; codes shards of two encodings; a codes shard without a pass record; residue
+        shards of another kind (query encodings); a plain shard that is not legacy; a shard that is no Parquet file.
+        Each names the shards."""
+        def metadata(change):
+            def rewrite(table):
+                meta = dict(table.schema.metadata)
+                change(meta)
+                return table.replace_schema_metadata(meta)
+            return rewrite
+
+        cases = {
+            "plain and codes": (True, 1, lambda t: t.select(["id", "embedding"]).replace_schema_metadata(None),
+                                ("The 2 shards of run run in", "are mixed: ", "no residue column (a plain pass) (e.g. "
+                                 "emb_run-1.parquet)", "residue_codes of")),
+            "two encodings": (True, 1, metadata(lambda m: m.update({b"foldmatch.encoding_digest": b"0" * 64})),
+                              ("are mixed: ", "encoding_digest " + "0" * 64)),
+            "no pass record": (True, 0, metadata(lambda m: m.pop(META_PASS)),
+                               ("1 of the 2 shard(s) of run run in", "record no pass (foldmatch.pass): "
+                                "emb_run-0.parquet.")),
+            "query encodings": (True, None, metadata(lambda m: m.update({b"foldmatch.residue_output":
+                                                                         b"query_encoding"})),
+                                ("hold query_encoding of", f"not the residue codes of {SYSTEM.name}")),
+            "not legacy": (False, None, lambda t: t.replace_schema_metadata({b"foldmatch.system": b"x"}),
+                           ("are not plain embedding shards", "the metadata foldmatch.system")),
+        }
+        for case, (codes, rank, change, texts) in cases.items():
+            with self.subTest(case=case):
+                self.clear()
+                self.unrecorded_run(*_codes_flag(codes), ranks=2)
+                for r in ((0, 1) if rank is None else (rank,)):
+                    _rewrite(self.shard(r), change)
+                message = self.refused_seal(*(() if codes else ("--min-res-n", "0")))
+                for text in texts:
+                    self.assertIn(text, message)
+        with self.subTest(case="no Parquet file"):
+            self.clear()
+            self.unrecorded_run("--residue-codes")
+            self.shard().write_bytes(b"not a shard")
+            self.assertIn("emb_run-0.parquet: not a readable Parquet embedding shard", self.refused_seal())
+
+    def test_s6_the_pass(self):
+        """A plain run without --min-res-n; a codes run with another --min-res-n than its shards'; codes shards that
+        disagree on their pass's world size or --min-res-n, or record no valid one; a world smaller than the shard
+        count. Each gives both values."""
+        self.unrecorded_run()
+        self.assertIn("hold no residue codes, so they do not record the --min-res-n of their pass: give the "
+                      "--min-res-n the run used.", self.refused_seal())
+        cases = {
+            "another --min-res-n": ((), ("--min-res-n", "100"),
+                                    ("--min-res-n is 100, but the shards of run run in", "record a pass with "
+                                     "--min-res-n 0: leave --min-res-n out")),
+            "world sizes disagree": (((1, _with_pass(world_size=3)),), (),
+                                     ("disagree on their pass's world_size: 2 in emb_run-0.parquet, 3 in "
+                                      "emb_run-1.parquet.",)),
+            "min_res_n disagree": (((1, _with_pass(min_res_n=5)),), (),
+                                   ("disagree on their pass's min_res_n: 0 in emb_run-0.parquet, 5 in "
+                                    "emb_run-1.parquet.",)),
+            "no valid min_res_n": (((0, _with_pass(min_res_n=None)), (1, _with_pass(min_res_n=None))), (),
+                                   ("record a pass without a valid --min-res-n and world size (min_res_n None, "
+                                    "world_size 2)",)),
+            "a world smaller than the shards": (((0, _with_pass(world_size=1)), (1, _with_pass(world_size=1))), (),
+                                                ("record a pass on 1 rank(s), but there are 2 of them",)),
+        }
+        for case, (changes, extra, texts) in cases.items():
+            with self.subTest(case=case):
+                self.clear()
+                self.unrecorded_run("--residue-codes", ranks=2)
+                for rank, change in changes:
+                    _rewrite(self.shard(rank), change)
+                message = self.refused_seal(*extra)
+                for text in texts:
+                    self.assertIn(text, message)
+
+    def test_s7_the_pre_flight(self):
+        """The pre-flight's own refusals (strict for a codes run, a header without an id in either mode) and nothing to
+        build: as the one-shot."""
+        self.unrecorded_run("--residue-codes")
+        duplicate = _write(self.inputs / "dup.fasta", ">1acb_E\nACDE\n>1acb_E\nACDE\n")
+        self.assertIn("repeat an earlier id", self.refused_seal(fasta=duplicate, cause=ValueError))
+        self.clear()
+        self.unrecorded_run()
+        empty_id = _write(self.inputs / "empty-id.fasta", ">\nACDE\n>b\nKLMN\n")
+        self.assertIn("is empty", self.refused_seal("--min-res-n", "0", fasta=empty_id, cause=ValueError))
+        self.assertIn("there is nothing to build", self.refused_seal("--min-res-n", "1000", cause=ValueError))
+
+    def test_s8_the_shards_are_incomplete(self):
+        """Rows other than the kept entries (a lost shard, codes or plain; a plain run sealed with another --min-res-n)
+        and rows that are not the deal."""
+        message_end = "The shards are incomplete: run 'build sequences-embed' again"
+        self.unrecorded_run("--residue-codes", ranks=2)
+        self.shard(1).unlink()
+        message = self.refused_seal()
+        self.assertIn(f"The 1 shard(s) of run run in {self.shards.resolve()} hold 1 row(s), but "
+                      f"{self.fasta.resolve()} has 2 entries with at least 0 residues.", message)
+        self.assertTrue(message.endswith(f"{message_end}."), message)
+        self.clear()
+        self.unrecorded_run(ranks=2)
+        self.shard(1).unlink()
+        message = self.refused_seal("--min-res-n", "0")
+        self.assertIn("hold 1 row(s), but", message)
+        self.assertTrue(message.endswith(f"{message_end}, or give the --min-res-n the run used."), message)
+        self.clear()
+        self.unrecorded_run()
+        self.assertIn("hold 2 row(s), but", self.refused_seal("--min-res-n", "100"))
+        self.clear()
+        five = _write(self.inputs / "five.fasta", _FIVE)
+        self.unrecorded_run("--residue-codes", ranks=2, fasta=five)
+        t0, t1 = pq.read_table(self.shard(0)), pq.read_table(self.shard(1))
+        pq.write_table(t0.slice(0, 2), self.shard(0))  # rank 0: entries 0, 2; rank 1: 4, 1, 3
+        pq.write_table(pa.concat_tables([t0.slice(2), t1.replace_schema_metadata(t0.schema.metadata)]), self.shard(1))
+        message = self.refused_seal(fasta=five)
+        self.assertIn("are not the deal of its 5 entries over the 2 rank(s) of the pass (rank 0 has 2 row(s), not 3; "
+                      "rank 1 has 3 row(s), not 2): the shards cannot be indexed.", message)
+        self.assertTrue(message.endswith(f"{message_end}."), message)
+
+    def test_s9_ids_not_at_their_dealt_positions(self):
+        for codes in (False, True):
+            with self.subTest(codes=codes):
+                self.clear()
+                self.unrecorded_run(*_codes_flag(codes))
+                _rewrite(self.shard(), lambda table: table.set_column(0, table.schema.field("id"), pa.array(
+                    table.column("id").to_pylist()[::-1], table.schema.field("id").type)))
+                message = self.refused_seal(*(() if codes else ("--min-res-n", "0")))
+                self.assertIn("2 shard row(s) of run run do not hold the id of the entry", message)
+                self.assertIn("emb_run-0.parquet row 0 holds '2uzi_A', entry 0 is '1acb_E'", message)
+
+    def test_s9_sequences_that_are_not_the_shards(self):
+        """A FASTA with the run's ids, order and lengths but another residue (the same size and pre-flight counts):
+        a codes run's seq_sha1 refuses it; a plain run has no seq_sha1, so its seal binds by ids only (D31)."""
+        for codes in (True, False):
+            with self.subTest(codes=codes):
+                self.clear()
+                shutil.copyfile(_FASTA, self.fasta)
+                self.unrecorded_run(*_codes_flag(codes))
+                _one_residue_changed(self.fasta)
+                if not codes:
+                    self.sealed("--min-res-n", "0", fasta=self.fasta)
+                    continue
+                message = self.refused_seal()
+                self.assertIn("1 shard row(s) of run run hold a seq_sha1 that is not the sha1 of the sequence of the "
+                              f"entry of {self.fasta.resolve()} the pass dealt them, though they hold its id: "
+                              "emb_run-0.parquet row 0 ('1acb_E', entry 0). These shards were not computed from this "
+                              "FASTA's sequences.", message)
+
+    def test_s10_a_write_during_the_hash(self):
+        """The seal's bracket opens before the hash: a write while the FASTA is hashed (its mtime moved once the hash
+        is done) is refused, so the record never pairs a sha256 with a stat taken after it."""
+        self.unrecorded_run("--residue-codes")
+        real = split_run.fasta_sha256
+
+        def written_while_hashed(path):
+            out = real(path)
+            stat = os.stat(path)
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10 ** 9))
+            return out
+
+        with mock.patch.object(split_run, "fasta_sha256", side_effect=written_while_hashed):
+            message = self.refused_seal()
+        self.assertIn(f"The FASTA changed during the seal ({self.fasta.resolve()}: ", message)
+        self.assertEqual(split_run.record_run_ids(self.shards), [])
+
+    def test_s10_the_fasta_changed_during_the_seal(self):
+        """The FASTA touched, or removed, after the id check: refused with both stats."""
+        self.unrecorded_run("--residue-codes")
+        check = split_run.check_dealt_ids
+        stat = self.fasta.stat()
+
+        def touching(*args, **kwargs):
+            seconds = check(*args, **kwargs)
+            os.utime(self.fasta, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10 ** 9))
+            return seconds
+
+        with mock.patch.object(split_run, "check_dealt_ids", side_effect=touching):
+            message = self.refused_seal()
+        self.assertIn(f"The FASTA changed during the seal ({self.fasta.resolve()}: {stat.st_size} bytes, mtime_ns "
+                      f"{stat.st_mtime_ns}, inode {stat.st_ino} before it was hashed, now {stat.st_size} bytes, "
+                      f"mtime_ns {stat.st_mtime_ns + 10 ** 9}, inode {stat.st_ino})", message)
+
+        def removing(*args, **kwargs):
+            seconds = check(*args, **kwargs)
+            self.fasta.rename(self.inputs / "gone.fasta")
+            return seconds
+
+        with mock.patch.object(split_run, "check_dealt_ids", side_effect=removing):
+            self.assertIn("now cannot be stat'ed", self.refused_seal())
+
+    def test_s11_the_record_cannot_be_written(self):
+        """A full disk while the record is staged: the .tmp is removed. A record of the run written by another process
+        during the seal: refused, and left as it is."""
+        self.unrecorded_run("--residue-codes")
+        with mock.patch.object(split_run, "_write_all", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            message = self.refused_seal()
+        self.assertIn(f"The run record {self.shards.resolve() / 'emb_run.run.json'} cannot be written", message)
+        self.assertIn("No space left on device", message)
+        check = split_run.check_dealt_ids
+
+        def racing(*args, **kwargs):
+            seconds = check(*args, **kwargs)
+            (self.shards / "emb_run.run.json").write_text("another process\n")
+            return seconds
+
+        with mock.patch.object(split_run, "check_dealt_ids", side_effect=racing):
+            message = self.refused(self.seal(fasta=self.fasta))
+        self.assertIn("File exists", message)
+        self.assertEqual((self.shards / "emb_run.run.json").read_text(), "another process\n")
+        self.assertEqual(sorted(p.name for p in self.shards.iterdir()), ["emb_run-0.parquet", "emb_run.run.json"])
 
 
 # =====================================================================================================================

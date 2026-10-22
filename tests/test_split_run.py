@@ -165,6 +165,10 @@ class RunRecordIOTest(_Run):
         self.assertEqual(tmp.read_text(), "another writer's")  # not ours: left alone
         self.refused(lambda: split_run.refuse_existing_record(self.shards, "r"), str(tmp), "same run id (r)",
                      "Delete the .tmp", "FOLDMATCH_RUN_ID")
+        message = self.refused(lambda: split_run.refuse_existing_record(self.shards, "r",
+                                                                        command=split_run.SEAL_COMMAND),
+                               str(tmp), "Delete the .tmp, then run 'build sequences-seal' again.")
+        self.assertNotIn("FOLDMATCH_RUN_ID", message)
         tmp.unlink()
         final = split_run.write_run_record(self.shards, record)
         text = final.read_text()
@@ -172,7 +176,13 @@ class RunRecordIOTest(_Run):
         self.assertEqual((final.read_text(), self.names()), (text, ["emb_r-0.parquet", "emb_r.run.json"]))
         self.refused(lambda: split_run.refuse_existing_record(self.shards, "r"), str(final), "same run id (r)",
                      "Remove it and its shards", "another --shards-folder", "FOLDMATCH_RUN_ID")
+        message = self.refused(lambda: split_run.refuse_existing_record(self.shards, "r",
+                                                                        command=split_run.SEAL_COMMAND),
+                               str(final), "has its run record already, so there is nothing to seal",
+                               f"Use it: 'build sequences-index --from-shards {self.shards} --run-id r'")
+        self.assertNotIn("Remove it", message)
         split_run.refuse_existing_record(self.shards, "other")
+        split_run.refuse_existing_record(self.shards, "other", command=split_run.SEAL_COMMAND)
 
     def test_without_hard_links(self):
         """``os.link`` unsupported (ENOTSUP): the .tmp is renamed into place (INFO), unless a record exists."""
@@ -477,6 +487,31 @@ class CheckDealtIdsTest(_Run):
         self.refused(lambda: split_run.check_dealt_ids(run_shard_files(self.shards, "r"), record, preflight),
                      "not the deal of the 2 entries", "rank 2: 1 row(s)")
         self.refused(lambda: split_run.check_dealt_ids(paths[:1], record, preflight), "rank 0: 1 row(s)) are not")
+
+    def test_the_sequences_of_codes_shards(self):
+        """``sequences``: every codes row's seq_sha1 against its entry's sequence, in the same pass. A FASTA with the
+        same ids, order and lengths but another residue is refused (the ids still pass); a mismatched id is reported
+        as such, before any seq_sha1; plain shards have no seq_sha1 to check."""
+        fasta = _write(self.tmp / "five.fasta", _FIVE)
+        record, preflight, paths = self.make_record("c", fasta, ranks=2, codes=True)
+        self.assertIsInstance(split_run.check_dealt_ids(paths, record, preflight, sequences=True), float)
+        other = _write(self.tmp / "other.fasta", _FIVE.replace("VWYACDEFGH", "VWYACDEFGW").replace("IKLMNPQRST",
+                                                                                                   "IKLMNPQRSW"))
+        moved = preflight_fasta(other, 0)
+        split_run.check_dealt_ids(paths, record, moved)  # the ids alone agree
+        message = self.refused(lambda: split_run.check_dealt_ids(paths, record, moved, sequences=True),
+                               "2 shard row(s) of run c hold a seq_sha1 that is not the sha1 of the sequence of the "
+                               f"entry of {other} the pass dealt them, though they hold its id: emb_c-0.parquet row 1 "
+                               "('e2', entry 2); emb_c-1.parquet row 1 ('e3', entry 3). These shards were not computed "
+                               "from this FASTA's sequences.")
+        self.assertNotIn("do not hold the id", message)
+        self.rewrite(paths[0], ["e0", "e1", "e4"])
+        self.refused(lambda: split_run.check_dealt_ids(paths, record, preflight, sequences=True),
+                     "1 shard row(s) of run c do not hold the id", "emb_c-0.parquet row 1 holds 'e1', entry 2 is 'e2'")
+        (self.tmp / "plain").mkdir()
+        plain, plain_preflight, plain_paths = self.make_record("p", fasta, folder=self.tmp / "plain")
+        self.refused(lambda: split_run.check_dealt_ids(plain_paths, plain, plain_preflight, sequences=True),
+                     "the ids and seq_sha1 of a shard of run p cannot be read")
 
     def test_many_offsets(self):
         """More entries than one offset chunk (the chunk patched down to 2)."""

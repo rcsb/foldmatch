@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -51,7 +52,8 @@ from foldmatch.search.residue_shards import (
 )
 from foldmatch.search.sequence_store import SequenceStore
 from foldmatch.utils.dist import RUN_ID_ENV, is_run_id
-from foldmatch.utils.fasta import read_id_at
+from foldmatch.utils.fasta import read_id_at, read_record_at
+from foldmatch.utils.sequence import seq_sha1
 
 logger = logging.getLogger(__name__)
 
@@ -324,15 +326,30 @@ def check_codes_footers(paths: Sequence, *, system=None, expect: Optional[Dict[s
 # =====================================================================================================================
 # record I/O
 # =====================================================================================================================
-def refuse_existing_record(folder, run_id: str) -> None:
-    """Refuse if ``folder`` holds a run record of ``run_id``, or its staged ``.tmp``. Read-only."""
+def refuse_existing_record(folder, run_id: str, *, command: str = EMBED_COMMAND) -> None:
+    """Refuse if ``folder`` holds a run record of ``run_id``, or its staged ``.tmp``. Read-only.
+
+    The advice is ``command``'s: step 1 (:data:`EMBED_COMMAND`) found an earlier run with its id; the seal
+    (:data:`SEAL_COMMAND`) found the run it would seal recorded already (use the record), or a record whose writer
+    stopped (delete the ``.tmp``, then seal again)."""
     path = run_record_path(folder, run_id)
+    sealing = command == SEAL_COMMAND
     if path.exists():
+        if sealing:
+            raise RefusalError(
+                f"{path} exists: run {run_id} in {folder} has its run record already, so there is nothing to seal. "
+                f"Use it: 'build sequences-index --from-shards {folder} --run-id {run_id}' builds from it."
+            )
         raise RefusalError(
             f"{path} exists: a run record of an earlier run with the same run id ({run_id}) is in {folder}. Remove "
             f"it and its shards, use another --shards-folder, or set a different {RUN_ID_ENV}."
         )
     tmp = run_record_tmp_path(folder, run_id)
+    if tmp.exists() and sealing:
+        raise RefusalError(
+            f"{tmp} exists: the run record of run {run_id} was being written when its command stopped. Delete the "
+            f".tmp, then run 'build sequences-seal' again."
+        )
     if tmp.exists():
         raise RefusalError(
             f"{tmp} exists: an earlier run with the same run id ({run_id}) stopped while it wrote its run record. "
@@ -636,22 +653,46 @@ def check_run_shards(folder, record: Dict[str, Any]) -> List[Path]:
     return paths
 
 
-def check_dealt_ids(paths: Sequence, record: Dict[str, Any], preflight) -> float:
+def _sha1_rows(column: pa.ChunkedArray, path: Path) -> np.ndarray:
+    """A shard's ``seq_sha1`` column as a ``uint8`` array of ``[rows, 20]`` (20 B per row, no Python objects)."""
+    array = column.combine_chunks()
+    if array.type != SEQ_SHA1_TYPE or array.null_count:
+        raise RefusalError(f"{path}: its seq_sha1 column is not {SEQ_SHA1_TYPE} without nulls ({array.type}, "
+                           f"{array.null_count} null(s)).")
+    width = SEQ_SHA1_TYPE.byte_width
+    if not len(array):
+        return np.zeros((0, width), np.uint8)
+    data = np.frombuffer(array.buffers()[1], dtype=np.uint8)
+    return data[array.offset * width:(array.offset + len(array)) * width].reshape(-1, width)
+
+
+def check_dealt_ids(paths: Sequence, record: Dict[str, Any], preflight, *, sequences: bool = False) -> float:
     """Refuse unless every shard row holds the id of the FASTA entry the pass's deal gave it: kept entry ``k`` (in
     the order of ``preflight.offsets``) is row ``k // W`` of rank ``k % W``'s shard, ``W`` the record's
     ``world_size``. One sequential pass over the kept records, each shard's id column loaded once (about 100 B per
-    entry). Returns the seconds it took."""
+    entry). Returns the seconds it took.
+
+    With ``sequences`` (residue-code shards), every row's ``seq_sha1`` must also be the
+    :func:`~foldmatch.utils.sequence.seq_sha1` of its entry's sequence, read in the same pass (20 B more per row):
+    shards computed from another FASTA with the same ids, order and lengths are refused too. Their pre-flight was
+    strict, so every sequence is ASCII."""
     start = time.monotonic()
     world = record["world_size"]
     total = preflight.entries_kept
     by_rank: Dict[int, list] = {}
+    sha1s: Dict[int, Any] = {}
     names: Dict[int, str] = {}
     for path in map(Path, paths):
         rank = _shard_rank(path)
         try:
-            by_rank[rank] = pq.read_table(path, columns=[ID]).column(ID).to_pylist()
+            table = pq.read_table(path, columns=[ID, SEQ_SHA1] if sequences else [ID])
+            by_rank[rank] = table.column(ID).to_pylist()
+            if sequences:
+                sha1s[rank] = _sha1_rows(table.column(SEQ_SHA1), path)
         except (pa.ArrowException, OSError, KeyError) as exc:
-            raise RefusalError(f"{path}: the ids of a shard of run {record['run_id']} cannot be read ({exc}).") from exc
+            what = "ids and seq_sha1" if sequences else "ids"
+            raise RefusalError(f"{path}: the {what} of a shard of run {record['run_id']} cannot be read ({exc}).") \
+                from exc
         names[rank] = path.name
     found = {rank: len(ids) for rank, ids in by_rank.items()}
     deal = dealt_rows(total, world)
@@ -661,22 +702,37 @@ def check_dealt_ids(paths: Sequence, record: Dict[str, Any], preflight) -> float
             f"{preflight.path} over {world} rank(s) ({_deal_text(deal)})."
         )
     mismatches, shown = 0, []
+    sha1_mismatches, sha1_shown = 0, []
     offsets = preflight.offsets
     with open(preflight.path, "r") as fh:
         for begin in range(0, total, _OFFSET_CHUNK):
             for k, offset in enumerate(offsets[begin:begin + _OFFSET_CHUNK].tolist(), begin):
                 rank, row = k % world, k // world
                 got = by_rank[rank][row]
-                want = read_id_at(fh, offset)
+                if sequences:
+                    want, sequence = read_record_at(fh, offset)
+                else:
+                    want = read_id_at(fh, offset)
                 if got != want:
                     mismatches += 1
                     if len(shown) < _EXAMPLES:
                         shown.append(f"{names[rank]} row {row} holds {got!r}, entry {k} is {want!r}")
+                elif sequences and sha1s[rank][row].tobytes() != seq_sha1(sequence):
+                    sha1_mismatches += 1
+                    if len(sha1_shown) < _EXAMPLES:
+                        sha1_shown.append(f"{names[rank]} row {row} ({got!r}, entry {k})")
     if mismatches:
         raise RefusalError(
             f"{mismatches} shard row(s) of run {record['run_id']} do not hold the id of the entry of "
             f"{preflight.path} the pass dealt them: {'; '.join(shown)}{'; ...' if mismatches > len(shown) else ''}. "
             f"These shards were not computed from this FASTA in this order."
+        )
+    if sha1_mismatches:
+        raise RefusalError(
+            f"{sha1_mismatches} shard row(s) of run {record['run_id']} hold a seq_sha1 that is not the sha1 of the "
+            f"sequence of the entry of {preflight.path} the pass dealt them, though they hold its id: "
+            f"{'; '.join(sha1_shown)}{'; ...' if sha1_mismatches > len(sha1_shown) else ''}. These shards were not "
+            f"computed from this FASTA's sequences."
         )
     return time.monotonic() - start
 

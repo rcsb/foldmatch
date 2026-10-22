@@ -210,6 +210,29 @@ _INDEX_CLEANUP_EMBEDDINGS_HELP = (
     "--no-residue-codes on a run with residue codes. By default they are kept."
 )
 
+# Plan P8b (CLI), verbatim: the split build's recovery.
+_SEAL_HELP = (
+    "Recovery: write the run record of embedding shards that have none, so that 'build "
+    "sequences-index' can build from them: a 'build sequences-embed' run whose rank 0 stopped "
+    "after the pass (wall time, out of memory, a full disk), or the shards a 'build sequences' "
+    "run kept when its index phase failed. Checks the shards against the FASTA (entry count, "
+    "each rank's rows, the shard schema and the id of every row) without ESM3 or a GPU, in one "
+    "process. The record says it was sealed: it binds the shards by these checks, not by the "
+    "pass."
+)
+
+_SEAL_FASTA_HELP = "The FASTA file the run embedded."
+
+_SEAL_FROM_SHARDS_HELP = "Folder holding the run's shards."
+
+_SEAL_RUN_ID_HELP = "Run id of the shards to seal (emb_<run id>-<rank>.parquet)."
+
+_SEAL_MIN_RES_N_HELP = (
+    "The --min-res-n the run used. Required for a run without residue codes, whose shards do "
+    "not record it; for a run with codes it is read from the shards, and a different value is "
+    "refused."
+)
+
 
 @build_db_app.command(
     name="structures",
@@ -712,6 +735,71 @@ def build_sequences_index(
                 record_path.unlink()
                 computer.remove_shards()
     logging.info(f"Database {db_path} built from run {run_id} in {time.monotonic() - start:.1f} s")
+
+
+@build_db_app.command(
+    name="sequences-seal",
+    help=_SEAL_HELP
+)
+def build_sequences_seal(
+        fasta_file: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+            help=_SEAL_FASTA_HELP
+        )],
+        from_shards: Annotated[Path, typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_SEAL_FROM_SHARDS_HELP
+        )],
+        run_id: Annotated[str, typer.Option(
+            help=_SEAL_RUN_ID_HELP
+        )],
+        min_res_n: Annotated[Optional[int], typer.Option(
+            min=0,
+            help=_SEAL_MIN_RES_N_HELP
+        )] = None,
+        log_level: Annotated[LogLevel, typer.Option(
+            help='Logging level.'
+        )] = LogLevel.info
+):
+    """Recovery of a split sequence build: one process checks the shards of a run that has no run record against the
+    FASTA, then writes their record, sealed, so that 'build sequences-index' can build from them. No ESM3 or GPU."""
+
+    # Every refusal is a RefusalError, in both modes (D32). Nothing is written but the record, last.
+    set_log_level(log_level)
+    from foldmatch.utils.dist import is_run_id
+    if not is_run_id(run_id):
+        raise typer.BadParameter(
+            f"{run_id!r} is not a run id: letters, digits, '.', '_' and '-' only, "
+            f"starting with a letter or digit.", param_hint="--run-id"
+        )
+    _refuse_multi_node_job("build sequences-seal")
+
+    from foldmatch.search import split_run
+    with _refusals():
+        split_run.refuse_existing_record(from_shards, run_id, command=split_run.SEAL_COMMAND)
+        record = _seal_run(fasta_file, from_shards, run_id, min_res_n)
+        path = split_run.write_run_record(from_shards, record)
+    codes = f", residue codes of {record['system']['name']}" if record["system"] is not None else ""
+    logging.info(
+        f"Run {run_id} sealed: {record['rows']} entries in {len(record['shards'])} shard(s) of "
+        f"{record['world_size']} rank(s){codes}; record {path}"
+    )
+    logging.warning(
+        f"The record of run {run_id} is sealed: it binds the shards to {fasta_file} by their entry count, each rank's "
+        f"rows and the id of every row"
+        + (" and its seq_sha1, the sha1 of the entry's sequence" if codes else "")
+        + ", not by the pass that wrote them, which 'build sequences-seal' did not see."
+    )
+    logging.info("Build the database DB with: " + shlex.join([
+        "fm-search", "build", "sequences-index", "--fasta-file", str(fasta_file), "--output-db", "DB",
+        "--from-shards", str(from_shards), "--run-id", run_id,
+    ]))
 
 
 @build_db_app.command(
@@ -1613,12 +1701,18 @@ def _fasta_preflight(fasta_file: Path, min_res_n: int, strict: bool = False, out
     from foldmatch.utils.sequence import preflight_fasta
     preflight = preflight_fasta(fasta_file, min_res_n)
     preflight.check(strict=strict)
-    if output_db is not None and preflight.entries_kept == 0:
+    if output_db is not None:
+        _refuse_nothing_to_build(fasta_file, min_res_n, preflight)
+    return preflight
+
+
+def _refuse_nothing_to_build(fasta_file: Path, min_res_n: int, preflight) -> None:
+    """Raise ``ValueError`` when the pre-flight kept no entry of the FASTA: there is nothing to build."""
+    if preflight.entries_kept == 0:
         raise ValueError(
             f"{fasta_file} has no sequence with at least {min_res_n} residues "
             f"({preflight.entries} entries in all): there is nothing to build."
         )
-    return preflight
 
 
 def _check_store_matches_preflight(store, preflight, output_db: str) -> None:
@@ -2273,8 +2367,8 @@ def _log_split_build(record: dict, *, db_path: str, from_shards: Path, shards: i
     if sealed:
         logging.warning(
             f"The record of run {run_id} was written by 'build sequences-seal' (FoldMatch "
-            f"{record['foldmatch_version']}): it binds the shards to the FASTA by their entry count, rows and ids (and "
-            f"seq_sha1 when the residue-code store is validated), not by the pass that wrote them"
+            f"{record['foldmatch_version']}): it binds the shards to the FASTA by their entry count, rows and ids "
+            f"(and, with residue codes, their seq_sha1), not by the pass that wrote them"
             + ("." if pass_version is not None else
                ", whose FoldMatch version is not recorded (shards without residue codes do not record it).")
         )
@@ -2375,6 +2469,168 @@ def _whole_node_threads():
                           "threadpoolctl found no BLAS library to limit")
         logging.info("; ".join((set_to if raised else []) + kept))
         yield
+
+
+def _seal_run(fasta_file: Path, from_shards: Path, run_id: str, min_res_n: Optional[int]) -> dict:
+    """The run record ``build sequences-seal`` writes for the shards of ``run_id``, which have none, once the checks
+    that bind them to the FASTA have passed. Writes nothing.
+
+    In this order: the run has shards (S4); their footers say what the pass was (S5, S6: :func:`_seal_footers`);
+    then, between two stats of the FASTA, its sha256, its pre-flight with the run's ``min_res_n`` and the strictness
+    of its mode (S7), the shards' rows and ranks, which must be the deal of the kept entries over the pass's ranks
+    (S8), and the id of every shard row at its dealt position, with residue codes also its seq_sha1 against the
+    entry's sequence (S9); the FASTA must not change meanwhile (S10). The record is sealed: it names no database and no
+    pass options, and a plain run's pass record has no ESM3 revision.
+    """
+    from foldmatch.search import split_run
+    from foldmatch.search.residue_shards import RESIDUE_CODES, run_shard_files
+    paths = run_shard_files(from_shards, run_id)
+    if not paths:
+        runs = split_run._runs(from_shards)
+        raise RefusalError(
+            f"No embedding shards of run {run_id} (emb_{run_id}-<rank>.parquet) in {from_shards}, so there is nothing "
+            f"to seal. It holds "
+            + ("; ".join(f"run {rid} ({state.describe()})" for rid, state in runs.items()) if runs else "no run")
+            + "."
+        )
+    system, min_res_n, world_size, run_pass = _seal_footers(paths, folder=from_shards, run_id=run_id,
+                                                            min_res_n=min_res_n)
+    codes = system is not None
+
+    stat = split_run.fasta_stat(fasta_file)
+    sha256, seconds = split_run.fasta_sha256(fasta_file)
+    logging.info(f"FASTA sha256 of {fasta_file} ({stat.bytes} bytes) in {seconds:.1f} s")
+    preflight = _fasta_preflight(fasta_file, min_res_n, strict=codes)
+    _refuse_nothing_to_build(fasta_file, min_res_n, preflight)
+    shards = split_run.shard_entries(paths)
+    rows = sum(shard["rows"] for shard in shards)
+    with _refusals(note="The shards are incomplete: run 'build sequences-embed' again"
+                        + ("." if codes else ", or give the --min-res-n the run used.")):
+        if rows != preflight.entries_kept:
+            raise RefusalError(
+                f"The {len(shards)} shard(s) of run {run_id} in {from_shards} hold {rows} row(s), but {fasta_file} has "
+                f"{preflight.entries_kept} entries with at least {min_res_n} residues."
+            )
+        _check_shards_are_the_deal(shards, preflight.entries_kept, world_size, from_shards, run_id)
+    seconds = split_run.check_dealt_ids(paths, {"run_id": run_id, "world_size": world_size}, preflight,
+                                        sequences=codes)
+    logging.info(f"Ids{' and seq_sha1' if codes else ''} of the {rows} shard rows checked against {fasta_file} in "
+                 f"{seconds:.1f} s")
+    try:
+        now = split_run.fasta_stat(fasta_file)
+        shown = _stat_text(now)
+    except OSError as exc:
+        now, shown = None, f"cannot be stat'ed ({exc})"
+    if now != stat:
+        raise RefusalError(
+            f"The FASTA changed during the seal ({fasta_file}: {_stat_text(stat)} before it was hashed, now {shown}), "
+            f"so the shards were not checked against one FASTA. No record was written."
+        )
+    return {
+        "kind": split_run.RUN_RECORD_KIND,
+        "record_version": split_run.RUN_RECORD_VERSION,
+        "run_id": run_id,
+        "command": split_run.SEAL_COMMAND,
+        "sealed": True,
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "foldmatch_version": __version__,
+        "fasta": {"path": str(Path(fasta_file).resolve()), "bytes": stat.bytes, "mtime_ns": stat.mtime_ns,
+                  "sha256": sha256},
+        "min_res_n": min_res_n,
+        "strict": codes,
+        "preflight": split_run.preflight_counts(preflight),
+        "output_db": None,
+        "residue_output": RESIDUE_CODES if codes else None,
+        "system": system,
+        "world_size": world_size,
+        "pass": run_pass,
+        "options": {},
+        "shards": shards,
+        "rows": rows,
+    }
+
+
+def _seal_footers(paths: List[Path], *, folder: Path, run_id: str,
+                  min_res_n: Optional[int]) -> Tuple[Optional[dict], int, int, dict]:
+    """What the footers of a run's shards say about its pass, for ``build sequences-seal``: ``(system block or None,
+    min_res_n, world size, pass record)``.
+
+    Refused (S5): shards of more than one kind (plain and residue codes, or the codes of several systems); plain
+    shards that are not legacy ones (:func:`~foldmatch.search.split_run.check_plain_footers`); residue shards that
+    are not residue codes, or whose pass record (``foldmatch.pass``) is missing or lacks its ``min_res_n`` and world
+    size. Refused (S6): a plain run without ``min_res_n``, which its shards do not record; for codes, shards that
+    disagree on their pass's ``min_res_n`` or world size, a ``min_res_n`` other than theirs, or a world smaller than
+    the shard count. A plain run's world is its shard count: a pass on W ranks writes min(W, N) shards of its N
+    entries, and their deal over that many ranks is the same.
+    """
+    from foldmatch.search import split_run
+    from foldmatch.search.residue_shards import ResidueShardError, pass_record, read_shard_info
+    try:
+        infos = [read_shard_info(path) for path in paths]
+    except ResidueShardError as exc:
+        raise RefusalError(str(exc)) from exc
+    groups = {}
+    for info in infos:
+        groups.setdefault(info.key, []).append(info)
+    if len(groups) > 1:
+        raise RefusalError(
+            f"The {len(infos)} shards of run {run_id} in {folder} are mixed: "
+            + "; ".join(f"{len(group)} shard(s) with {group[0].describe()} (e.g. {group[0].path.name})"
+                        for group in groups.values())
+            + ". The shards of one run come from one pass, so they cannot be sealed as one run."
+        )
+    if infos[0].residue_output is None:
+        split_run.check_plain_footers(paths)
+        if min_res_n is None:
+            raise RefusalError(
+                f"The {len(infos)} shard(s) of run {run_id} in {folder} hold no residue codes, so they do not record "
+                f"the --min-res-n of their pass: give the --min-res-n the run used."
+            )
+        return None, min_res_n, len(infos), pass_record(min_res_n=min_res_n, world_size=len(infos))
+
+    unrecorded = [info.path.name for info in infos if info.pass_record is None]
+    if unrecorded:
+        raise RefusalError(
+            f"{len(unrecorded)} of the {len(infos)} shard(s) of run {run_id} in {folder} record no pass "
+            f"(foldmatch.pass): {', '.join(unrecorded[:10])}{', ...' if len(unrecorded) > 10 else ''}. Their "
+            f"--min-res-n and world size are unknown, so they cannot be sealed: run 'build sequences-embed' again."
+        )
+    first = infos[0]
+    for key in ("min_res_n", "world_size"):
+        other = [info for info in infos if info.pass_record.get(key) != first.pass_record.get(key)]
+        if other:
+            raise RefusalError(
+                f"The shards of run {run_id} in {folder} disagree on their pass's {key}: "
+                f"{first.pass_record.get(key)!r} in {first.path.name}, {other[0].pass_record.get(key)!r} in "
+                f"{other[0].path.name}{f' and {len(other) - 1} more' if len(other) > 1 else ''}. The shards of one run "
+                f"come from one pass, so they cannot be sealed as one run."
+            )
+    shards_min_res_n, world_size = first.pass_record.get("min_res_n"), first.pass_record.get("world_size")
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= floor
+               for value, floor in ((shards_min_res_n, 0), (world_size, 1))):
+        raise RefusalError(
+            f"The shards of run {run_id} in {folder} record a pass without a valid --min-res-n and world size "
+            f"(min_res_n {shards_min_res_n!r}, world_size {world_size!r}), so they cannot be sealed: run 'build "
+            f"sequences-embed' again."
+        )
+    if min_res_n is not None and min_res_n != shards_min_res_n:
+        raise RefusalError(
+            f"--min-res-n is {min_res_n}, but the shards of run {run_id} in {folder} record a pass with --min-res-n "
+            f"{shards_min_res_n}: leave --min-res-n out for a run with residue codes, or give the run's."
+        )
+    if world_size < len(infos):
+        raise RefusalError(
+            f"The shards of run {run_id} in {folder} record a pass on {world_size} rank(s), but there are "
+            f"{len(infos)} of them: they are not the shards of one pass."
+        )
+    system = {"name": first.system, "digest": first.system_digest, "encoding_digest": first.encoding_digest}
+    run_pass = split_run.check_codes_footers(paths, expect=system, min_res_n=shards_min_res_n, world_size=world_size)
+    if None in system.values():
+        raise RefusalError(
+            f"The shards of run {run_id} in {folder} hold residue codes without their system's name and digests "
+            f"({', '.join(f'{key} {value}' for key, value in system.items())}), so they cannot be sealed."
+        )
+    return system, shards_min_res_n, world_size, run_pass
 
 
 def _residue_codes_preflight(fasta_file: Path, min_res_n: int, output_db: str,
