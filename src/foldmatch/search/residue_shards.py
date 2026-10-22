@@ -31,13 +31,18 @@ that differs only in its statistics may reuse them), query encodings its ``diges
 
 A plain pass (no residue output) keeps the legacy schema ``id | embedding`` with no metadata, byte for byte.
 
-pyarrow and numpy only: no torch, so Stage-2 code can import it.
+A run's shards are ``emb_<run id>-<rank>.parquet`` (:func:`run_shard_files`, :func:`shard_run_ids`; also imported
+from ``foldmatch.search.embedding_computer``).
+
+pyarrow and numpy only: no torch, so Stage-2 code (and ``foldmatch.search.split_run``) can import it.
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import platform
+import re
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -46,6 +51,8 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from foldmatch.utils.dist import is_run_id
 
 RESIDUE_CODES = "residue_codes"
 QUERY_ENCODING = "query_encoding"
@@ -190,6 +197,42 @@ def large_binary_array(payloads: Sequence[bytes]) -> pa.LargeBinaryArray:
     np.cumsum(np.fromiter((len(p) for p in payloads), dtype=np.int64, count=n), out=offsets[1:])
     data = _concat_payloads(payloads, int(offsets[-1]))
     return pa.LargeBinaryArray.from_buffers(PAYLOAD_TYPE, n, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
+
+
+# =====================================================================================================================
+# shard files
+# =====================================================================================================================
+# A run's shards are {folder}/emb_{run id}-{rank}.parquet. Run ids may contain '-' (utils.dist), so the rank is the
+# last '-'-separated field.
+_SHARD_PREFIX = "emb_"
+_ANY_SHARD = re.compile(rf"{_SHARD_PREFIX}(?P<run_id>.+)-\d+\.parquet")
+
+
+def run_shard_files(folder: Path, run_id: str) -> list[Path]:
+    """The shards of run ``run_id`` in ``folder``, in the order rank 0 reads them (sorted by path).
+
+    The glob is narrowed by an exact match, so a run whose id merely starts
+    with this one (``abc`` vs ``abc-1``) is never picked up. The id is
+    escaped in the glob: run ids hold no glob metacharacters
+    (:func:`foldmatch.utils.dist.run_id`), but a name found in a folder may.
+    """
+    out_name = f"{_SHARD_PREFIX}{run_id}"
+    shard_name = re.compile(rf"{re.escape(out_name)}-\d+\.parquet")
+    return sorted(
+        path for path in Path(folder).glob(f"{glob.escape(out_name)}-*.parquet")
+        if shard_name.fullmatch(path.name)
+    )
+
+
+def shard_run_ids(folder: Path) -> list[str]:
+    """The run ids of every shard in ``folder``, sorted. Read-only, file names only.
+
+    Only well-formed run ids (:func:`foldmatch.utils.dist.is_run_id`) count:
+    a file such as ``emb_copy[1]-0.parquet`` is not a shard of any run.
+    """
+    names = (path.name for path in Path(folder).glob(f"{_SHARD_PREFIX}*.parquet"))
+    return sorted({match["run_id"] for match in map(_ANY_SHARD.fullmatch, names)
+                   if match and is_run_id(match["run_id"])})
 
 
 # =====================================================================================================================

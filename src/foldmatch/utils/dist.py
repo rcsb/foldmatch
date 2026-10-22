@@ -81,6 +81,37 @@ def srun_step_id() -> Optional[str]:
     return step
 
 
+def _whole_number(name: str) -> Optional[int]:
+    """``name``'s value as a whole number; ``None`` if it is unset or not one."""
+    value = os.environ.get(name, "").strip()
+    return int(value) if value.isdigit() else None
+
+
+def multi_rank_launch() -> Optional[str]:
+    """``NAME=value`` of the launch variable that shows this process is one of several ranks, else ``None``.
+
+    A rank above 0 (``RANK``, ``LOCAL_RANK``, ``NODE_RANK`` or ``SLURM_PROCID``), ``WORLD_SIZE`` above 1, or a
+    task of an srun step (:func:`srun_step_id`) with more than one task (``SLURM_STEP_NUM_TASKS``, else
+    ``SLURM_NTASKS``). This is the rule of
+    :func:`~foldmatch.inference.chain_complete_inference.bundle_fetch_allowed`: the batch step of an sbatch script
+    is one process, whatever ``SLURM_NTASKS`` its job has. Values that are not whole numbers are ignored. For the
+    commands that must run as one process (``build sequences-index``, ``build sequences-seal``).
+    """
+    for name in ("RANK", "LOCAL_RANK", "NODE_RANK", "SLURM_PROCID"):
+        rank = _whole_number(name)
+        if rank is not None and rank > 0:
+            return f"{name}={rank}"
+    world_size = _whole_number("WORLD_SIZE")
+    if world_size is not None and world_size > 1:
+        return f"WORLD_SIZE={world_size}"
+    if srun_step_id() is not None:
+        name = "SLURM_STEP_NUM_TASKS" if _whole_number("SLURM_STEP_NUM_TASKS") else "SLURM_NTASKS"
+        tasks = _whole_number(name)
+        if tasks is not None and tasks > 1:
+            return f"{name}={tasks}"
+    return None
+
+
 def command_digest() -> str:
     """Eight hex digits of SHA-1 over this command's arguments (``sys.argv[1:]``).
 
