@@ -104,7 +104,7 @@ def _resolve_num_workers(requested: Optional[int], n_tasks: int) -> int:
     return max(1, min(avail, n_tasks))
 
 
-def _expand_cpu_affinity() -> int:
+def _expand_cpu_affinity(purpose: str = "alignment") -> int:
     """Widen this process's CPU affinity mask to all CPUs, returning the count.
 
     A process launched under a binding scheduler (e.g. NERSC ``srun`` pins each
@@ -116,7 +116,8 @@ def _expand_cpu_affinity() -> int:
     This is safe even on shared/allocated machines: the kernel intersects the
     requested set with the process's cpuset cgroup, so ``sched_setaffinity``
     cannot escape a real allocation — it just un-does soft ``--cpu-bind`` masks.
-    No-op where ``sched_setaffinity`` is unavailable (non-Linux).
+    No-op where ``sched_setaffinity`` is unavailable (non-Linux). ``purpose``
+    names what the CPUs are widened for in the log line.
     """
     n = os.cpu_count() or 1
     if not hasattr(os, "sched_setaffinity"):
@@ -129,7 +130,7 @@ def _expand_cpu_affinity() -> int:
         return before
     after = len(os.sched_getaffinity(0))
     if after != before:
-        logger.info(f"Widened CPU affinity for alignment: {before} -> {after} CPUs")
+        logger.info(f"Widened CPU affinity for {purpose}: {before} -> {after} CPUs")
     return after
 
 # The biotite ProteinSequence alphabet (20 canonical + ambiguity codes B/Z/X and

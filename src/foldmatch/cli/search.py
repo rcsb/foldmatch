@@ -2,6 +2,8 @@ import glob
 import os
 import logging
 import sqlite3
+import sys
+import time
 import typer
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -405,78 +407,34 @@ def build_database_from_fasta(
     """Build an embedding database from protein sequences in a FASTA file."""
 
     set_log_level(log_level)
-    if residue_codes:
-        preflight, embedding_computer, prepared = _residue_codes_preflight(
-            fasta_file, min_res_n, output_db, tmp_embedding_folder, num_nodes
-        )
-        # The pass also writes the residue codes and seq_sha1 into each shard.
-        from foldmatch.search.residue_shards import RESIDUE_CODES
-        residue = {"residue_output": RESIDUE_CODES, "scoring_system": prepared}
-    else:
-        preflight = _fasta_preflight(fasta_file, min_res_n, output_db=output_db)
-
-        from foldmatch.search.embedding_computer import EmbeddingComputer
-        embedding_computer = EmbeddingComputer(
-            embedding_folder=tmp_embedding_folder,
-        )
-        prepared = None
-        # A plain build calls the pass exactly as before.
-        residue = {}
+    # Read only, for the index phase's log lines: Lightning's DDP launcher sets OMP_NUM_THREADS during the pass when
+    # it is unset (to the allowed CPUs // devices per node), and FAISS starts with that value.
+    omp_env_at_start = os.environ.get("OMP_NUM_THREADS")
+    run = _sequence_build_preflight(fasta_file, min_res_n, output_db, tmp_embedding_folder, num_nodes, residue_codes)
     # A --residue-codes build reports every refusal as a RefusalError (D20:
     # exit 1); a plain build raises exactly what it raised before.
-    refusals = _refusals if residue_codes else nullcontext
-    with refusals():
-        embedding_computer.compute_from_fasta(
-            fasta_file=fasta_file,
-            min_res_n=min_res_n,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            num_nodes=num_nodes,
-            accelerator=accelerator,
-            devices=arg_devices(devices),
-            strategy=strategy,
-            preflight=preflight,
-            **residue,
-        )
+    with run.refusals():
+        _run_sequence_pass(run, fasta_file=fasta_file, min_res_n=min_res_n, batch_size=batch_size,
+                           num_workers=num_workers, num_nodes=num_nodes, accelerator=accelerator, devices=devices,
+                           strategy=strategy)
 
     if not _is_rank_zero():
         return
+    if num_nodes > 1:
+        logging.info(
+            f"The index phase runs in this one process: the other {num_nodes - 1} node(s) stay allocated until it "
+            f"ends. 'build sequences-embed' and then 'build sequences-index' (as its own job on a CPU node) "
+            f"release them when the ESM3 pass ends."
+        )
 
-    from foldmatch.search.embedding_database import EmbeddingDatabase
-    embedding_db = EmbeddingDatabase(
-        db_path=output_db
+    _build_sequence_database(
+        run.embedding_computer, run.preflight, fasta_file=fasta_file, output_db=output_db, min_res_n=min_res_n,
+        system=None if run.prepared is None else run.prepared.system,
+        index=_IndexOptions(use_gpu_index, index_type, ivf_nlist, ivf_nprobe, load_batch_size),
+        refusals=run.refusals, omp_env_at_start=omp_env_at_start,
     )
-    with refusals():
-        embedding_db.create_db(
-            embedding_batches=embedding_computer.get_embedding_batches(load_batch_size=load_batch_size),
-            use_gpu_index=use_gpu_index,
-            index_type=index_type,
-            index_config=IndexConfig(nlist=ivf_nlist, nprobe=ivf_nprobe),
-        )
-
-    # Persist a sidecar id->sequence store so this database can be the
-    # subject (or query) of a Stage-2 pairwise-alignment search. Built
-    # directly from the FASTA — the DB ids ARE the FASTA headers — using the
-    # same min_res_n filter so store and index stay in lock-step. Rank 0 only,
-    # after the pass, so ranks never race on the SQLite file.
-    from foldmatch.search.sequence_store import SequenceStore
-    store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
-    with refusals():
-        store.create(
-            fasta_file=fasta_file,
-            min_res_n=min_res_n,
-        )
-        _check_store_matches_preflight(store, preflight, output_db)
-    if prepared is not None:
-        # Last, once the database it describes is complete; its manifest is
-        # written last of all. A refusal leaves the database (BLOSUM62) and the
-        # shards (for --from-shards) in place.
-        _build_residue_code_store(
-            embedding_computer, embedding_db, store, preflight, prepared.system,
-            min_res_n=min_res_n, load_batch_size=load_batch_size,
-        )
     if cleanup_embeddings:
-        embedding_computer.remove_shards()
+        run.embedding_computer.remove_shards()
 
 
 @build_db_app.command(
@@ -1436,6 +1394,230 @@ def _refusals(note: Optional[str] = None):
         raise RefusalError(f"{exc} {note}") from exc
     except (ValueError, OSError, sqlite3.DatabaseError) as exc:
         raise RefusalError(str(exc) if note is None else f"{exc} {note}") from exc
+
+
+@dataclass(frozen=True)
+class _IndexOptions:
+    """The FAISS options of a sequence build's index phase, as ``build sequences`` takes them."""
+    use_gpu_index: bool
+    index_type: IndexType
+    ivf_nlist: int
+    ivf_nprobe: Optional[int]
+    load_batch_size: int
+
+    def index_config(self) -> IndexConfig:
+        """A fresh ``IndexConfig`` for each build: an ivf_pq build sets its ``nprobe``."""
+        return IndexConfig(nlist=self.ivf_nlist, nprobe=self.ivf_nprobe)
+
+
+@dataclass(frozen=True)
+class _SequencePass:
+    """What every rank of a sequence build has after its pre-flight: the FASTA pre-flight, the embedding computer
+    (this run's id and shards), the prepared scoring system (``--residue-codes``; else ``None``) and the mode."""
+    preflight: Any
+    embedding_computer: Any
+    prepared: Any
+    residue_codes: bool
+
+    @property
+    def residue(self) -> dict:
+        """The residue keywords of the pass: the codes and seq_sha1 go into each shard under ``--residue-codes``;
+        a plain build calls the pass exactly as before (none)."""
+        if not self.residue_codes:
+            return {}
+        from foldmatch.search.residue_shards import RESIDUE_CODES
+        return {"residue_output": RESIDUE_CODES, "scoring_system": self.prepared}
+
+    def refusals(self):
+        """The refusal wrapper of this mode: :func:`_refusals` under ``--residue-codes`` (D20), else none."""
+        return _refusals() if self.residue_codes else nullcontext()
+
+
+def _sequence_build_preflight(fasta_file: Path, min_res_n: int, output_db: str, shards_folder: Path, num_nodes: int,
+                              residue_codes: bool) -> _SequencePass:
+    """Every rank's read-only checks of a sequence build, before ESM3; returns the :class:`_SequencePass`.
+
+    A plain build runs the FASTA pre-flight with the outputs-exist check and draws this run's id, raising what it
+    always raised; a ``--residue-codes`` build runs :func:`_residue_codes_preflight` (every refusal a
+    :class:`RefusalError`).
+    """
+    if residue_codes:
+        preflight, embedding_computer, prepared = _residue_codes_preflight(
+            fasta_file, min_res_n, output_db, shards_folder, num_nodes
+        )
+    else:
+        preflight = _fasta_preflight(fasta_file, min_res_n, output_db=output_db)
+
+        from foldmatch.search.embedding_computer import EmbeddingComputer
+        embedding_computer = EmbeddingComputer(
+            embedding_folder=shards_folder,
+        )
+        prepared = None
+    return _SequencePass(preflight, embedding_computer, prepared, residue_codes)
+
+
+def _run_sequence_pass(run: _SequencePass, *, fasta_file: Path, min_res_n: int, batch_size: int, num_workers: int,
+                       num_nodes: int, accelerator, devices, strategy) -> None:
+    """Every rank: the ESM3 pass of a sequence build into this run's shards, ending at the pass barrier
+    (``compute_from_fasta``). The caller wraps it in ``run.refusals()``."""
+    run.embedding_computer.compute_from_fasta(
+        fasta_file=fasta_file,
+        min_res_n=min_res_n,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        num_nodes=num_nodes,
+        accelerator=accelerator,
+        devices=arg_devices(devices),
+        strategy=strategy,
+        preflight=run.preflight,
+        **run.residue,
+    )
+
+
+#: ``omp_env_at_start`` of an index phase whose command has no pass (``build sequences-index``): nothing in the process
+#: changes ``OMP_NUM_THREADS`` before it.
+_OMP_ENV_NOT_RECORDED = object()
+
+
+def _build_sequence_database(embedding_computer, preflight, *, fasta_file: Path, output_db: str, min_res_n: int,
+                             system, index: _IndexOptions, refusals, split: Optional[Mapping] = None,
+                             after_sequence_store=None, omp_env_at_start=_OMP_ENV_NOT_RECORDED) -> Optional[dict]:
+    """The index phase of a sequence build, in one process: the FAISS index from the run's shards, the sequence
+    store from the FASTA, and with ``system`` the residue-code store; returns the code store's manifest, else
+    ``None``. ``omp_env_at_start`` is ``OMP_NUM_THREADS`` as the command found it, before its pass
+    (:func:`_log_index_phase`).
+
+    ``refusals`` is the mode's refusal wrapper (``_SequencePass.refusals``). ``after_sequence_store``, if given, is
+    called once the sequence store has passed :func:`_check_store_matches_preflight`, before the code store.
+    ``split`` is the run record of a split build (``build sequences-index``); ``None`` for ``build sequences``.
+    """
+    from foldmatch.search.embedding_database import EmbeddingDatabase
+    embedding_db = EmbeddingDatabase(
+        db_path=output_db
+    )
+    _log_index_phase(omp_env_at_start)
+    with refusals():
+        start = time.monotonic()
+        embedding_db.create_db(
+            embedding_batches=embedding_computer.get_embedding_batches(load_batch_size=index.load_batch_size),
+            use_gpu_index=index.use_gpu_index,
+            index_type=index.index_type,
+            index_config=index.index_config(),
+        )
+        logging.info(f"FAISS index built in {time.monotonic() - start:.1f} s")
+
+    # Persist a sidecar id->sequence store so this database can be the
+    # subject (or query) of a Stage-2 pairwise-alignment search. Built
+    # directly from the FASTA — the DB ids ARE the FASTA headers — using the
+    # same min_res_n filter so store and index stay in lock-step. Rank 0 only,
+    # after the pass, so ranks never race on the SQLite file.
+    from foldmatch.search.sequence_store import SequenceStore
+    store = SequenceStore(embedding_db.db_folder, embedding_db.index_name)
+    with refusals():
+        start = time.monotonic()
+        store.create(
+            fasta_file=fasta_file,
+            min_res_n=min_res_n,
+        )
+        logging.info(f"Sequence store built in {time.monotonic() - start:.1f} s")
+        _check_store_matches_preflight(store, preflight, output_db)
+        if after_sequence_store is not None:
+            after_sequence_store()
+    if system is None:
+        return None
+    # Last, once the database it describes is complete; its manifest is
+    # written last of all. A refusal leaves the database (BLOSUM62) and the
+    # shards (for --from-shards) in place.
+    start = time.monotonic()
+    manifest = _build_residue_code_store(
+        embedding_computer, embedding_db, store, preflight, system,
+        min_res_n=min_res_n, load_batch_size=index.load_batch_size,
+    )
+    logging.info(f"Residue-code store built in {time.monotonic() - start:.1f} s")
+    return manifest
+
+
+def _log_index_phase(omp_env_at_start=_OMP_ENV_NOT_RECORDED) -> None:
+    """Log the threads the index phase gets (FAISS's OpenMP, the CPUs this process may use, each thread-pool runtime)
+    and warn, except on macOS (where ``foldmatch`` pins ``OMP_NUM_THREADS=1``), when FAISS has fewer threads than
+    the usable physical cores, naming the cause. Diagnostics only: nothing is changed.
+
+    ``omp_env_at_start`` is ``OMP_NUM_THREADS`` when the command started (``None``: unset). When it was unset then and
+    is set now, the pass set it: Lightning's DDP launcher does so for a multi-device run (to the allowed CPUs // the
+    devices per node, also for ranks srun starts), and FAISS, first loaded here, starts with that value.
+
+    One more line (a WARNING, INFO on macOS) when FAISS's BLAS runs on one thread by build: a BLAS runtime at one
+    thread whose threading layer is ``disabled``, or one in FAISS's own library folder (``faiss_cpu.libs`` beside the
+    package, or inside it) whose threading layer threadpoolctl does not report as threaded. The faiss-cpu 1.13.2
+    wheel's OpenBLAS is such a library, so its ivf_pq training and adds run on one core.
+    """
+    import faiss
+    from foldmatch.search.code_alignment import _physical_cpus
+    omp_threads = faiss.omp_get_max_threads()
+    cpus = os.cpu_count() or 1
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except AttributeError:  # no affinity masks (macOS)
+        allowed = cpus
+    physical = _physical_cpus()
+    omp_env = os.environ.get("OMP_NUM_THREADS")
+    set_by_pass = omp_env_at_start is None and omp_env is not None
+    logging.info(
+        f"Index phase: FAISS {faiss.__version__}, {omp_threads} OpenMP thread(s); {allowed} of {cpus} CPUs allowed "
+        f"({physical} physical cores); OMP_NUM_THREADS={omp_env if omp_env is not None else 'unset'}"
+        + (" (set during the ESM3 pass by Lightning: the allowed CPUs // devices per node; unset at the start)"
+           if set_by_pass else "")
+    )
+    try:
+        import threadpoolctl
+        runtimes = threadpoolctl.threadpool_info()
+    except Exception as exc:  # diagnostics only: never fail a build over them
+        logging.debug(f"threadpoolctl could not list the thread pools: {exc}")
+        runtimes = []
+    for runtime in runtimes:
+        logging.info(
+            f"Thread pool: {runtime.get('internal_api')}, {runtime.get('num_threads')} thread(s), "
+            f"{os.path.basename(str(runtime.get('filepath')))}"
+        )
+    # The k-means of an ivf_pq training and the IVF assignment of its adds are BLAS products: on a BLAS built without
+    # threads they run on one core whatever FAISS's OpenMP threads. A threaded BLAS that a variable limits to one
+    # thread (a later faiss-cpu wheel bundles an OpenMP OpenBLAS) is not flagged.
+    package = os.path.dirname(os.path.realpath(faiss.__file__))
+    for runtime in runtimes:
+        path = os.path.realpath(str(runtime.get("filepath")))
+        folder = os.path.dirname(path)
+        own = path.startswith(package + os.sep) or (
+            os.path.dirname(folder) == os.path.dirname(package)
+            and os.path.basename(folder).startswith("faiss") and folder.endswith(".libs"))
+        layer = runtime.get("threading_layer")
+        if runtime.get("user_api") == "blas" and runtime.get("num_threads") == 1 and (
+                layer == "disabled" or (own and layer not in ("pthreads", "openmp"))):
+            logging.log(
+                logging.INFO if sys.platform == "darwin" else logging.WARNING,
+                f"FAISS's BLAS, {os.path.basename(path)}, is single-threaded, so the ivf_pq training and adds run on "
+                f"one core whatever FAISS's thread count: a FAISS built on a multi-threaded BLAS (for example the "
+                f"MKL build of the official 'pytorch' conda channel) builds a 30M-entry ivf_pq index about 10x faster."
+            )
+            break
+    if sys.platform != "darwin" and omp_threads < physical:
+        # With OMP_NUM_THREADS unset, OpenMP starts one thread per CPU of the affinity mask, never fewer than its
+        # physical cores: fewer threads come from the variable, or from a limit set inside this process or by another
+        # OpenMP variable (not from the mask).
+        if set_by_pass:
+            cause = (f"OMP_NUM_THREADS={omp_env}, which Lightning's DDP launcher set during the ESM3 pass (it was "
+                     f"unset at the start; Lightning sets it to the allowed CPUs // devices per node)")
+            remedy = (" To choose FAISS's threads, export OMP_NUM_THREADS before the run (it also sets each rank's "
+                      "torch threads in the pass), or build in two steps ('build sequences-embed', then 'build "
+                      "sequences-index' as its own job).")
+        elif omp_env is not None:
+            cause, remedy = f"OMP_NUM_THREADS={omp_env}", ""
+        else:
+            cause, remedy = ("an OpenMP thread limit set inside this process or by another OpenMP variable "
+                             "(OMP_NUM_THREADS is unset)"), ""
+        logging.warning(
+            f"FAISS has {omp_threads} OpenMP thread(s) for {physical} usable physical cores, because of {cause}: "
+            f"the index phase may be slower than this node allows.{remedy}"
+        )
 
 
 def _residue_codes_preflight(fasta_file: Path, min_res_n: int, output_db: str,

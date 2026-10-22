@@ -75,10 +75,22 @@ class EmbeddingComputer:
     def __init__(
             self,
             embedding_folder: Path,
+            *,
+            run: Optional[str] = None,
     ):
+        """``run`` binds the computer to the shards of that run id (``build sequences-index`` reads a finished run's
+        shards): :func:`~foldmatch.utils.dist.run_id` is then never called, and a malformed id raises
+        ``ValueError``. Without it, this run's id is drawn as every pass draws it."""
         self.embedding_folder = embedding_folder
-        # Raises on a rank > 0 that was given no id to share, before any model loads.
-        self.run_id = run_id()
+        if run is None:
+            # Raises on a rank > 0 that was given no id to share, before any model loads.
+            self.run_id = run_id()
+        elif is_run_id(run):
+            self.run_id = run
+        else:
+            raise ValueError(
+                f"{run!r} is not a run id: letters, digits, '.', '_' and '-' only, starting with a letter or digit."
+            )
         self.out_name = f"{_SHARD_PREFIX}{self.run_id}"
         # Number of embeddings rank 0 must find in the shards; known for FASTA input.
         self.expected_count: Optional[int] = None
@@ -189,17 +201,7 @@ class EmbeddingComputer:
         """
 
         residue_output = check_residue_output(residue_output)
-        if preflight is None:
-            preflight = preflight_fasta(fasta_file, min_res_n)
-            preflight.check(strict=residue_output is not None)
-        elif Path(preflight.path).resolve() != Path(fasta_file).resolve() or preflight.min_res_n != min_res_n:
-            raise ValueError(
-                f"Pre-flight of {preflight.path} (min_res_n={preflight.min_res_n}) does not "
-                f"match {fasta_file} (min_res_n={min_res_n})"
-            )
-        # One embedding per kept entry; rank 0 checks the shards against it after the pass.
-        self.expected_count = preflight.entries_kept
-        self.preflight = preflight
+        preflight = self.attach_preflight(fasta_file, min_res_n, preflight, strict=residue_output is not None)
         self.refuse_existing_shards()
         # Only a residue pass gets the residue keywords: a plain pass is called exactly as before.
         residue = {} if residue_output is None else {
@@ -227,6 +229,28 @@ class EmbeddingComputer:
         # A rank's shard is complete only once that rank has left the pass: wait for every rank, so rank 0 may read
         # the shards (get_embedding_batches, iter_residue_codes, build_query_encodings) as soon as this returns.
         _wait_for_every_rank()
+
+    def attach_preflight(self, fasta_file: Path, min_res_n: int, preflight: Optional[FastaPreflight] = None, *,
+                         strict: bool = False) -> FastaPreflight:
+        """Bind the FASTA pre-flight of this run's input to the computer and return it.
+
+        ``preflight`` must be :func:`preflight_fasta`'s result for ``fasta_file`` and ``min_res_n`` (a mismatch
+        raises ``ValueError``); without it the pre-flight runs here, its problems refused (``strict``) or logged.
+        Sets :attr:`expected_count` (one embedding per kept entry, which rank 0 checks the shards against) and
+        :attr:`preflight` (the input order), as a FASTA pass does before it starts.
+        """
+        if preflight is None:
+            preflight = preflight_fasta(fasta_file, min_res_n)
+            preflight.check(strict=strict)
+        elif Path(preflight.path).resolve() != Path(fasta_file).resolve() or preflight.min_res_n != min_res_n:
+            raise ValueError(
+                f"Pre-flight of {preflight.path} (min_res_n={preflight.min_res_n}) does not "
+                f"match {fasta_file} (min_res_n={min_res_n})"
+            )
+        # One embedding per kept entry; rank 0 checks the shards against it after the pass.
+        self.expected_count = preflight.entries_kept
+        self.preflight = preflight
+        return preflight
 
     def shard_files(self) -> list[Path]:
         """This run's per-rank Parquet shards, ``emb_{run_id}-{rank}.parquet`` (:func:`run_shard_files`)."""
