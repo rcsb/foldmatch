@@ -51,7 +51,7 @@ pip install -e .
 - Lightning 2.6.1
 - Typer 0.24.1
 - Biotite 1.6.0
-- FAISS 1.13.2
+- FAISS 1.15.1 (the `faiss-cpu` wheel)
 - igraph 1.0.0
 - leidenalg 0.11.0
 - PyTorch with CUDA support (recommended for GPU acceleration)

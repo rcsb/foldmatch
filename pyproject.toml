@@ -23,7 +23,7 @@ dependencies=[
     "hf-xet==1.4.2",
     "huggingface-hub==0.36.2",
     "httpx==0.28.1",
-    "faiss-cpu==1.13.2",
+    "faiss-cpu==1.15.1",
     "igraph==1.0.0",
     "leidenalg==0.11.0",
     "pyarrow==24.0.0",

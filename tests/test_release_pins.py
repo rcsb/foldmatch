@@ -202,6 +202,11 @@ class DependencyPinsTest(unittest.TestCase):
     def test_threadpoolctl_is_declared(self):
         self.assertIn("threadpoolctl==3.6.0", self.dependencies)
 
+    def test_faiss_cpu_is_the_threaded_wheel(self):
+        """faiss-cpu 1.15.1 (P9): its Linux wheels bundle an OpenMP OpenBLAS, where 1.13.2's was single-threaded."""
+        self.assertIn("faiss-cpu==1.15.1", self.dependencies)
+        self.assertFalse([r for r in self.dependencies if r.startswith("faiss") and r != "faiss-cpu==1.15.1"])
+
 
 class _NotAWeight:
     pass
