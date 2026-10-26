@@ -59,6 +59,94 @@ pip install -e .
 **Optional Dependencies:**
 
 - `faiss-gpu` for GPU-accelerated similarity search (instead of `faiss-cpu`)
+- a FAISS built on MKL, for faster `ivf_pq` builds of large databases on Linux x86_64 with Python 3.12 (see *FAISS
+  threads* below)
+
+### FAISS threads
+
+FoldMatch installs the `faiss-cpu` 1.15.1 wheel. On Linux the wheel bundles an OpenMP build of OpenBLAS
+(`faiss_cpu.libs/libopenblaso-*.so`) and its own `libgomp`. FAISS's BLAS work therefore runs on FAISS's OpenMP
+threads: the k-means and OPQ steps of an `ivf_pq` training, the IVF assignment of its adds, and batched flat searches.
+Earlier FoldMatch versions pinned `faiss-cpu` 1.13.2, whose OpenBLAS is single-threaded. With it, a 30-million-entry
+`ivf_pq` index took about 7 hours on any node.
+
+- **Choosing the threads.** Export `OMP_NUM_THREADS` to set FAISS's threads. It also sets the threads of FAISS's
+  OpenBLAS. `OPENBLAS_NUM_THREADS` has no effect on FAISS's OpenBLAS; it changes only the OpenBLAS copies of numpy
+  and scipy. When `OMP_NUM_THREADS` is unset, `fm-search build sequences-index` gives FAISS the physical cores it may
+  use and logs the count.
+- **Build times.** On NERSC Perlmutter, `fm-search build sequences-index --residue-codes` over 30.4 million sequences
+  built the `ivf_pq` index in 1 h 45 min on a GPU node (one 64-core AMD EPYC 7763, 64 threads; 2 h 47 min for the
+  whole command) and in 2 h 37 min on a CPU node (two 64-core EPYC 7763, 128 threads; 3 h 33 min). Most of the
+  difference is the training, 40 min against 1 h 16 min: the OPQ step of the wheel's training does not gain from
+  more threads. In a benchmark on the CPU node, two OPQ iterations took 66 to 70 s at 4 to 16 threads and 173 s at
+  128, while 10 iterations of the IVF k-means gained up to about 32 threads.
+- **Recommended on large nodes.** With the wheel, run `build sequences-index` with `OMP_NUM_THREADS=64` on a node
+  with more than 64 physical cores, such as a 128-core CPU node. The setting applies to the whole command. This
+  advice rests on the 64-thread GPU-node build above and on the OPQ benchmark (121 s at 64 threads against 173 s at
+  128); a full build at 64 threads on a 128-core node was not timed. With it, `build sequences-index` warns that FAISS
+  has fewer threads than physical cores; with the wheel that warning is expected. With the MKL build below, leave
+  `OMP_NUM_THREADS` unset: it built a 30-million-entry index in 43 minutes at 128 threads.
+- **128 BLAS threads at most.** The x86_64 wheel's OpenBLAS is built with `MAX_THREADS=128`, so FAISS's BLAS work
+  runs on at most 128 threads. That OpenBLAS also lowers a higher OpenMP thread count to 128 when FAISS calls it. On
+  a node with more than 128 physical cores, FAISS therefore runs 128 threads, and `build sequences-index` warns that
+  FAISS has fewer threads than physical cores.
+- **Reproducibility.** Two `hnsw` or `ivf_pq` builds are byte-identical only at `OMP_NUM_THREADS=1`. The wheel's
+  k-means results also change with the thread count. `OPENBLAS_NUM_THREADS=1` alone does not make FAISS
+  single-threaded. With the wheel, search results can change with FAISS's thread count too, in the last digits of
+  the scores and so in the order of tied hits: between 32 and 256 threads, about a quarter of 1,000 batched flat
+  searches and 3 to 5 `ivf_pq` searches were reordered. For bit-identical reruns, set `OMP_NUM_THREADS` to the same
+  value (unset, FAISS gets each node's core count).
+- **Existing databases.** FAISS 1.13.2 and 1.15.1 read each other's index files. Searching one database with either
+  version gives the same hits up to float rounding (flat and `ivf_pq` scores within about 3e-7), which can reorder
+  tied hits and swap hits tied at the cut-off; with `hnsw`, 5 to 7% of 1,000 searches changed at least one hit. A
+  rebuilt `ivf_pq` index is a different, equally valid index: at 30 million entries, rebuilds shared 57 to 59% of
+  their top-100 hits with each other (1.13.2 against the MKL build below, the wheel against the MKL build, and two
+  wheel builds at 64 and 128 threads), with about the same self-hit rates. Searches whose results you compare should
+  all use the same database.
+- **Start-up log.** On Linux x86_64, `import faiss` logs at INFO `Could not load library with AVX2 support due to:
+  ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")`, then `Successfully loaded faiss.`. This is
+  expected: the 1.15.1 wheel has one library, which picks the CPU's instructions at run time (its compile options
+  include `DD`).
+- **macOS.** The macOS wheel uses Apple Accelerate for BLAS and bundles its own `libomp`, so FoldMatch keeps
+  `OMP_NUM_THREADS=1` there by default (see *macOS notes*).
+
+**Optional: FAISS with MKL.** For Linux x86_64 and Python 3.12 only, the official FAISS conda channel, `pytorch`,
+publishes a `faiss-cpu` 1.15.1 build on MKL. It builds large `ivf_pq` indexes faster than the wheel, mostly because
+its OPQ training is faster. On one NERSC Perlmutter GPU node (64 cores), `build sequences-index --residue-codes` over
+30.4 million sequences took 2 h 02 min with it, of which 59 min was the index (the wheel: 2 h 47 min and 1 h 45 min).
+In a FAISS-only script on one CPU node (2× AMD EPYC 7763), with 128 threads bound to cores (`OMP_PROC_BIND=spread
+OMP_PLACES=cores`; FoldMatch does not bind threads), it built a 30-million-entry `ivf_pq` index in 43 minutes. The
+commands below replace the wheel with the conda build. They were tested on NERSC, in a conda env (Python 3.12) in
+which FoldMatch and its dependencies had been installed with `pip`:
+
+```bash
+python -m pip uninstall -y faiss-cpu
+conda install -y --no-deps --override-channels -c pytorch -c conda-forge \
+  "pytorch::faiss-cpu=1.15.1=py3.12_hf65b397_0_cpu" "pytorch::libfaiss=1.15.1=py3.12_hf65b397_0_cpu" \
+  "conda-forge::mkl=2025.3.1=h0e700b2_12" "conda-forge::onemkl-license=2025.3.1=hf2ce2f3_12" \
+  "conda-forge::tbb=2023.1.0=haa8c3ee_2" "conda-forge::libhwloc=2.15.0=default_hd7c4d0c_1001" \
+  "conda-forge::libxml2=2.15.4=h7df9aa5_1" "conda-forge::libxml2-16=2.15.4=hf3af7cc_1" \
+  "conda-forge::libiconv=1.18=h0cb94f2_3" "conda-forge::llvm-openmp=23.1.4=h7148c6a_0" \
+  "conda-forge::_openmp_mutex=4.5=8_kmp_llvm" "conda-forge::libsvs-runtime=0.4.0=g7f7c639_0_0" \
+  "conda-forge::python_abi=3.12=9_cp312" "conda-forge::libgcc=16.2.0=ha9f2e26_7" \
+  "conda-forge::libgcc-ng=16.2.0=h69a702a_7" "conda-forge::libgomp=16.2.0=he0feb66_7" \
+  "conda-forge::libstdcxx=16.2.0=h934c35e_7"
+python -c "import faiss; print(faiss.__version__, faiss.get_compile_options())"   # 1.15.1 OPTIMIZE AVX2 ...
+```
+
+- **Why `--no-deps`.** It keeps conda from replacing pip's numpy and its BLAS, but conda then checks nothing. The
+  listed packages are what `libfaiss` and MKL needed in that env, which had the rest; `libfaiss` needs `libgcc` 16 or
+  later. In another env, a library still missing makes `import faiss` fail with an `ImportError` that names it.
+- **Reinstalling FoldMatch.** The conda package registers as the distribution `faiss`, not `faiss-cpu`, so `pip check`
+  reports `foldmatch ... requires faiss-cpu, which is not installed`. That is expected. Reinstall or upgrade FoldMatch
+  in this env only with `pip install --no-deps ...`. Without `--no-deps`, pip installs the `faiss-cpu` wheel over the
+  conda FAISS.
+- **Updating the env.** Never run `conda update`, or a `conda install` without `--no-deps`, in this env: conda's view
+  of it is inconsistent on purpose. Repeat the `--no-deps` form instead.
+- **OpenMP runtime.** It depends on the import order. FoldMatch's commands load torch first, so torch's `libgomp`
+  serves FAISS and MKL. A script that imports `faiss` first gets LLVM's `libomp`. Both work.
+- **Thread logs.** threadpoolctl 3.6.0 does not list this MKL, so the index phase's `Thread pool:` lines do not show
+  FAISS's BLAS.
 
 
 
@@ -451,7 +539,7 @@ pytest
 
 ### macOS notes
 
-**The problem.** PyPI wheels for `faiss-cpu` and `torch` (pulled in via `lightning`) each bundle their own copy of `libomp.dylib`. On macOS, both copies get loaded into the same Python process. Whenever FAISS enters an OpenMP-parallel section (batched search with more than one query vector, `IndexHNSWFlat` graph construction, IVF-PQ training) the second OpenMP runtime fails to `pthread_mutex_init` and the call deadlocks — the CLI appears to hang indefinitely. Linux installs are unaffected because both libraries share a single OpenMP runtime.
+**The problem.** PyPI wheels for `faiss-cpu` and `torch` (pulled in via `lightning`) each bundle their own copy of `libomp.dylib`. On macOS, both copies get loaded into the same Python process. Whenever FAISS enters an OpenMP-parallel section (batched search with more than one query vector, `IndexHNSWFlat` graph construction, IVF-PQ training) the second OpenMP runtime fails to `pthread_mutex_init` and the call deadlocks — the CLI appears to hang indefinitely — or the process crashes (a segmentation fault at `OMP_NUM_THREADS=4` on an M1 Max, with torch 2.11 and `faiss-cpu` 1.13.2 or 1.15.1). Linux installs are unaffected: there the copies are GNU `libgomp` builds, which can be loaded together, and FoldMatch's commands, which load torch first, run FAISS on torch's copy.
 
 **Affected commands** on macOS without mitigation:
 

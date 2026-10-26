@@ -142,15 +142,18 @@ While the major version is `0`, breaking changes are released in a minor bump.
   outlives the job (such as `$SCRATCH`); and run step 2 as its own job on one
   CPU node, submitted with `sbatch -C cpu -N 1 --dependency=afterok:<job 1>
   --kill-on-invalid-dep=yes` and started without srun, with a generous wall
-  time too: the `faiss-cpu` 1.13.2 wheel bundles a single-threaded BLAS, so at
-  30 million sequences an `ivf_pq` index takes about 7 to 8 hours whatever the
-  thread count (7.1 hours in an 8-node build; in a replay, 1 h 50 min to train
-  and about 6.4 hours of adds): ask for 10 to 12 hours, more with
-  `--residue-codes`. With a FAISS built on a multi-threaded BLAS (FAISS 1.15.1
-  with MKL from the official `pytorch` conda channel), the same index took 43
-  minutes on one CPU node at 128 threads; the index phase logs a line, a
-  warning except on macOS, when FAISS's BLAS is single-threaded. A step 2
-  killed by its wall time cannot resume: it leaves `<output-db>.build.lock`
+  time too. At 30.4 million sequences with `--residue-codes`, step 2 with the
+  `faiss-cpu` 1.15.1 wheel FoldMatch now pins (see *Changed*) took 3 h 33 min
+  on one CPU node (128 cores and FAISS threads): 2 h 37 min for the `ivf_pq`
+  index, 16 min for the sequence store, 30 min for the residue-code store and
+  4 min for the shard id check. On one GPU node (64 cores and threads) it took
+  2 h 47 min, 1 h 45 min of it for the index, and with FAISS 1.15.1 built on
+  MKL (the official `pytorch` conda channel's build; see the README) 2 h 02
+  min, 59 min of it for the index: ask for 6 hours. The `faiss-cpu` 1.13.2
+  wheel's single-threaded BLAS made the index take about 7 to 8 hours whatever
+  the thread count; the index phase logs a line, a warning except on macOS,
+  when FAISS's BLAS is single-threaded. A step 2 killed by its wall time
+  cannot resume: it leaves `<output-db>.build.lock`
   and partial database files, which the next step 2 lists and which must be
   deleted before FAISS is rebuilt from scratch. A project with GPU hours only
   may run step 2 on one GPU node, where `ivf_pq` fits (`flat` and `hnsw` may
@@ -162,10 +165,19 @@ While the major version is `0`, breaking changes are released in a minor bump.
   cores it may use (and the threads of the BLAS libraries threadpoolctl finds,
   which it logs), unless `OMP_NUM_THREADS` (for BLAS also
   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` or `VECLIB_MAXIMUM_THREADS`) is
-  set; on macOS it leaves them as they are. It holds a lock,
-  `<output-db>.build.lock`, while it builds, so a second step 2 into the same
-  database is refused; a lock left by a killed job is reported with its
-  content, the database files present and what to delete. `build
+  set; on macOS it leaves them as they are. On Linux, FAISS's own OpenBLAS,
+  in the `faiss-cpu` wheel, is one of those libraries: an OpenMP build, it
+  runs FAISS's OpenMP threads (at most 128 in the x86_64 wheel), so
+  `OMP_NUM_THREADS` sets it and `OPENBLAS_NUM_THREADS` does not (the log line
+  says so). With the wheel, the OPQ step of an `ivf_pq` training does not gain
+  from more threads, which is most of why the CPU node above took longer than
+  the GPU node. With the wheel, run step 2 with `OMP_NUM_THREADS=64` on a node
+  of more than 64 physical cores (it sets the threads of the whole step 2; not
+  timed at this scale on a 128-core node), and expect the warning that FAISS
+  has fewer threads than cores; with the MKL build, leave it unset. It holds
+  a lock, `<output-db>.build.lock`, while it builds, so a second step 2 into
+  the same database is refused; a lock left by a killed job is reported with
+  its content, the database files present and what to delete. `build
   sequences-seal --fasta-file F --from-shards S --run-id X` recovers shards
   that have no record: those of a step 1 whose rank 0 stopped after the pass
   (wall time, out of memory, a full disk; when step 1 itself refuses then, its
@@ -356,9 +368,9 @@ While the major version is `0`, breaking changes are released in a minor bump.
   node's CPUs (and physical cores) the process may use, and `OMP_NUM_THREADS`,
   with one line per thread pool threadpoolctl finds; a line naming FAISS's
   BLAS library when it is single-threaded, as the `faiss-cpu` 1.13.2 wheel's
-  is (a warning, except on macOS: the `ivf_pq` training and adds then run on
-  one core, and a FAISS built on a multi-threaded BLAS builds a
-  30-million-entry `ivf_pq` index about 10 times faster); and, except on
+  was (a warning, except on macOS: the `ivf_pq` training and adds then run on
+  one core; the line says to install the pinned `faiss-cpu` 1.15.1, whose
+  OpenBLAS is multi-threaded, or a FAISS built on MKL); and, except on
   macOS, a warning when FAISS has fewer threads than usable physical cores,
   naming the cause: `OMP_NUM_THREADS`, which Lightning's DDP launcher sets
   during a multi-device pass when it is unset (to the CPUs the rank may use
@@ -428,6 +440,37 @@ While the major version is `0`, breaking changes are released in a minor bump.
   limit Apple Accelerate (numpy's BLAS on macOS): an in-process run there
   keeps Accelerate's own thread count and says so once in the log, while the
   worker processes are limited through `VECLIB_MAXIMUM_THREADS=1` either way.
+- **`faiss-cpu` 1.15.1** (was 1.13.2). On Linux its wheels bundle an OpenMP
+  build of OpenBLAS, where 1.13.2's OpenBLAS was single-threaded. The OPQ and
+  k-means training of an `ivf_pq` index, the IVF assignment of its adds and
+  batched flat searches therefore run on FAISS's OpenMP threads, at most 128
+  for BLAS in the x86_64 wheel (see the README, *FAISS threads*): an `ivf_pq`
+  index of 30 million sequences, about 7 hours with 1.13.2 on any node, took
+  1 h 45 min on a 64-core node at 64 threads and 2 h 37 min on a 128-core node
+  at 128, where the wheel's OPQ training runs slower than at fewer threads.
+  `OMP_NUM_THREADS` sets those threads; `OPENBLAS_NUM_THREADS` does not. Index
+  files written by either version are read by both, and the two search one
+  database alike up to float rounding, which can reorder tied hits (with
+  `hnsw`, 5 to 7% of searches changed a hit). With the wheel, rounding and
+  so the order of tied hits also depend on FAISS's thread count: set
+  `OMP_NUM_THREADS` to the same value for bit-identical reruns. Any rebuild
+  of an `ivf_pq` index gives a different, equally valid index (at 30 million
+  entries, an MKL build below shared 57% of its top-100 hits with the 1.13.2
+  index, wheel builds 58 to 59% with an MKL build, and two wheel builds at 64
+  and 128 threads 59% with each other), so compare only searches made on the
+  same database.
+  A FAISS built on MKL, from the official `pytorch` conda channel (Linux
+  x86_64, Python 3.12), is faster still for large `ivf_pq` builds; the README
+  gives the install and its caveats. On macOS the wheel still uses Accelerate
+  and bundles its own OpenMP runtime, so FoldMatch still sets
+  `OMP_NUM_THREADS=1` there by default. On Linux x86_64, `import faiss` now
+  logs at INFO that it "Could not load library with AVX2 support": expected,
+  the wheel has one library that picks the CPU's instructions at run time. Its
+  Linux wheels need glibc 2.27 (FoldMatch's own wheels need 2.28), its macOS
+  wheels macOS 14 on arm64, as before, and macOS 15 on x86_64 (was 14);
+  `faiss-cpu` still publishes no sdist.
+  `uv.lock` is regenerated, and now also records FoldMatch 0.10.0 and its
+  `threadpoolctl` pin.
 - **`download-models` also fetches the esm-codes scoring bundle.** `fm-embedding
   download-models` and `inference download-models` now download, besides ESM3
   and the aggregator, the bundle of every registered esm-codes scoring system
