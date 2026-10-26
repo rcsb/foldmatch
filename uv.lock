@@ -639,7 +639,7 @@ wheels = [
 
 [[package]]
 name = "foldmatch"
-version = "0.8.0"
+version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "biotite" },
@@ -653,6 +653,7 @@ dependencies = [
     { name = "leidenalg" },
     { name = "lightning" },
     { name = "pyarrow" },
+    { name = "threadpoolctl" },
     { name = "typer" },
 ]
 
@@ -674,6 +675,7 @@ requires-dist = [
     { name = "leidenalg", specifier = "==0.11.0" },
     { name = "lightning", specifier = "==2.6.1" },
     { name = "pyarrow", specifier = "==24.0.0" },
+    { name = "threadpoolctl", specifier = "==3.6.0" },
     { name = "typer", specifier = "==0.24.1" },
 ]
 
