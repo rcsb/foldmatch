@@ -1953,6 +1953,26 @@ after = (faiss.omp_get_max_threads(), faiss_blas())
 print("D29 " + json.dumps({"n": _physical_cpus(), "before": before, "inside": inside, "after": after}))
 """
 
+# The esm-codes in-process BLAS limit with the wheel: FAISS's count set apart from its OpenBLAS's (no BLAS call since,
+# so the OpenBLAS still reports its own count), as after faiss.omp_set_num_threads in the Python API.
+_ESM_CODES_LIMIT_CHILD = """
+import json, os
+import torch
+import faiss, threadpoolctl
+from foldmatch.search import code_alignment
+def faiss_blas():
+    return [r["num_threads"] for r in threadpoolctl.threadpool_info() if r.get("user_api") == "blas"
+            and os.path.basename(r["filepath"]).startswith("libopenblaso")]
+reported = faiss_blas()
+k = 2 if reported != [2] else 3
+faiss.omp_set_num_threads(k)
+before = (faiss.omp_get_max_threads(), torch.get_num_threads(), faiss_blas())
+with code_alignment._blas_one_thread_here():
+    inside = faiss.omp_get_max_threads()
+after = (faiss.omp_get_max_threads(), torch.get_num_threads())
+print("ESM " + json.dumps({"k": k, "before": before, "inside": inside, "after": after}))
+"""
+
 
 class FaissWheelTest(unittest.TestCase):
     """P9: the pinned faiss-cpu wheel, unmocked. Linux only (the macOS wheels use Accelerate, which threadpoolctl does
@@ -2002,6 +2022,25 @@ class FaissWheelTest(unittest.TestCase):
                                      rf"BLAS libraries limited: (.+, )?libopenblaso-[^,]+\.so(, .+)?$")
         self.assertEqual(result["inside"], [want, [want]], result)
         self.assertEqual(result["after"][0], result["before"][0], result)
+
+    def test_the_esm_codes_in_process_limit_with_the_wheel(self):
+        """The esm-codes Stage 2's in-process BLAS limit, unmocked, in a fresh process with torch loaded first: it
+        reaches FAISS's OpenMP count (1 inside), and afterwards FAISS and torch have their counts of before, although
+        FAISS's had been set apart from the count its OpenBLAS reports (threadpoolctl's restore alone gives them that
+        stale count)."""
+        env = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS
+               and k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+        env["PYTHONPATH"] = os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p])
+        run = subprocess.run([sys.executable, "-c", _ESM_CODES_LIMIT_CHILD], env=env, capture_output=True, text=True,
+                             timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+        result = json.loads(next(line for line in run.stdout.splitlines() if line.startswith("ESM "))[4:])
+        k, (faiss_before, torch_before, blas) = result["k"], result["before"]
+        self.assertEqual(faiss_before, k, result)
+        self.assertEqual(len(blas), 1, result)
+        self.assertNotEqual(blas[0], k, result)              # the OpenBLAS reports another count: the case at issue
+        self.assertEqual(result["inside"], 1, result)
+        self.assertEqual(result["after"], [faiss_before, torch_before], result)
 
 
 def _execute(path, sql):

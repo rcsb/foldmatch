@@ -448,17 +448,21 @@ While the major version is `0`, breaking changes are released in a minor bump.
   index of 30 million sequences, about 7 hours with 1.13.2 on any node, took
   1 h 45 min on a 64-core node at 64 threads and 2 h 37 min on a 128-core node
   at 128, where the wheel's OPQ training runs slower than at fewer threads.
-  `OMP_NUM_THREADS` sets those threads; `OPENBLAS_NUM_THREADS` does not. Index
-  files written by either version are read by both, and the two search one
-  database alike up to float rounding, which can reorder tied hits (with
-  `hnsw`, 5 to 7% of searches changed a hit). With the wheel, rounding and
-  so the order of tied hits also depend on FAISS's thread count: set
-  `OMP_NUM_THREADS` to the same value for bit-identical reruns. Any rebuild
-  of an `ivf_pq` index gives a different, equally valid index (at 30 million
-  entries, an MKL build below shared 57% of its top-100 hits with the 1.13.2
-  index, wheel builds 58 to 59% with an MKL build, and two wheel builds at 64
-  and 128 threads 59% with each other), so compare only searches made on the
-  same database.
+  `OMP_NUM_THREADS` sets those threads; `OPENBLAS_NUM_THREADS` does not. The
+  one-thread BLAS limit of an in-process esm-codes Stage 2 now reaches that
+  OpenBLAS too, and so FAISS's OpenMP threads (and torch's, which share them
+  when torch is loaded first) while it runs; it then sets every OpenMP runtime
+  back to its thread count, where threadpoolctl's restore alone left them at
+  the OpenBLAS's own, older count. Index files written by either version are
+  read by both, and the two search one database alike up to float rounding,
+  which can reorder tied hits (with `hnsw`, 5 to 7% of searches changed a
+  hit). With the wheel, rounding and so the order of tied hits also depend on
+  FAISS's thread count: set `OMP_NUM_THREADS` to the same value for
+  bit-identical reruns. Any rebuild of an `ivf_pq` index gives a different,
+  equally valid index (at 30 million entries, an MKL build below shared 57% of
+  its top-100 hits with the 1.13.2 index, wheel builds 58 to 59% with an MKL
+  build, and two wheel builds at 64 and 128 threads 59% with each other), so
+  compare only searches made on the same database.
   A FAISS built on MKL, from the official `pytorch` conda channel (Linux
   x86_64, Python 3.12), is faster still for large `ivf_pq` builds; the README
   gives the install and its caveats. On macOS the wheel still uses Accelerate

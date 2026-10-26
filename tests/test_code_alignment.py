@@ -1098,6 +1098,93 @@ class TaskPlanningTest(unittest.TestCase):
         self.assertEqual(ca._lpt(["a", "b", "c", "d"], [3, 7, 3, 9]), ["d", "b", "a", "c"])
 
 
+class _Runtime:
+    """One OpenMP runtime's thread count: the count FAISS, the faiss-cpu wheel's OpenBLAS and torch (loaded first)
+    share on Linux."""
+
+    def __init__(self, threads):
+        self.threads = threads
+
+
+def _fake_threadpoolctl(runtime: _Runtime, blas_reports: int):
+    """threadpoolctl over ``runtime`` with an OpenMP BLAS, as OpenBLAS 0.3.15's OpenMP build behaves: the BLAS keeps
+    no count of its own, so its limit and threadpoolctl's restore set the runtime's count, the restore to what the BLAS
+    reported at entry (``blas_reports``: its count of its last BLAS call, which lags behind FAISS's)."""
+
+    class OpenMP:
+        @property
+        def num_threads(self):
+            return runtime.threads
+
+        def set_num_threads(self, threads):
+            runtime.threads = threads
+
+    class Controller:
+        def select(self, user_api=None):
+            assert user_api == "openmp", user_api
+            return mock.Mock(lib_controllers=[OpenMP()])
+
+    class Limiter:
+        def __init__(self, limits, user_api):
+            assert user_api == "blas", user_api
+            runtime.threads = limits                    # openblas_set_num_threads sets the OpenMP count
+
+        def restore_original_limits(self):
+            runtime.threads = blas_reports
+
+    return mock.Mock(ThreadpoolController=Controller, threadpool_limits=Limiter)
+
+
+class InProcessBlasLimitTest(unittest.TestCase):
+    """P9: an in-process Stage 2 limits BLAS to one thread (``_blas_one_thread_here``) and gives every OpenMP runtime
+    its thread count again afterwards. With the faiss-cpu 1.15.1 wheel's OpenMP OpenBLAS, threadpoolctl's restore alone
+    set FAISS's (and torch's) count to OpenBLAS's stale one (NERSC job 60321459: FAISS at 7 came back at 128)."""
+
+    def setUp(self):
+        noted = mock.patch.object(ca, "_note_uncontrolled_blas")
+        noted.start()
+        self.addCleanup(noted.stop)
+
+    def test_the_openmp_count_comes_back(self):
+        runtime = _Runtime(8)
+        with mock.patch.dict(sys.modules, {"threadpoolctl": _fake_threadpoolctl(runtime, blas_reports=128)}):
+            with ca._blas_one_thread_here():
+                self.assertEqual(runtime.threads, 1)              # the limit reaches the OpenMP runtime
+            self.assertEqual(runtime.threads, 8)
+            limiter = sys.modules["threadpoolctl"].threadpool_limits(limits=1, user_api="blas")
+            limiter.restore_original_limits()
+            self.assertEqual(runtime.threads, 128)                # threadpoolctl's restore alone (the P9 finding)
+
+    def test_the_count_comes_back_after_an_error(self):
+        runtime = _Runtime(5)
+        with mock.patch.dict(sys.modules, {"threadpoolctl": _fake_threadpoolctl(runtime, blas_reports=64)}):
+            with self.assertRaises(KeyError), ca._blas_one_thread_here():
+                raise KeyError("in the block")
+        self.assertEqual(runtime.threads, 5)
+
+    def test_without_threadpoolctl_nothing_is_limited(self):
+        with mock.patch.dict(sys.modules, {"threadpoolctl": None}):  # import threadpoolctl raises ImportError
+            self.assertEqual(ca._openmp_thread_counts(), [])
+            with ca._blas_one_thread_here():
+                pass
+        ca._note_uncontrolled_blas.assert_not_called()
+
+    def test_the_real_pools_are_as_before(self):
+        """Unmocked, on this platform: every pool threadpoolctl lists has its thread count of before after the block
+        (on Linux with the faiss-cpu wheel, FaissWheelTest checks FAISS's count set apart from OpenBLAS's)."""
+        try:
+            import threadpoolctl
+        except ImportError:
+            self.skipTest("threadpoolctl is not installed")
+
+        def counts():
+            return [(p.get("filepath"), p.get("num_threads")) for p in threadpoolctl.threadpool_info()]
+        before = counts()
+        with ca._blas_one_thread_here():
+            pass
+        self.assertEqual(counts(), before)
+
+
 @functools.lru_cache(maxsize=None)
 def _panel_offsets():
     return _prepared().for_worker().load_panel()[1]

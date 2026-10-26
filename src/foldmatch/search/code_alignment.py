@@ -452,8 +452,28 @@ def _single_threaded_blas_env():
                 os.environ[k] = v
 
 
+def _openmp_thread_counts() -> list:
+    """``(controller, threads)`` for every OpenMP runtime threadpoolctl finds in this process; empty without
+    threadpoolctl, or when it cannot list them."""
+    try:
+        import threadpoolctl
+        return [(lib, lib.num_threads)
+                for lib in threadpoolctl.ThreadpoolController().select(user_api="openmp").lib_controllers]
+    except Exception:  # noqa: BLE001  (nothing to set back then: threadpoolctl's own restore only)
+        return []
+
+
 @contextmanager
 def _blas_one_thread_here():
+    """BLAS at one thread for the block, as in a pool worker (threadpoolctl); every thread count as before after it.
+
+    An OpenMP BLAS keeps no thread count of its own (OpenBLAS 0.3.15's OpenMP build, the faiss-cpu wheel's BLAS on
+    Linux): the limit sets the OpenMP count of its runtime, the one FAISS runs (and torch, which shares it when torch
+    is loaded first), and threadpoolctl's restore sets that count to the one the BLAS reported at entry, which lags
+    behind FAISS's until a BLAS call (P9: FAISS set to 7 came back at 128). So once threadpoolctl has restored its
+    pools, each OpenMP runtime gets its count at entry again.
+    """
+    openmp = _openmp_thread_counts()
     limiter = _limit_blas_threads()
     if limiter is not None:
         _note_uncontrolled_blas()
@@ -462,6 +482,9 @@ def _blas_one_thread_here():
     finally:
         if limiter is not None:
             limiter.restore_original_limits()
+            for lib, threads in openmp:
+                if lib.num_threads != threads:
+                    lib.set_num_threads(threads)
 
 
 @contextmanager
