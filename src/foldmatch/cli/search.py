@@ -1850,6 +1850,33 @@ def _run_sequence_pass(run: _SequencePass, *, fasta_file: Path, min_res_n: int, 
 #: changes ``OMP_NUM_THREADS`` before it.
 _OMP_ENV_NOT_RECORDED = object()
 
+#: The faiss-cpu version pyproject.toml pins, named by the index phase's line about a single-threaded FAISS BLAS: its
+#: Linux wheels bundle an OpenMP OpenBLAS (the 1.13.2 wheels' OpenBLAS was single-threaded).
+_FAISS_CPU_PIN = "1.15.1"
+
+
+def _in_faiss_folder(path: str, package: str) -> bool:
+    """Whether the library at ``path`` (a real path) is one FAISS ships: inside the ``faiss`` package folder
+    ``package``, or in a wheel's library folder beside it (``faiss_cpu.libs``)."""
+    folder = os.path.dirname(path)
+    return path.startswith(package + os.sep) or (
+        os.path.dirname(folder) == os.path.dirname(package)
+        and os.path.basename(folder).startswith("faiss") and folder.endswith(".libs"))
+
+
+def _faiss_openmp_blas(runtimes) -> Optional[str]:
+    """The file name of FAISS's own BLAS among threadpoolctl's ``runtimes`` when it is an OpenMP build (the faiss-cpu
+    1.15.1 wheel's ``libopenblaso``), else None. Such a BLAS runs the OpenMP threads FAISS runs, whatever
+    ``OPENBLAS_NUM_THREADS`` says."""
+    import faiss
+    package = os.path.dirname(os.path.realpath(faiss.__file__))
+    for runtime in runtimes:
+        path = os.path.realpath(str(runtime.get("filepath")))
+        if runtime.get("user_api") == "blas" and runtime.get("threading_layer") == "openmp" \
+                and _in_faiss_folder(path, package):
+            return os.path.basename(path)
+    return None
+
 
 def _build_sequence_database(embedding_computer, preflight, *, fasta_file: Path, output_db: str, min_res_n: int,
                              system, index: _IndexOptions, refusals, split: Optional[Mapping] = None,
@@ -1925,7 +1952,8 @@ def _log_index_phase(omp_env_at_start=_OMP_ENV_NOT_RECORDED) -> None:
     One more line (a WARNING, INFO on macOS) when FAISS's BLAS runs on one thread by build: a BLAS runtime at one
     thread whose threading layer is ``disabled``, or one in FAISS's own library folder (``faiss_cpu.libs`` beside the
     package, or inside it) whose threading layer threadpoolctl does not report as threaded. The faiss-cpu 1.13.2
-    wheel's OpenBLAS is such a library, so its ivf_pq training and adds run on one core.
+    wheel's OpenBLAS is such a library (its ivf_pq training and adds ran on one core); the OpenMP OpenBLAS of the
+    1.15.1 wheel FoldMatch pins (:data:`_FAISS_CPU_PIN`) is not.
     """
     import faiss
     from foldmatch.search.code_alignment import _physical_cpus
@@ -1957,22 +1985,20 @@ def _log_index_phase(omp_env_at_start=_OMP_ENV_NOT_RECORDED) -> None:
         )
     # The k-means of an ivf_pq training and the IVF assignment of its adds are BLAS products: on a BLAS built without
     # threads they run on one core whatever FAISS's OpenMP threads. A threaded BLAS that a variable limits to one
-    # thread (a later faiss-cpu wheel bundles an OpenMP OpenBLAS) is not flagged.
+    # thread (the faiss-cpu 1.15.1 wheel's OpenMP OpenBLAS at OMP_NUM_THREADS=1, for example) is not flagged.
     package = os.path.dirname(os.path.realpath(faiss.__file__))
     for runtime in runtimes:
         path = os.path.realpath(str(runtime.get("filepath")))
-        folder = os.path.dirname(path)
-        own = path.startswith(package + os.sep) or (
-            os.path.dirname(folder) == os.path.dirname(package)
-            and os.path.basename(folder).startswith("faiss") and folder.endswith(".libs"))
+        own = _in_faiss_folder(path, package)
         layer = runtime.get("threading_layer")
         if runtime.get("user_api") == "blas" and runtime.get("num_threads") == 1 and (
                 layer == "disabled" or (own and layer not in ("pthreads", "openmp"))):
             logging.log(
                 logging.INFO if sys.platform == "darwin" else logging.WARNING,
                 f"FAISS's BLAS, {os.path.basename(path)}, is single-threaded, so the ivf_pq training and adds run on "
-                f"one core whatever FAISS's thread count: a FAISS built on a multi-threaded BLAS (for example the "
-                f"MKL build of the official 'pytorch' conda channel) builds a 30M-entry ivf_pq index about 10x faster."
+                f"one core whatever FAISS's thread count: install the faiss-cpu {_FAISS_CPU_PIN} FoldMatch pins (pip "
+                f"install faiss-cpu=={_FAISS_CPU_PIN}), whose wheel bundles an OpenMP OpenBLAS, or a FAISS built on "
+                f"MKL (README, 'FAISS threads')."
             )
             break
     if sys.platform != "darwin" and omp_threads < physical:
@@ -2426,9 +2452,22 @@ def _whole_node_threads():
     ``n`` unless one of :data:`_BLAS_THREAD_VARS` is set, which reaches only the BLAS libraries threadpoolctl finds
     (the INFO line names them). Nothing is raised on macOS, where ``foldmatch`` pins ``OMP_NUM_THREADS=1`` against the
     second libomp. ``n`` is :func:`~foldmatch.search.code_alignment._physical_cpus` of the affinity mask, so call it
-    after the mask was widened. Gains for ivf_pq (its training and the encoding of its adds), not for flat, whose adds
-    are copies after an L2 normalisation of 1000 rows per call (below the size FAISS parallelises); HNSW adds 100
-    vectors per call and scales poorly.
+    after the mask was widened. Gains for ivf_pq (the k-means of its training and the encoding of its adds), not for
+    flat, whose adds are copies after an L2 normalisation of 1000 rows per call (below the size FAISS parallelises);
+    HNSW adds 100 vectors per call and scales poorly. With the faiss-cpu 1.15.1 wheel the OPQ step of an ivf_pq
+    training does not gain: on a 128-core node it ran fastest at 4-16 threads and 2.6x slower at 128 (P9), and a
+    30M-entry training took 76 min there at 128 threads against 40 min on a 64-core node at 64. D29 still gives the
+    whole block ``n``.
+
+    The limit also reaches the OpenMP OpenBLAS of the faiss-cpu 1.15.1 wheel (``libopenblaso``), which keeps no
+    thread count of its own (OpenBLAS 0.3.15): ``openblas_set_num_threads`` sets the calling thread's OpenMP count,
+    the one FAISS reads (FAISS and its OpenBLAS share an OpenMP runtime), and every BLAS call runs that count, lowered
+    to the build's MAX_THREADS (128 in the x86_64 wheel) when it is larger. The limit gives it the ``n`` FAISS was just
+    given, so FAISS keeps ``n``, at most MAX_THREADS (above it the INFO line still says ``n``, and the index phase warns
+    of fewer threads than cores). On exit threadpoolctl sets every pool it lists back to its count at entry, in its
+    listing order, which leaves that OpenMP count at OpenBLAS's (it lags FAISS's until a BLAS call); FAISS's previous
+    count is restored after it. ``OPENBLAS_NUM_THREADS`` does not set that OpenBLAS's threads (FAISS's OpenMP count
+    does), as the INFO line says when such a variable leaves BLAS alone.
     """
     import faiss
     from foldmatch.search.code_alignment import _physical_cpus
@@ -2453,7 +2492,15 @@ def _whole_node_threads():
         blas_set = [f"{name}={os.environ[name]}" for name in _BLAS_THREAD_VARS if name in os.environ]
         limited = None
         if blas_set:
-            kept.append(f"BLAS threads left to {', '.join(blas_set)}")
+            follows = None
+            if raised:  # FAISS was given n: an OpenMP BLAS of FAISS's runs FAISS's count, whatever the variable
+                try:  # diagnostics only
+                    import threadpoolctl
+                    follows = _faiss_openmp_blas(threadpoolctl.threadpool_info())
+                except Exception as exc:
+                    logging.debug(f"threadpoolctl could not list the thread pools: {exc}")
+            kept.append(f"BLAS threads left to {', '.join(blas_set)}" + (
+                f", except FAISS's OpenMP OpenBLAS, {follows}, which runs FAISS's OpenMP threads" if follows else ""))
         else:
             import threadpoolctl
             stack.enter_context(threadpoolctl.threadpool_limits(limits=n, user_api="blas"))

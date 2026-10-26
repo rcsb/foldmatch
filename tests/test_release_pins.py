@@ -207,6 +207,11 @@ class DependencyPinsTest(unittest.TestCase):
         self.assertIn("faiss-cpu==1.15.1", self.dependencies)
         self.assertFalse([r for r in self.dependencies if r.startswith("faiss") and r != "faiss-cpu==1.15.1"])
 
+    def test_the_index_phase_names_the_pinned_faiss_cpu(self):
+        """The index phase's line about a single-threaded FAISS BLAS tells to install the pinned faiss-cpu."""
+        from foldmatch.cli import search
+        self.assertIn(f"faiss-cpu=={search._FAISS_CPU_PIN}", self.dependencies)
+
 
 class _NotAWeight:
     pass

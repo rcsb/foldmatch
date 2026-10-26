@@ -70,6 +70,12 @@ _OPTIONS = ("--min-res-n", "100", "--batch-size", "2", "--ivf-nlist", "256", "--
             "--cleanup-embeddings")
 
 
+def _faiss_libs() -> str:
+    """The faiss-cpu wheel's library folder, beside the installed faiss package (the macOS wheels have none)."""
+    import faiss
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(faiss.__file__))), "faiss_cpu.libs")
+
+
 # =====================================================================================================================
 # P8b.1: the phases of build sequences
 # =====================================================================================================================
@@ -403,11 +409,11 @@ class OneShotPhasesTest(_WithBundle):
         self.assertFalse([r for r in logs.records if r.getMessage().startswith("Thread pool: ")])
 
     def test_a_single_threaded_faiss_blas(self):
-        """One line when FAISS's BLAS runs on one thread by build, a WARNING (INFO on macOS) naming the library: the
-        faiss-cpu 1.13.2 wheel's OpenBLAS in faiss_cpu.libs (threading layer disabled), FAISS's own BLAS whose
-        threading layer threadpoolctl does not report, any BLAS built without threads; the first one only. None for a
-        threaded BLAS (MKL at 128 threads, numpy's OpenBLAS limited to one thread, a later wheel's OpenMP OpenBLAS at
-        one thread or more), and none when threadpoolctl finds no BLAS."""
+        """One line when FAISS's BLAS runs on one thread by build, a WARNING (INFO on macOS) naming the library and the
+        pinned faiss-cpu: the faiss-cpu 1.13.2 wheel's OpenBLAS in faiss_cpu.libs (threading layer disabled), FAISS's
+        own BLAS whose threading layer threadpoolctl does not report, any BLAS built without threads; the first one
+        only. None for a threaded BLAS (MKL at 128 threads, numpy's OpenBLAS limited to one thread, the faiss-cpu
+        1.15.1 wheel's OpenMP OpenBLAS at one thread or more), and none when threadpoolctl finds no BLAS."""
         import faiss
         package = os.path.dirname(os.path.realpath(faiss.__file__))
         libs = os.path.join(os.path.dirname(package), "faiss_cpu.libs")
@@ -423,7 +429,7 @@ class OneShotPhasesTest(_WithBundle):
                 "filepath": os.path.join(libs, "libgomp-e985bcbb.so.1.0.0")}
         wheel = blas(os.path.join(libs, "libopenblas-r0-11edc3fa.3.15.so"), "disabled", 1)
         serial = blas("/opt/conda/lib/libopenblasp-r0.3.21.so", "disabled", 1)
-        later = os.path.join(libs, "libopenblaso-r0-d77a1985.3.15.so")
+        pinned = os.path.join(libs, "libopenblaso-r0-d77a1985.3.15.so")
         cases = {
             "the faiss-cpu 1.13.2 wheel": ([gomp, wheel], "libopenblas-r0-11edc3fa.3.15.so"),
             "in the package, no threading layer": (
@@ -437,14 +443,14 @@ class OneShotPhasesTest(_WithBundle):
             "MKL at 128 threads": ([gomp, blas("/envs/faisscf/lib/libmkl_rt.so.2", "intel", 128, api="mkl")], None),
             "numpy's OpenBLAS limited to one thread": (
                 [blas("/sp/numpy.libs/libscipy_openblas64_-ff651d7f.so", "pthreads", 1)], None),
-            "a later wheel's OpenMP OpenBLAS at one thread": ([blas(later, "openmp", 1)], None),
-            "a later wheel's OpenMP OpenBLAS": ([gomp, blas(later, "openmp", 64)], None),
+            "the faiss-cpu 1.15.1 wheel's OpenMP OpenBLAS at one thread": ([blas(pinned, "openmp", 1)], None),
+            "the faiss-cpu 1.15.1 wheel's OpenMP OpenBLAS": ([gomp, blas(pinned, "openmp", 64)], None),
             "no BLAS": ([gomp], None),
             "nothing found": ([], None),
         }
         text = ("FAISS's BLAS, {}, is single-threaded, so the ivf_pq training and adds run on one core whatever "
-                "FAISS's thread count: a FAISS built on a multi-threaded BLAS (for example the MKL build of the "
-                "official 'pytorch' conda channel) builds a 30M-entry ivf_pq index about 10x faster.")
+                "FAISS's thread count: install the faiss-cpu 1.15.1 FoldMatch pins (pip install faiss-cpu==1.15.1), "
+                "whose wheel bundles an OpenMP OpenBLAS, or a FAISS built on MKL (README, 'FAISS threads').")
         for case, (pools, name) in cases.items():
             for platform in ("linux", "darwin"):
                 with self.subTest(case=case, platform=platform), mock.patch.object(sys, "platform", platform), \
@@ -1800,27 +1806,32 @@ class IndexStepTest(_SplitBuild):
         self.assertEqual(list(empty.rglob("models--*")), [])  # nothing fetched (transformers writes a version.txt)
 
     # -- D29: the threads of the index phase (FAISS's thread calls and threadpoolctl's limit mocked) ------------------
-    #: threadpoolctl's runtimes as a Linux node might list them: two BLAS libraries (one of them twice) and an OpenMP.
+    #: threadpoolctl's runtimes as a Linux node with the faiss-cpu 1.15.1 wheel might list them: numpy's and scipy's
+    #: OpenBLAS (one of them twice), FAISS's OpenMP OpenBLAS in faiss_cpu.libs, and an OpenMP.
     POOLS = [{"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
               "filepath": "/site-packages/numpy.libs/libscipy_openblas64_-ff651d7f.so"},
              {"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
               "filepath": "/site-packages/scipy.libs/libscipy_openblas-68440149.so"},
              {"user_api": "blas", "internal_api": "openblas", "num_threads": 6,
               "filepath": "/elsewhere/libscipy_openblas-68440149.so"},
+             {"user_api": "blas", "internal_api": "openblas", "num_threads": 6, "threading_layer": "openmp",
+              "filepath": os.path.join(_faiss_libs(), "libopenblaso-r0-d77a1985.3.15.so")},
              {"user_api": "openmp", "internal_api": "openmp", "num_threads": 6,
-              "filepath": "/site-packages/faiss/../faiss_cpu.libs/libgomp-a34b3233.so.1.0.0"}]
+              "filepath": os.path.join(_faiss_libs(), "libgomp-a34b3233.so.1.0.0")}]
+    #: The same without FAISS's BLAS (the faiss-cpu 1.13.2 wheel's is listed at 1 thread, an MKL build's not at all).
+    POOLS_NO_FAISS_BLAS = [pool for pool in POOLS if "libopenblaso" not in pool["filepath"]]
 
-    def threads(self, platform="linux", pools=POOLS, **env):
+    def threads(self, platform="linux", pools=POOLS, info_error=None, **env):
         """``_whole_node_threads`` with ``env`` (the thread variables otherwise unset) on ``platform``, threadpoolctl
-        listing ``pools``: ``(FAISS thread calls inside the block, after it, threadpool_limits calls, (limit left
-        inside, after), log)``."""
+        listing ``pools`` (or raising ``info_error``): ``(FAISS thread calls inside the block, after it,
+        threadpool_limits calls, (limit left inside, after), log)``."""
         clean = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS}
         clean.update(env)
         with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(sys, "platform", platform), \
                 mock.patch.object(code_alignment, "_physical_cpus", return_value=6), \
                 mock.patch("faiss.omp_get_max_threads", return_value=3), \
                 mock.patch("faiss.omp_set_num_threads") as set_threads, \
-                mock.patch("threadpoolctl.threadpool_info", return_value=pools), \
+                mock.patch("threadpoolctl.threadpool_info", return_value=pools, side_effect=info_error), \
                 mock.patch("threadpoolctl.threadpool_limits") as limits, self.assertLogs(level="INFO") as logs:
             with search._whole_node_threads():
                 inside = list(set_threads.call_args_list)
@@ -1831,7 +1842,8 @@ class IndexStepTest(_SplitBuild):
 
     def test_d29_threads_with_the_variables_unset(self):
         """FAISS gets the physical cores (the previous count restored after the block), and so does BLAS; the INFO line
-        names the BLAS libraries threadpoolctl found (the limit reaches no other), or says it found none."""
+        names the BLAS libraries threadpoolctl found (the limit reaches no other; the faiss-cpu 1.15.1 wheel's OpenMP
+        OpenBLAS is one of them), or says it found none."""
         inside, after, limits, exited, log = self.threads()
         self.assertEqual(inside, [mock.call(6)])
         self.assertEqual(after, [mock.call(6), mock.call(3)])
@@ -1839,9 +1851,13 @@ class IndexStepTest(_SplitBuild):
         self.assertEqual(exited, (False, True))
         self.assertEqual(len(log), 1)
         self.assertRegex(log[0], r"^FAISS/BLAS threads set to 6 \(physical cores of the \d+ allowed CPUs\); BLAS "
+                                 r"libraries limited: libopenblaso-r0-d77a1985\.3\.15\.so, "
+                                 r"libscipy_openblas-68440149\.so, libscipy_openblas64_-ff651d7f\.so$")
+        *_, log = self.threads(pools=self.POOLS_NO_FAISS_BLAS)
+        self.assertRegex(log[0], r"^FAISS/BLAS threads set to 6 \(physical cores of the \d+ allowed CPUs\); BLAS "
                                  r"libraries limited: libscipy_openblas-68440149\.so, "
                                  r"libscipy_openblas64_-ff651d7f\.so$")
-        *_, log = self.threads(pools=self.POOLS[3:])
+        *_, log = self.threads(pools=[pool for pool in self.POOLS if pool["user_api"] != "blas"])
         self.assertRegex(log[0], r"^FAISS/BLAS threads set to 6 \(physical cores of the \d+ allowed CPUs\); "
                                  r"threadpoolctl found no BLAS library to limit$")
 
@@ -1851,12 +1867,24 @@ class IndexStepTest(_SplitBuild):
         self.assertEqual(log, ["FAISS threads left to OMP_NUM_THREADS=2; BLAS threads left to OMP_NUM_THREADS=2"])
 
     def test_d29_a_blas_variable_set(self):
+        """BLAS is left to the variable, and the INFO line says that FAISS's OpenMP OpenBLAS (the faiss-cpu 1.15.1
+        wheel's), which the variable does not govern, runs FAISS's threads; with OMP_NUM_THREADS also set, FAISS is
+        left to it too and nothing is added."""
         for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-            with self.subTest(name=name):
-                inside, after, limits, _, log = self.threads(**{name: "1"})
-                self.assertEqual((inside, limits), ([mock.call(6)], []))
-                self.assertRegex(log[0], rf"^FAISS threads set to 6 \(physical cores of the \d+ allowed CPUs\); "
-                                         rf"BLAS threads left to {name}=1$")
+            for pools, follows in ((self.POOLS, ", except FAISS's OpenMP OpenBLAS, libopenblaso-r0-d77a1985.3.15.so, "
+                                                "which runs FAISS's OpenMP threads"),
+                                   (self.POOLS_NO_FAISS_BLAS, ""), ([], "")):
+                with self.subTest(name=name, pools=len(pools)):
+                    inside, after, limits, _, log = self.threads(pools=pools, **{name: "1"})
+                    self.assertEqual((inside, limits), ([mock.call(6)], []))
+                    self.assertRegex(log[0], rf"^FAISS threads set to 6 \(physical cores of the \d+ allowed CPUs\); "
+                                             rf"BLAS threads left to {name}=1{re.escape(follows)}$")
+        inside, after, limits, _, log = self.threads(OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="1")
+        self.assertEqual((inside, after, limits), ([], [], []))
+        self.assertEqual(log, ["FAISS threads left to OMP_NUM_THREADS=2; BLAS threads left to OMP_NUM_THREADS=2, "
+                               "OPENBLAS_NUM_THREADS=1"])
+        *_, log = self.threads(info_error=RuntimeError("cannot inspect"), OPENBLAS_NUM_THREADS="1")
+        self.assertRegex(log[0], r"BLAS threads left to OPENBLAS_NUM_THREADS=1$")
 
     def test_d29_never_on_macos(self):
         for env in ({}, {"OMP_NUM_THREADS": "1"}):
@@ -1904,6 +1932,76 @@ class IndexStepTest(_SplitBuild):
         self.assertEqual(limits.call_args, mock.call(limits=6, user_api="blas"))
         self.assertEqual(phase.call_args.kwargs["split"], split_run.read_run_record(self.shards / "emb_run.run.json"))
         self.assertIs(phase.call_args.kwargs["refusals"], search._refusals)
+
+
+#: A fresh process that loads torch first, as the CLI does, then runs an unmocked ``_whole_node_threads`` block and
+#: prints FAISS's OpenMP count and FAISS's OpenBLAS's threads before, inside and after it (FaissWheelTest).
+_D29_CHILD = """
+import json, logging, os, sys
+import torch
+import faiss, threadpoolctl
+from foldmatch.cli import search
+from foldmatch.search.code_alignment import _physical_cpus
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout, force=True)
+def faiss_blas():
+    return [r["num_threads"] for r in threadpoolctl.threadpool_info() if r.get("user_api") == "blas"
+            and os.path.basename(r["filepath"]).startswith("libopenblaso")]
+before = (faiss.omp_get_max_threads(), faiss_blas())
+with search._whole_node_threads():
+    inside = (faiss.omp_get_max_threads(), faiss_blas())
+after = (faiss.omp_get_max_threads(), faiss_blas())
+print("D29 " + json.dumps({"n": _physical_cpus(), "before": before, "inside": inside, "after": after}))
+"""
+
+
+class FaissWheelTest(unittest.TestCase):
+    """P9: the pinned faiss-cpu wheel, unmocked. Linux only (the macOS wheels use Accelerate, which threadpoolctl does
+    not list), and only when the installed FAISS is that wheel (not a conda build, not another version)."""
+
+    def setUp(self):
+        import faiss
+        if not sys.platform.startswith("linux"):
+            self.skipTest("the faiss-cpu wheels bundle an OpenBLAS on Linux only")
+        if faiss.__version__ != search._FAISS_CPU_PIN or not os.path.isdir(_faiss_libs()):
+            self.skipTest(f"FAISS {faiss.__version__} at {faiss.__file__} is not the faiss-cpu "
+                          f"{search._FAISS_CPU_PIN} wheel")
+
+    def test_the_wheel_blas_is_threaded(self):
+        """threadpoolctl lists the wheel's BLAS in faiss_cpu.libs as an OpenMP OpenBLAS, and the index phase logs it
+        without the single-threaded line (a pin to a wheel with a single-threaded BLAS fails here)."""
+        import threadpoolctl
+        runtimes = threadpoolctl.threadpool_info()
+        own = [r for r in runtimes if r.get("user_api") == "blas"
+               and os.path.dirname(os.path.realpath(r["filepath"])) == os.path.realpath(_faiss_libs())]
+        self.assertEqual([(r["internal_api"], r.get("threading_layer")) for r in own], [("openblas", "openmp")],
+                         runtimes)
+        self.assertEqual(search._faiss_openmp_blas(runtimes), os.path.basename(os.path.realpath(own[0]["filepath"])))
+        with self.assertLogs(level="INFO") as logs:
+            search._log_index_phase(None)
+        messages = [record.getMessage() for record in logs.records]
+        self.assertFalse([m for m in messages if "single-threaded" in m], messages)
+        self.assertEqual(len([m for m in messages if m.startswith("Thread pool: openblas, ")
+                              and m.endswith(os.path.basename(own[0]["filepath"]))]), 1, messages)
+
+    def test_d29_with_the_wheel(self):
+        """D29 unmocked, in a fresh process with torch loaded first: the INFO line names FAISS's OpenMP OpenBLAS
+        among the libraries limited; inside the block FAISS and that OpenBLAS run the physical cores (at most the
+        wheel's 128); after it FAISS has its previous count again."""
+        env = {k: v for k, v in os.environ.items() if k not in search._BLAS_THREAD_VARS
+               and k not in _LAUNCH_ENV and k not in _DDP_ENV and not k.startswith(_DDP_ENV_PREFIXES)}
+        env["PYTHONPATH"] = os.pathsep.join([_SRC] + [p for p in [os.environ.get("PYTHONPATH")] if p])
+        run = subprocess.run([sys.executable, "-c", _D29_CHILD], env=env, capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr[-4000:])
+        lines = run.stdout.splitlines()
+        result = json.loads(next(line for line in lines if line.startswith("D29 "))[4:])
+        n = result["n"]
+        want = min(n, 128)
+        limited = [line for line in lines if line.startswith("FAISS/BLAS threads set to ")]
+        self.assertEqual(len(limited), 1, run.stdout)
+        self.assertRegex(limited[0], rf"^FAISS/BLAS threads set to {n} \(physical cores of the \d+ allowed CPUs\); "
+                                     rf"BLAS libraries limited: (.+, )?libopenblaso-[^,]+\.so(, .+)?$")
+        self.assertEqual(result["inside"], [want, [want]], result)
+        self.assertEqual(result["after"][0], result["before"][0], result)
 
 
 def _execute(path, sql):
