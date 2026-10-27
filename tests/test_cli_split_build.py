@@ -14,8 +14,9 @@ under the ESM3 spy with ``scoring_system.prepare`` refusing. ``SealOptionTest``,
 (P8b.5) check the recovery, ``build sequences-seal``, under the same spies: its options, that the shards a failed
 one-shot kept or a step 1 left without a record are sealed and then built into the one-shot's database, and each of its
 refusals S1-S11, which write nothing. ``LaunchChecksBeforeTorchTest`` (P9.I1) runs step 2 and the seal as commands
-with a hook that ends the process at any import of torch or Lightning: I2 and I3 refuse before it. ``RealEsm3SplitTest``
-runs both builds with the real CPU pass, and ``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
+with a hook that ends the process at any import of torch or Lightning: I2 and I3 refuse before it; ``CommandLineTest``
+(P9.I2) checks the command line their advice ends with. ``RealEsm3SplitTest`` runs both builds with the real CPU pass,
+and ``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
 """
 import dataclasses
 import errno
@@ -1207,6 +1208,25 @@ def _index_args(fasta, db, shards, *extra):
     return ("build", "sequences-index", "--fasta-file", fasta, "--output-db", db, "--from-shards", shards, *extra)
 
 
+#: ``sys.argv[0]`` of the ``fm-search`` console script, as step 2 and the seal see it in ``_SplitBuild`` (P9.I2).
+_FM_SEARCH = "/opt/foldmatch/bin/fm-search"
+
+
+def _as_fm_search(args):
+    """``sys.argv`` as the ``fm-search`` console script sets it for ``args``."""
+    return mock.patch.object(sys, "argv", [_FM_SEARCH, *map(str, args)])
+
+
+def _command_line(args) -> str:
+    """The command line that the launch checks' advice gives for ``args`` run through the console script."""
+    return shlex.join(["fm-search", *map(str, args)])
+
+
+#: What the launch checks' advice says the one-node job's SCRIPT runs next time (P9.I2, review finding 2).
+_NEXT_BUILD = ("with the paths and run id of that job's build (export FOLDMATCH_RUN_ID=ID before the sbatch, and pass "
+               "--run-id \"$FOLDMATCH_RUN_ID\")")
+
+
 def _tree(*folders) -> dict:
     """``{path: sha256}`` of every file under ``folders`` (``None`` for a folder), and whether each folder exists."""
     out = {}
@@ -1326,10 +1346,13 @@ class _SplitBuild(_WithBundle):
         return Path(shards) / f"emb_{run_id}.run.json"
 
     def index(self, *extra, fasta=_FASTA, db=None, shards=None, env=None):
-        """Step 2 under the ESM3 spy, the bundle refused, with ``env`` set; returns the result."""
+        """Step 2 under the ESM3 spy, the bundle refused, with ``env`` set and ``sys.argv`` as the console script
+        sets it; returns the result."""
+        args = _index_args(fasta, db or self.db, shards or self.shards, *extra)
         with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")), \
-                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}):
-            result = invoke(*_index_args(fasta, db or self.db, shards or self.shards, *extra))
+                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}), \
+                _as_fm_search(args):
+            result = invoke(*args)
         esm3.assert_not_called()
         return result
 
@@ -1793,7 +1816,8 @@ class IndexStepTest(_SplitBuild):
                              "'build sequences-index' runs in a one-task srun step of SLURM job 42, which holds 2 "
                              "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
                              "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
-                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."),
+                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT "
+                             "runs this command, without srun, " + _NEXT_BUILD + ": {command}"),
             "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_GPUS_ON_NODE": 4},
                      "SLURM job 42 has GPUs (SLURM_GPUS_ON_NODE=4), which 'build sequences-index' does not use: run it "
                      "as its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it "
@@ -1801,9 +1825,10 @@ class IndexStepTest(_SplitBuild):
         }
         for k, (case, (env, text)) in enumerate(cases.items()):
             with self.subTest(case=case):
-                messages = self.logged(lambda: self.built(env=env, db=self.tmp / f"w{k}" / "db"))
+                db = self.tmp / f"w{k}" / "db"
+                messages = self.logged(lambda: self.built(env=env, db=db))
                 warnings = [m for level, m in messages if level == "WARNING"]
-                self.assertIn(text, warnings)
+                self.assertIn(text.format(command=_command_line(_index_args(_FASTA, db, self.shards))), warnings)
                 self.assertFalse([m for m in warnings if "afterok:42" in m], warnings)  # the build runs in job 42
         messages = self.logged(lambda: self.built(env={"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1},
                                                   db=self.tmp / "w" / "db"))
@@ -2122,7 +2147,8 @@ class IndexRefusalTest(_SplitBuild):
                 find_run.assert_not_called()
                 widen.assert_not_called()
             self.assertEqual(message, f"'build sequences-index' runs as one process ({launch}): launch it once, "
-                                      f"directly in the batch script or with srun -n 1.")
+                                      f"directly in the batch script or with srun -n 1. The command: "
+                                      f"{_command_line(_index_args(self.fasta, self.db, self.shards))}")
 
     def test_i3_the_batch_step_of_a_multi_node_job(self):
         self.embed_run()
@@ -2132,9 +2158,11 @@ class IndexRefusalTest(_SplitBuild):
         self.assertIn("SLURM job 4711 holds 2 nodes", message)
         # No dependency on the job being refused: its afterok would never be met.
         self.assertTrue(message.endswith(
-            "Run it as its own one-node CPU job instead: once this job has ended, sbatch -C cpu -N 1 ... (no "
+            "Run it as its own one-node CPU job instead: once this job has ended, sbatch -C cpu -N 1 ... SCRIPT (no "
             "dependency is needed then); next time, submit it from the GPU job's script before the job's work starts: "
-            "sbatch -C cpu -N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."), message)
+            "sbatch -C cpu -N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT runs "
+            "this command, without srun, next time " + _NEXT_BUILD + ": "
+            + _command_line(_index_args(self.fasta, self.db, self.shards))), message)
         self.assertNotIn("afterok:4711", message)
 
     def test_i2_i3_before_the_logging_setup(self):
@@ -2521,10 +2549,13 @@ class _Sealing(_SplitBuild):
     no record."""
 
     def seal(self, *extra, fasta=_FASTA, shards=None, run_id="run", env=None):
-        """``build sequences-seal`` with ``env`` set; returns the result."""
+        """``build sequences-seal`` with ``env`` set and ``sys.argv`` as the console script sets it; returns the
+        result."""
+        args = _seal_args(fasta, shards or self.shards, run_id, *extra)
         with _esm3_spy() as esm3, mock.patch.object(ss, "prepare", side_effect=AssertionError("bundle fetched")), \
-                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}):
-            result = invoke(*_seal_args(fasta, shards or self.shards, run_id, *extra))
+                mock.patch.dict(os.environ, {name: str(value) for name, value in (env or {}).items()}), \
+                _as_fm_search(args):
+            result = invoke(*args)
         esm3.assert_not_called()
         return result
 
@@ -2814,7 +2845,6 @@ class SealTest(_Sealing):
                 self.assertIn(f"sealed {record['created_utc']} by FoldMatch {foldmatch.__version__}; embedded by "
                               + ("FoldMatch 0.7.0-old on" if codes else "a FoldMatch it does not record on"), start)
 
-
     def test_launch_warnings_after_the_logging_setup(self):
         """P9.I1: a one-task srun step of a multi-node job, and a one-node job with GPUs: sealed, with the WARNING of
         D34 logged once set_log_level has set up the logging."""
@@ -2824,7 +2854,8 @@ class SealTest(_Sealing):
                              "'build sequences-seal' runs in a one-task srun step of SLURM job 42, which holds 2 "
                              "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
                              "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
-                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."),
+                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT "
+                             "runs this command, without srun, " + _NEXT_BUILD + ": {command}"),
             "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_JOB_GPUS": "0,1"},
                      "SLURM job 42 has GPUs (SLURM_JOB_GPUS=0,1), which 'build sequences-seal' does not use: run it as "
                      "its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it on "
@@ -2836,6 +2867,7 @@ class SealTest(_Sealing):
                 shards.mkdir()
                 self.unrecorded(shards=shards)
                 events = self.setup_and_warnings(lambda: self.sealed("--min-res-n", 0, env=env, shards=shards))
+                text = text.format(command=_command_line(_seal_args(_FASTA, shards, "run", "--min-res-n", 0)))
                 self.assertEqual(events[:2], [("set_log_level", LogLevel.info), ("WARNING", text)], events)
 
 
@@ -2876,16 +2908,21 @@ class SealRefusalTest(_Sealing):
         """One of several ranks (I2), and the batch step of a multi-node job (I3): refused before the folder is
         read, and before set_log_level (P9.I1)."""
         self.unrecorded_run()
-        for env, text in (({"WORLD_SIZE": 2}, "'build sequences-seal' runs as one process (WORLD_SIZE=2): launch it "
-                                              "once, directly in the batch script or with srun -n 1."),
-                          ({"LOCAL_RANK": 1}, "(LOCAL_RANK=1)"),
-                          ({"SLURM_JOB_ID": 7, "SLURM_STEP_ID": 0, "SLURM_STEP_NUM_TASKS": 2},
-                           "(SLURM_STEP_NUM_TASKS=2)"),
-                          ({"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8},
-                           "SLURM job 4711 holds 2 nodes, and 'build sequences-seal' runs in one process")):
+        command = _command_line(_seal_args(self.fasta, self.shards, "run"))
+        i2 = f" The command: {command}"
+        i3 = f" SCRIPT. SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: {command}"
+        for env, text, end in (({"WORLD_SIZE": 2}, "'build sequences-seal' runs as one process (WORLD_SIZE=2): launch "
+                                                   "it once, directly in the batch script or with srun -n 1.", i2),
+                               ({"LOCAL_RANK": 1}, "(LOCAL_RANK=1)", i2),
+                               ({"SLURM_JOB_ID": 7, "SLURM_STEP_ID": 0, "SLURM_STEP_NUM_TASKS": 2},
+                                "(SLURM_STEP_NUM_TASKS=2)", i2),
+                               ({"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8},
+                                "SLURM job 4711 holds 2 nodes, and 'build sequences-seal' runs in one process", i3)):
             with self.subTest(env=env), mock.patch.object(split_run, "refuse_existing_record") as refuse, \
                     mock.patch.object(search, "set_log_level", side_effect=AssertionError("set_log_level")) as setup:
-                self.assertIn(text, self.refused_seal(env=env))
+                message = self.refused_seal(env=env)
+                self.assertIn(text, message)
+                self.assertTrue(message.endswith(end), message)
                 refuse.assert_not_called()
                 setup.assert_not_called()  # P9.I1: before set_log_level, which imports Lightning and so torch
 
@@ -3122,7 +3159,7 @@ class SealRefusalTest(_Sealing):
 
 
 # =====================================================================================================================
-# P9.I1: the launch checks of step 2 and the seal, before torch
+# P9.I1, P9.I2: the launch checks of step 2 and the seal, before torch, and the command line in their advice
 # =====================================================================================================================
 #: A sitecustomize for the commands that ``LaunchChecksBeforeTorchTest`` runs: any import of torch, Lightning, ESM or
 #: FAISS ends the process at once with status 97, naming the module, so that no ``except`` can hide it; one of them
@@ -3184,7 +3221,8 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
         module, _, attr = _fm_search_entry_point().partition(":")
         self.fm_search = self.tmp / "bin" / "fm-search"
         self.fm_search.write_text(_CONSOLE_SCRIPT.format(python=sys.executable, module=module, attr=attr))
-        self.fasta = Path(shutil.copyfile(_FASTA, self.tmp / "seqs.fasta"))
+        (self.tmp / "in put").mkdir()
+        self.fasta = Path(shutil.copyfile(_FASTA, self.tmp / "in put" / "it's seqs.fasta"))
         self.db = self.tmp / "out" / "db"
         self.env = {k: v for k, v in os.environ.items()
                     if k not in _LAUNCH_ENV and k not in _DDP_ENV and k not in _JOB_ENV
@@ -3195,15 +3233,28 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
         return {"build sequences-index": _index_args(self.fasta, self.db, self.tmp / "shards"),
                 "build sequences-seal": _seal_args(self.fasta, self.tmp / "shards", "run")}
 
-    def run_command(self, entry, args, hook=True, **env):
-        """``args`` through ``entry`` (``"fm-search"`` or ``"python -m"``) with ``env`` added, and with the hook unless
-        ``hook`` is false."""
-        program = ([sys.executable, str(self.fm_search)] if entry == "fm-search" else
-                   [sys.executable, "-m", "foldmatch.cli.search"])
+    @staticmethod
+    def program(entry) -> list:
+        """The command line of ``entry`` (``"fm-search"`` or ``"python -m"``) before the arguments."""
+        return [sys.executable, "-m", "foldmatch.cli.search"] if entry == "python -m" else ["fm-search"]
+
+    def command_env(self, hook=True, **env) -> dict:
+        """The environment of the commands, with ``env`` added, and with the hook unless ``hook`` is false."""
         path = ([str(self.tmp / "site")] if hook else []) + [_SRC] + \
             [p for p in [os.environ.get("PYTHONPATH")] if p]
-        return subprocess.run([*program, *map(str, args)], env={**self.env, "PYTHONPATH": os.pathsep.join(path), **env},
-                              cwd=self.tmp, capture_output=True, text=True, timeout=600)
+        return {**self.env, "PYTHONPATH": os.pathsep.join(path), **env}
+
+    def run_command(self, entry, args, hook=True, **env):
+        """``args`` through ``entry`` (``"fm-search"`` or ``"python -m"``) in ``self.tmp``, with ``env`` added, and with
+        the hook unless ``hook`` is false."""
+        program = [sys.executable, str(self.fm_search)] if entry == "fm-search" else self.program(entry)
+        return subprocess.run([*program, *map(str, args)], env=self.command_env(hook, **env), cwd=self.tmp,
+                              capture_output=True, text=True, timeout=600)
+
+    def in_this_folder(self, entry) -> list:
+        """What the I3 advice's command starts with when run through ``entry`` in ``self.tmp`` with absolute paths: a
+        cd to ``self.tmp``, except through the console script (P9.I2)."""
+        return [] if entry == "fm-search" else ["cd", os.path.realpath(self.tmp), "&&"]
 
     def assert_refused_before_torch(self, result, start):
         """Exit status 1 with one line on stderr, ``Error: `` and the refusal, which starts with ``start``."""
@@ -3229,7 +3280,44 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                                 f"instead: ")
                     self.assertIn("--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes", result.stderr)
                     self.assertNotIn("afterok:4711", result.stderr)
+                    # P9.I2: the command to run in the one-node job, last, as it was invoked, shell-quoted.
+                    lead = f"SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: "
+                    self.assertIn(lead, result.stderr)
+                    self.assertEqual(shlex.split(result.stderr.split(lead, 1)[1]),
+                                     [*self.in_this_folder(entry), *self.program(entry), *map(str, args)])
         self.assert_nothing_written()
+
+    def test_the_command_runs_from_another_folder(self):
+        """P9.I2: with relative paths, the I3 refusal's command starts with a cd to the folder the command ran in, so
+        that it runs from any folder (sbatch starts the one-node job in the folder it is submitted from). From another
+        folder it passes the paths' checks and reaches set_log_level, whose Lightning import the hook stops; without
+        the cd it is refused there with exit status 2. The I2 refusal's command, for the same batch script, has no
+        cd."""
+        self.fm_search.chmod(0o755)
+        elsewhere = self.tmp / "jobs"
+        elsewhere.mkdir()
+        env = self.command_env(PATH=os.pathsep.join([str(self.tmp / "bin"), os.environ.get("PATH", "")]))
+        relative = {"build sequences-index": _index_args("in put/it's seqs.fasta", "out/db", "shards"),
+                    "build sequences-seal": _seal_args("in put/it's seqs.fasta", "shards", "run")}
+        lead = f"SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: "
+        for command, args in relative.items():
+            with self.subTest(command=command):
+                result = self.run_command("fm-search", args, **self.I3_ENV)
+                self.assert_refused_before_torch(result, f"SLURM job 4711 holds 2 nodes, and '{command}' runs ")
+                line = result.stderr.split(lead, 1)[1].rstrip("\n")
+                self.assertEqual(shlex.split(line), ["cd", os.path.realpath(self.tmp), "&&", "fm-search", *args])
+                rerun = subprocess.run(["/bin/sh", "-c", line], cwd=elsewhere, env=env, capture_output=True, text=True,
+                                       timeout=600)
+                self.assertEqual((rerun.returncode, rerun.stderr), (97, "FORBIDDEN IMPORT: lightning\n"))
+                without_cd = subprocess.run(["/bin/sh", "-c", line.split(" && ", 1)[1]], cwd=elsewhere, env=env,
+                                            capture_output=True, text=True, timeout=600)
+                self.assertEqual(without_cd.returncode, 2, without_cd.stderr)
+                self.assertIn("Invalid value for '--fasta-file'", without_cd.stderr)
+                i2 = self.run_command("fm-search", args, WORLD_SIZE="2")
+                self.assert_refused_before_torch(i2, f"'{command}' runs as one process (WORLD_SIZE=2): ")
+                self.assertEqual(shlex.split(i2.stderr.split(" The command: ", 1)[1]), ["fm-search", *args])
+        self.assert_nothing_written()
+        self.assertEqual(list(elsewhere.iterdir()), [])
 
     def test_i2_before_torch(self):
         for command, args in self.commands().items():
@@ -3240,7 +3328,9 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                     result = self.run_command("fm-search", args, **env)
                     self.assert_refused_before_torch(
                         result, f"'{command}' runs as one process ({launch}): launch it once, directly in the batch "
-                                f"script or with srun -n 1.")
+                                f"script or with srun -n 1. The command: ")
+                    self.assertEqual(shlex.split(result.stderr.split(" The command: ", 1)[1]),
+                                     ["fm-search", *map(str, args)])
         self.assert_nothing_written()
 
     def test_the_hook_stops_lightning(self):
@@ -3269,9 +3359,108 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                     self.assertRegex(lines[0], "^" + prefix + re.escape(
                         f"'{command}' runs in a one-task srun step of SLURM job 42, which holds 2 nodes: the others "
                         f"stay allocated until it ends. Next time, run it as its own one-node CPU job: "))
+                    self.assertTrue(lines[0].endswith(f" SCRIPT runs this command, without srun, {_NEXT_BUILD}: "
+                                                      + shlex.join(["fm-search", *map(str, args), "--log-level",
+                                                                    level])), lines[0])
                     self.assertEqual(len([line for line in result.stderr.splitlines() if line.startswith("Error: ")]),
                                      1, result.stderr)
 
+
+
+class CommandLineTest(unittest.TestCase):
+    """P9.I2: ``_command_line``, the command line that the launch checks' advice ends with, from ``sys.argv`` and
+    ``sys.orig_argv``."""
+
+    ARGS = ["build", "sequences-index", "--fasta-file", "/data/my seqs.fasta", "--output-db", "it's/db",
+            "--from-shards=/scratch/$USER/shards", "--run-id", "60158326_2_0_ab12cd34", "--index-type", "ivf_pq"]
+
+    def command_line(self, argv, orig_argv=(), command="build sequences-index", **options):
+        with mock.patch.object(sys, "argv", list(argv)), mock.patch.object(sys, "orig_argv", list(orig_argv)):
+            return search._command_line(command, **options)
+
+    def test_the_console_script(self):
+        """``fm-search``, whatever path the console script ran from; every argument as given, shell-quoted."""
+        for argv0 in ("/env/bin/fm-search", "fm-search", "./fm-search"):
+            with self.subTest(argv0=argv0):
+                line = self.command_line([argv0, *self.ARGS], ["/env/bin/python3.12", argv0, *self.ARGS])
+                self.assertEqual(line, "fm-search build sequences-index --fasta-file '/data/my seqs.fasta' "
+                                       "--output-db 'it'\"'\"'s/db' '--from-shards=/scratch/$USER/shards' --run-id "
+                                       "60158326_2_0_ab12cd34 --index-type ivf_pq")
+                self.assertEqual(shlex.split(line), ["fm-search", *self.ARGS])
+        seal = ["build", "sequences-seal", "--fasta-file", "f.fasta", "--from-shards", "s", "--run-id", "r"]
+        self.assertEqual(self.command_line(["/env/bin/fm-search", *seal], command="build sequences-seal"),
+                         "fm-search " + shlex.join(seal))
+
+    def test_python_m(self):
+        """``python -m foldmatch.cli.search``, with the interpreter and its options as they were typed."""
+        program = ["python3", "-X", "importtime", "-m", "foldmatch.cli.search"]
+        line = self.command_line([search.__file__, *self.ARGS], [*program, *self.ARGS])
+        self.assertTrue(line.startswith("python3 -X importtime -m foldmatch.cli.search build sequences-index "), line)
+        self.assertEqual(shlex.split(line), [*program, *self.ARGS])
+
+    def test_other_invocations(self):
+        """What ``sys.orig_argv`` holds before the arguments."""
+        cases = {
+            "the module as a script": ("src/foldmatch/cli/search.py",
+                                       ["/usr/bin/python3", "src/foldmatch/cli/search.py"]),
+            "python -c": ("-c", ["python", "-c", "from foldmatch.cli.search import main; main()"]),
+            "a wrapper script": ("/home/me/run fm.py", ["python", "/home/me/run fm.py"]),
+        }
+        for case, (argv0, program) in cases.items():
+            with self.subTest(case=case):
+                line = self.command_line([argv0, *self.ARGS], [*program, *self.ARGS])
+                self.assertEqual(shlex.split(line), [*program, *self.ARGS])
+
+    def test_fallbacks(self):
+        """``fm-search`` when ``sys.orig_argv`` does not end with the arguments (``sys.argv`` rewritten), and
+        ``fm-search <command> ...`` when ``sys.argv`` does not run the command (the app called in-process)."""
+        line = self.command_line(["/x/search.py", *self.ARGS], ["python", "-m", "foldmatch.cli.search", "build"])
+        self.assertEqual(shlex.split(line), ["fm-search", *self.ARGS])
+        for argv in (["/venv/bin/pytest", "-q", "tests"], ["/env/bin/fm-search", "build", "sequences-seal"],
+                     ["/env/bin/fm-search"], []):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.command_line(argv, argv), "fm-search build sequences-index ...")
+        with mock.patch.object(sys, "argv", ["/venv/bin/pytest"]):
+            del sys.argv
+            self.assertEqual(search._command_line("build sequences-seal"), "fm-search build sequences-seal ...")
+
+    def test_in_another_job(self):
+        """For another job, which sbatch starts in the folder it is submitted from: a cd to this process's folder first
+        when the line depends on it, a relative --fasta-file, --output-db or --from-shards (as ``--option PATH`` or
+        ``--option=PATH``) or a program other than fm-search; not when that folder is gone."""
+        absolute = ["build", "sequences-index", "--fasta-file", "/data/s.fasta", "--output-db", "/db/x",
+                    "--from-shards=/scratch/shards", "--run-id", "r1", "--index-type", "ivf_pq"]
+        fm_search = ["/env/bin/fm-search", *absolute]
+        with mock.patch.object(os, "getcwd", return_value="/scratch/my run"):
+            for options in ({}, {"in_another_job": True}):
+                self.assertEqual(self.command_line(fm_search, **options), "fm-search " + shlex.join(absolute))
+            for k, value in ((3, "s.fasta"), (3, "../s.fasta"), (5, "db/x"), (5, "x"), (5, ""), (6, "--from-shards=s")):
+                argv = list(fm_search)
+                argv[k + 1] = value
+                with self.subTest(argv=argv):
+                    line = self.command_line(argv, in_another_job=True)
+                    self.assertEqual(shlex.split(line), ["cd", "/scratch/my run", "&&", "fm-search", *argv[1:]])
+                    self.assertTrue(line.startswith("cd '/scratch/my run' && fm-search build "), line)
+                    self.assertEqual(self.command_line(argv), shlex.join(["fm-search", *argv[1:]]))
+            equals = ["/env/bin/fm-search", *absolute[:2], "--fasta-file=s.fasta", *absolute[4:]]
+            self.assertEqual(shlex.split(self.command_line(equals, in_another_job=True))[:3],
+                             ["cd", "/scratch/my run", "&&"])
+            program = ["/usr/bin/python3", "-m", "foldmatch.cli.search"]
+            self.assertEqual(shlex.split(self.command_line([search.__file__, *absolute], [*program, *absolute],
+                                                           in_another_job=True)),
+                             ["cd", "/scratch/my run", "&&", *program, *absolute])
+            self.assertEqual(self.command_line(["/venv/bin/pytest"], in_another_job=True),
+                             "fm-search build sequences-index ...")
+        relative = ["/env/bin/fm-search", *absolute[:3], "s.fasta", *absolute[4:]]
+        with mock.patch.object(os, "getcwd", side_effect=FileNotFoundError(errno.ENOENT, "No such file or directory")):
+            self.assertEqual(self.command_line(relative, in_another_job=True), shlex.join(["fm-search", *relative[1:]]))
+
+    def test_a_newline(self):
+        """An argument holding a newline keeps it, inside its quotes: the line runs as given, but on two lines."""
+        args = ["build", "sequences-index", "--output-db", "/db/a\nb"]
+        line = self.command_line(["/env/bin/fm-search", *args])
+        self.assertEqual(line.count("\n"), 1, line)
+        self.assertEqual(shlex.split(line), ["fm-search", *args])
 
 # =====================================================================================================================
 # real ESM3 (CPU)

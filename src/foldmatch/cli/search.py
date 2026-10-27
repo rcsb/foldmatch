@@ -2205,7 +2205,10 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     allocated while one process works. A one-task srun step of such a job, and a one-node job with GPUs, get a
     WARNING. The advice never makes the command's job depend on this job, which it refuses (its ``afterok`` would
     never be met) or in which it keeps running: it is submitted once this job has ended, or next time from the GPU
-    job's script before its work, with ``$SLURM_JOB_ID`` left for that script's shell.
+    job's script before its work, with ``$SLURM_JOB_ID`` left for that script's shell. It ends with the command line to
+    run there (:func:`_command_line`, after a ``cd`` to this process's folder when the line depends on it); next time
+    with the paths and run id of the GPU job's build, whose run id step 1 derives from that job unless
+    ``FOLDMATCH_RUN_ID`` sets it, exported before the sbatch so that the CPU job has it too.
 
     It runs before ``set_log_level``, which imports Lightning and so torch: that import takes minutes from a cold file
     system on a compute node (P8b, N3 case E: I3 refused 118 s after the launch), and a refusal needs no logging
@@ -2217,7 +2220,7 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     if launch is not None:
         raise RefusalError(
             f"'{command}' runs as one process ({launch}): launch it once, directly in the batch script or with "
-            f"srun -n 1."
+            f"srun -n 1. The command: {_command_line(command)}"
         )
     job = os.environ.get("SLURM_JOB_ID", "").strip()
     if not job:
@@ -2225,16 +2228,21 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     nodes = _whole_number("SLURM_JOB_NUM_NODES")
     if nodes is not None and nodes > 1:
         chained = ("submit it from the GPU job's script before the job's work starts: sbatch -C cpu -N 1 "
-                   "--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ...")
+                   "--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT")
+        build = ("with the paths and run id of that job's build (export FOLDMATCH_RUN_ID=ID before the sbatch, and pass "
+                 "--run-id \"$FOLDMATCH_RUN_ID\")")
+        line = _command_line(command, in_another_job=True)
         if srun_step_id() is None:
             raise RefusalError(
                 f"SLURM job {job} holds {nodes} nodes, and '{command}' runs in one process on one of them: the others "
                 f"would stay allocated until it ends. Run it as its own one-node CPU job instead: once this job has "
-                f"ended, sbatch -C cpu -N 1 ... (no dependency is needed then); next time, {chained}"
+                f"ended, sbatch -C cpu -N 1 ... SCRIPT (no dependency is needed then); next time, {chained}. SCRIPT "
+                f"runs this command, without srun, next time {build}: {line}"
             )
         return [
             f"'{command}' runs in a one-task srun step of SLURM job {job}, which holds {nodes} nodes: the others stay "
-            f"allocated until it ends. Next time, run it as its own one-node CPU job: {chained}"
+            f"allocated until it ends. Next time, run it as its own one-node CPU job: {chained}. SCRIPT runs this "
+            f"command, without srun, {build}: {line}"
         ]
     gpus = [f"{name}={os.environ[name].strip()}" for name in ("SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS")
             if os.environ.get(name, "").strip()]
@@ -2245,6 +2253,59 @@ def _refuse_multi_node_job(command: str) -> List[str]:
             f"ivf_pq fits (flat and hnsw may not)."
         ]
     return []
+
+
+#: The options of 'build sequences-index' and 'build sequences-seal' that name a path (:func:`_command_line`).
+_PATH_OPTIONS = ("--fasta-file", "--output-db", "--from-shards")
+
+
+def _command_line(command: str, *, in_another_job: bool = False) -> str:
+    """This process's command line, to run ``command`` (``build sequences-index``, ...) again elsewhere: the
+    arguments of ``sys.argv``, as given, after the program as it was invoked, shell-quoted (:func:`shlex.join`).
+
+    Through the ``fm-search`` console script the program is ``fm-search``. Otherwise it is what ``sys.orig_argv``
+    holds before those arguments: ``python -m foldmatch.cli.search`` with the interpreter and its options as typed,
+    ``python path/to/script.py``, or ``python -c CODE``; ``fm-search`` when ``sys.orig_argv`` does not end with them.
+    When ``sys.argv`` does not run ``command`` (the app called in-process), ``fm-search <command> ...``.
+
+    ``in_another_job``: the line is for another job, which sbatch starts in the folder it is submitted from, so it
+    starts with ``cd <this process's folder> && `` when it depends on that folder: a relative ``--fasta-file``,
+    ``--output-db`` or ``--from-shards``, or a program other than ``fm-search`` (the interpreter, the script or
+    ``-m``'s module may be found from it). Not when that folder is gone (``os.getcwd`` fails).
+
+    An argument holding a newline keeps it, inside its quotes: the line still runs, but it is more than one line.
+    """
+    words = command.split()
+    argv = [str(argument) for argument in getattr(sys, "argv", ())]
+    arguments = argv[1:]
+    if arguments[:len(words)] != words:
+        return shlex.join(["fm-search", *words]) + " ..."
+    program = ["fm-search"]
+    if Path(argv[0]).name != "fm-search":
+        invoked = [str(argument) for argument in getattr(sys, "orig_argv", ())]
+        start = len(invoked) - len(arguments)
+        if start > 0 and invoked[start:] == arguments:
+            program = invoked[:start]
+    line = shlex.join(program + arguments)
+    if in_another_job and (program != ["fm-search"] or _relative_path_option(arguments)):
+        try:
+            line = f"cd {shlex.quote(os.getcwd())} && {line}"
+        except OSError:
+            pass
+    return line
+
+
+def _relative_path_option(arguments: List[str]) -> bool:
+    """Whether ``arguments`` give one of :data:`_PATH_OPTIONS` a relative path (``--option PATH`` or
+    ``--option=PATH``)."""
+    for k, argument in enumerate(arguments):
+        option, equals, value = argument.partition("=")
+        if option in _PATH_OPTIONS:
+            if not equals:
+                value = arguments[k + 1] if k + 1 < len(arguments) else ""
+            if not os.path.isabs(value):
+                return True
+    return False
 
 
 def _split_code_store(record: dict, record_path: Path, *, residue_codes: Optional[bool],
