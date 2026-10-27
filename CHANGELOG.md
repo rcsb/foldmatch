@@ -161,9 +161,16 @@ While the major version is `0`, breaking changes are released in a minor bump.
   and pass the same value to step 2 as its `--run-id`. Step 2 and the seal
   refuse to run as one of several ranks, or in the batch step of a job of more
   than one node, and warn in a one-task srun step of such a job and in a
-  one-node job with GPUs. Step 2 sets FAISS's OpenMP threads to the physical
-  cores it may use (and the threads of the BLAS libraries threadpoolctl finds,
-  which it logs), unless `OMP_NUM_THREADS` (for BLAS also
+  one-node job with GPUs. They refuse within seconds of the launch, before
+  Lightning and torch are imported (which can take minutes on a compute
+  node). The refusal in the batch step, like the srun step's warning, ends
+  with the command line to run in the one-node CPU job, as it was invoked
+  (`fm-search ...` through the console script), after a `cd` to the folder
+  it ran in when the line depends on it (a relative path, or `python -m`);
+  the refusal as one of several ranks ends with the command to launch
+  once. Step 2 sets FAISS's OpenMP threads to the
+  physical cores it may use (and the threads of the BLAS libraries
+  threadpoolctl finds, which it logs), unless `OMP_NUM_THREADS` (for BLAS also
   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` or `VECLIB_MAXIMUM_THREADS`) is
   set; on macOS it leaves them as they are. On Linux, FAISS's own OpenBLAS,
   in the `faiss-cpu` wheel, is one of those libraries: an OpenMP build, it
