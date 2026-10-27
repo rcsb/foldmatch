@@ -13,8 +13,9 @@ one-shot's database (``assert_same_database``), its threads, and each of its ref
 under the ESM3 spy with ``scoring_system.prepare`` refusing. ``SealOptionTest``, ``SealTest`` and ``SealRefusalTest``
 (P8b.5) check the recovery, ``build sequences-seal``, under the same spies: its options, that the shards a failed
 one-shot kept or a step 1 left without a record are sealed and then built into the one-shot's database, and each of its
-refusals S1-S11, which write nothing. ``RealEsm3SplitTest`` runs both builds with the real CPU pass, and
-``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
+refusals S1-S11, which write nothing. ``LaunchChecksBeforeTorchTest`` (P9.I1) runs step 2 and the seal as commands
+with a hook that ends the process at any import of torch or Lightning: I2 and I3 refuse before it. ``RealEsm3SplitTest``
+runs both builds with the real CPU pass, and ``TwoRankSplitSmoke`` (slow) both builds on two real ranks as commands.
 """
 import dataclasses
 import errno
@@ -55,7 +56,7 @@ from foldmatch.search.faiss_database import FaissEmbeddingDatabase
 from foldmatch.search.residue_code_store import CodeStoreValidationError, ResidueCodeStore
 from foldmatch.search.residue_shards import META_PASS, pass_record, read_shard_info
 from foldmatch.search.sequence_store import SequenceStore
-from foldmatch.types.api_types import Accelerator, IndexConfig, IndexType, Strategy
+from foldmatch.types.api_types import Accelerator, IndexConfig, IndexType, LogLevel, Strategy
 from foldmatch.utils.esm.loaders import ESM_REVISION
 from foldmatch.utils.sequence import preflight_fasta
 from test_cli_residue_codes import A4_XCPU_BITS, OTHER_ENCODING, PLAN_HELP, _DDP_ENV, _DDP_ENV_PREFIXES, \
@@ -1359,6 +1360,25 @@ class _SplitBuild(_WithBundle):
             call()
         return [(record.levelname, record.getMessage()) for record in logs.records]
 
+    def setup_and_warnings(self, call):
+        """``call()``'s ``set_log_level`` calls, as ``("set_log_level", level)``, and root-logger WARNINGs, as
+        ``("WARNING", message)``, in the order they came."""
+        events = []
+
+        class Recorder(logging.Handler):
+            def emit(self, record):
+                events.append((record.levelname, record.getMessage()))
+
+        root, recorder = logging.getLogger(), Recorder(level=logging.WARNING)
+        root.addHandler(recorder)
+        try:
+            with mock.patch.object(search, "set_log_level",
+                                   side_effect=lambda level: events.append(("set_log_level", level))):
+                call()
+        finally:
+            root.removeHandler(recorder)
+        return events
+
 
 class IndexOptionTest(_Tmp):
 
@@ -1789,6 +1809,19 @@ class IndexStepTest(_SplitBuild):
                                                   db=self.tmp / "w" / "db"))
         self.assertFalse([m for level, m in messages if level == "WARNING" and "SLURM job" in m])
 
+    def test_launch_warnings_after_the_logging_setup(self):
+        """P9.I1: the launch checks run before set_log_level, and their WARNING is logged once it has set up the
+        logging, so in its format."""
+        self.embed()
+        for k, env in enumerate(({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 2, "SLURM_STEP_ID": 3,
+                                  "SLURM_STEP_NUM_TASKS": 1},
+                                 {"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_GPUS_ON_NODE": 4})):
+            with self.subTest(env=env):
+                events = self.setup_and_warnings(lambda: self.built(env=env, db=self.tmp / f"w{k}" / "db"))
+                launch = [event for event in events if "SLURM job 42" in event[1]]
+                self.assertEqual(len(launch), 1, events)
+                self.assertEqual(events[:2], [("set_log_level", LogLevel.info), launch[0]])
+
     def test_offline_with_an_empty_hf_cache(self):
         """Step 2 as a command, with HF_HUB_OFFLINE=1 and an empty Hugging Face cache: the code store is built from
         the registry entry alone."""
@@ -2103,6 +2136,15 @@ class IndexRefusalTest(_SplitBuild):
             "dependency is needed then); next time, submit it from the GPU job's script before the job's work starts: "
             "sbatch -C cpu -N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."), message)
         self.assertNotIn("afterok:4711", message)
+
+    def test_i2_i3_before_the_logging_setup(self):
+        """P9.I1: I2 and I3 refuse before set_log_level, which imports Lightning and so torch."""
+        self.embed_run()
+        for env in ({"WORLD_SIZE": 2}, {"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8}):
+            with self.subTest(env=env), mock.patch.object(search, "set_log_level",
+                                                          side_effect=AssertionError("set_log_level")) as setup:
+                self.refused_index(env=env)
+                setup.assert_not_called()
 
     def test_i4_no_run_with_a_record(self):
         record = self.embed_run()
@@ -2773,6 +2815,30 @@ class SealTest(_Sealing):
                               + ("FoldMatch 0.7.0-old on" if codes else "a FoldMatch it does not record on"), start)
 
 
+    def test_launch_warnings_after_the_logging_setup(self):
+        """P9.I1: a one-task srun step of a multi-node job, and a one-node job with GPUs: sealed, with the WARNING of
+        D34 logged once set_log_level has set up the logging."""
+        cases = {
+            "an srun step": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 2, "SLURM_STEP_ID": 3,
+                              "SLURM_STEP_NUM_TASKS": 1, "SLURM_NTASKS": 8},
+                             "'build sequences-seal' runs in a one-task srun step of SLURM job 42, which holds 2 "
+                             "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
+                             "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
+                             "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ..."),
+            "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_JOB_GPUS": "0,1"},
+                     "SLURM job 42 has GPUs (SLURM_JOB_GPUS=0,1), which 'build sequences-seal' does not use: run it as "
+                     "its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it on "
+                     "one GPU node, where ivf_pq fits (flat and hnsw may not)."),
+        }
+        for k, (case, (env, text)) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                shards = self.tmp / f"w{k}"
+                shards.mkdir()
+                self.unrecorded(shards=shards)
+                events = self.setup_and_warnings(lambda: self.sealed("--min-res-n", 0, env=env, shards=shards))
+                self.assertEqual(events[:2], [("set_log_level", LogLevel.info), ("WARNING", text)], events)
+
+
 class SealRefusalTest(_Sealing):
 
     def setUp(self):
@@ -2808,7 +2874,7 @@ class SealRefusalTest(_Sealing):
 
     def test_s2_the_launch(self):
         """One of several ranks (I2), and the batch step of a multi-node job (I3): refused before the folder is
-        read."""
+        read, and before set_log_level (P9.I1)."""
         self.unrecorded_run()
         for env, text in (({"WORLD_SIZE": 2}, "'build sequences-seal' runs as one process (WORLD_SIZE=2): launch it "
                                               "once, directly in the batch script or with srun -n 1."),
@@ -2817,9 +2883,11 @@ class SealRefusalTest(_Sealing):
                            "(SLURM_STEP_NUM_TASKS=2)"),
                           ({"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8},
                            "SLURM job 4711 holds 2 nodes, and 'build sequences-seal' runs in one process")):
-            with self.subTest(env=env), mock.patch.object(split_run, "refuse_existing_record") as refuse:
+            with self.subTest(env=env), mock.patch.object(split_run, "refuse_existing_record") as refuse, \
+                    mock.patch.object(search, "set_log_level", side_effect=AssertionError("set_log_level")) as setup:
                 self.assertIn(text, self.refused_seal(env=env))
                 refuse.assert_not_called()
+                setup.assert_not_called()  # P9.I1: before set_log_level, which imports Lightning and so torch
 
     def test_s3_a_record_or_tmp(self):
         """A run with a record: use it. A record whose writer stopped (.tmp only): delete it, then seal again."""
@@ -3051,6 +3119,158 @@ class SealRefusalTest(_Sealing):
         self.assertIn("File exists", message)
         self.assertEqual((self.shards / "emb_run.run.json").read_text(), "another process\n")
         self.assertEqual(sorted(p.name for p in self.shards.iterdir()), ["emb_run-0.parquet", "emb_run.run.json"])
+
+
+# =====================================================================================================================
+# P9.I1: the launch checks of step 2 and the seal, before torch
+# =====================================================================================================================
+#: A sitecustomize for the commands that ``LaunchChecksBeforeTorchTest`` runs: any import of torch, Lightning, ESM or
+#: FAISS ends the process at once with status 97, naming the module, so that no ``except`` can hide it; one of them
+#: already imported when the interpreter starts (by a ``.pth`` file) ends it with status 98.
+_NO_HEAVY_IMPORTS = r"""
+import os, sys
+_BLOCKED = ("torch", "lightning", "lightning_fabric", "pytorch_lightning", "esm", "faiss")
+_loaded = sorted(name for name in sys.modules if name.partition(".")[0] in _BLOCKED)
+if _loaded:
+    sys.stderr.write(f"FORBIDDEN IMPORT at start-up: {', '.join(_loaded)}\n")
+    sys.stderr.flush()
+    os._exit(98)
+class _NoHeavyImports:
+    def find_spec(self, name, path=None, target=None):
+        if name.partition(".")[0] in _BLOCKED:
+            sys.stderr.write(f"FORBIDDEN IMPORT: {name}\n")
+            sys.stderr.flush()
+            os._exit(97)
+        return None
+sys.meta_path.insert(0, _NoHeavyImports())
+"""
+#: The console script that pip and uv install for a ``[project.scripts]`` entry point.
+_CONSOLE_SCRIPT = """\
+#!{python}
+import sys
+from {module} import {attr}
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit({attr}())
+"""
+
+
+def _fm_search_entry_point() -> str:
+    """``fm-search``'s entry point, from ``pyproject.toml`` when the tests run in a source tree."""
+    path = Path(_SRC).parent / "pyproject.toml"
+    if not path.is_file():
+        return "foldmatch.cli.search:main"
+    import tomllib
+    return tomllib.loads(path.read_text())["project"]["scripts"]["fm-search"]
+
+
+class LaunchChecksBeforeTorchTest(unittest.TestCase):
+    """``build sequences-index`` and ``build sequences-seal`` as commands, through an ``fm-search`` console script of
+    the package's entry point and through ``python -m foldmatch.cli.search``, with ``_NO_HEAVY_IMPORTS``: I2 and I3
+    refuse with exit status 1 and their whole message on stderr, before torch or Lightning is imported (P8b, N3 case
+    E: I3 came 118 s after the launch, after ``set_log_level``'s Lightning import). Without a launch refusal the hook
+    stops the commands at that import (the control). The WARNING of a one-task srun step of a multi-node job, without
+    the hook, comes in the logging format ``set_log_level`` sets up."""
+
+    I3_ENV = {"SLURM_JOB_ID": "4711", "SLURM_JOB_NUM_NODES": "2", "SLURM_NTASKS": "8"}
+    SRUN_STEP_ENV = {"SLURM_JOB_ID": "42", "SLURM_JOB_NUM_NODES": "2", "SLURM_STEP_ID": "3",
+                     "SLURM_STEP_NUM_TASKS": "1", "SLURM_NTASKS": "8"}
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name in ("site", "bin", "shards"):
+            (self.tmp / name).mkdir()
+        (self.tmp / "site" / "sitecustomize.py").write_text(_NO_HEAVY_IMPORTS)
+        module, _, attr = _fm_search_entry_point().partition(":")
+        self.fm_search = self.tmp / "bin" / "fm-search"
+        self.fm_search.write_text(_CONSOLE_SCRIPT.format(python=sys.executable, module=module, attr=attr))
+        self.fasta = Path(shutil.copyfile(_FASTA, self.tmp / "seqs.fasta"))
+        self.db = self.tmp / "out" / "db"
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in _LAUNCH_ENV and k not in _DDP_ENV and k not in _JOB_ENV
+                    and not k.startswith(_DDP_ENV_PREFIXES)}
+        self.env["HF_HUB_OFFLINE"] = "1"
+
+    def commands(self) -> dict:
+        return {"build sequences-index": _index_args(self.fasta, self.db, self.tmp / "shards"),
+                "build sequences-seal": _seal_args(self.fasta, self.tmp / "shards", "run")}
+
+    def run_command(self, entry, args, hook=True, **env):
+        """``args`` through ``entry`` (``"fm-search"`` or ``"python -m"``) with ``env`` added, and with the hook unless
+        ``hook`` is false."""
+        program = ([sys.executable, str(self.fm_search)] if entry == "fm-search" else
+                   [sys.executable, "-m", "foldmatch.cli.search"])
+        path = ([str(self.tmp / "site")] if hook else []) + [_SRC] + \
+            [p for p in [os.environ.get("PYTHONPATH")] if p]
+        return subprocess.run([*program, *map(str, args)], env={**self.env, "PYTHONPATH": os.pathsep.join(path), **env},
+                              cwd=self.tmp, capture_output=True, text=True, timeout=600)
+
+    def assert_refused_before_torch(self, result, start):
+        """Exit status 1 with one line on stderr, ``Error: `` and the refusal, which starts with ``start``."""
+        self.assertNotIn("FORBIDDEN IMPORT", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith(f"Error: {start}"), result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+        self.assertTrue(result.stderr.endswith("\n"), result.stderr)
+
+    def assert_nothing_written(self):
+        self.assertFalse(self.db.parent.exists())
+        self.assertEqual(list((self.tmp / "shards").iterdir()), [])
+
+    def test_i3_before_torch(self):
+        for entry in ("fm-search", "python -m"):
+            for command, args in self.commands().items():
+                with self.subTest(entry=entry, command=command):
+                    result = self.run_command(entry, args, **self.I3_ENV)
+                    self.assert_refused_before_torch(
+                        result, f"SLURM job 4711 holds 2 nodes, and '{command}' runs in one process on one of them: "
+                                f"the others would stay allocated until it ends. Run it as its own one-node CPU job "
+                                f"instead: ")
+                    self.assertIn("--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes", result.stderr)
+                    self.assertNotIn("afterok:4711", result.stderr)
+        self.assert_nothing_written()
+
+    def test_i2_before_torch(self):
+        for command, args in self.commands().items():
+            for env, launch in (({"WORLD_SIZE": "2"}, "WORLD_SIZE=2"),
+                                ({"SLURM_JOB_ID": "7", "SLURM_STEP_ID": "0", "SLURM_STEP_NUM_TASKS": "4",
+                                  "SLURM_JOB_NUM_NODES": "2"}, "SLURM_STEP_NUM_TASKS=4")):
+                with self.subTest(command=command, env=env):
+                    result = self.run_command("fm-search", args, **env)
+                    self.assert_refused_before_torch(
+                        result, f"'{command}' runs as one process ({launch}): launch it once, directly in the batch "
+                                f"script or with srun -n 1.")
+        self.assert_nothing_written()
+
+    def test_the_hook_stops_lightning(self):
+        """The control: without a launch refusal, each command, through each entry, reaches set_log_level, whose
+        Lightning import the hook stops."""
+        for entry in ("fm-search", "python -m"):
+            for command, args in self.commands().items():
+                with self.subTest(entry=entry, command=command):
+                    result = self.run_command(entry, args)
+                    self.assertEqual(result.returncode, 97, result.stderr)
+                    self.assertTrue(result.stderr.startswith("FORBIDDEN IMPORT: lightning\n"), result.stderr)
+
+    def test_the_srun_step_warning_in_the_logging_format(self):
+        """Without the hook: the WARNING of a one-task srun step of a multi-node job, in the format of --log-level info
+        and of --log-level debug; then the empty shards folder is refused."""
+        formats = {"info": r"\[proc-0\] ",
+                   "debug": r"> \d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} - \[proc-0\] - WARNING - search\.py:\d+ - "}
+        for command, args in self.commands().items():
+            for level, prefix in formats.items():
+                with self.subTest(command=command, level=level):
+                    result = self.run_command("fm-search", [*args, "--log-level", level], hook=False,
+                                              **self.SRUN_STEP_ENV)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    lines = [line for line in result.stderr.splitlines() if "one-task srun step" in line]
+                    self.assertEqual(len(lines), 1, result.stderr)
+                    self.assertRegex(lines[0], "^" + prefix + re.escape(
+                        f"'{command}' runs in a one-task srun step of SLURM job 42, which holds 2 nodes: the others "
+                        f"stay allocated until it ends. Next time, run it as its own one-node CPU job: "))
+                    self.assertEqual(len([line for line in result.stderr.splitlines() if line.startswith("Error: ")]),
+                                     1, result.stderr)
 
 
 # =====================================================================================================================

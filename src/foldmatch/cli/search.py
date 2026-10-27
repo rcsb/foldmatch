@@ -692,15 +692,19 @@ def build_sequences_index(
 
     # Every refusal is a RefusalError, in both modes (D32). Up to the index phase nothing is written but the build lock
     # (and the database's folder when it is missing), which a refusal removes.
-    set_log_level(log_level)
-    start = time.monotonic()
+    # The launch checks come before set_log_level, which imports Lightning and so torch (minutes from a cold file
+    # system on a compute node), so that I2 and I3 refuse within seconds; their WARNINGs wait for the logging setup.
     from foldmatch.utils.dist import is_run_id
     if run_id is not None and not is_run_id(run_id):
         raise typer.BadParameter(
             f"{run_id!r} is not a run id: letters, digits, '.', '_' and '-' only, "
             f"starting with a letter or digit.", param_hint="--run-id"
         )
-    _refuse_multi_node_job("build sequences-index")
+    launch_warnings = _refuse_multi_node_job("build sequences-index")
+    set_log_level(log_level)
+    start = time.monotonic()
+    for message in launch_warnings:
+        logging.warning(message)
     # Before torch, FAISS or pyarrow start a thread pool: the threads they start inherit this mask (D29).
     from foldmatch.search.alignment import _expand_cpu_affinity
     _expand_cpu_affinity(purpose="the index phase")
@@ -771,14 +775,17 @@ def build_sequences_seal(
     FASTA, then writes their record, sealed, so that 'build sequences-index' can build from them. No ESM3 or GPU."""
 
     # Every refusal is a RefusalError, in both modes (D32). Nothing is written but the record, last.
-    set_log_level(log_level)
+    # The launch checks come before set_log_level, as in 'build sequences-index'.
     from foldmatch.utils.dist import is_run_id
     if not is_run_id(run_id):
         raise typer.BadParameter(
             f"{run_id!r} is not a run id: letters, digits, '.', '_' and '-' only, "
             f"starting with a letter or digit.", param_hint="--run-id"
         )
-    _refuse_multi_node_job("build sequences-seal")
+    launch_warnings = _refuse_multi_node_job("build sequences-seal")
+    set_log_level(log_level)
+    for message in launch_warnings:
+        logging.warning(message)
 
     from foldmatch.search import split_run
     with _refusals():
@@ -2189,9 +2196,9 @@ def _stat_text(stat) -> str:
     return f"{stat.bytes} bytes, mtime_ns {stat.mtime_ns}, inode {stat.ino}"
 
 
-def _refuse_multi_node_job(command: str) -> None:
+def _refuse_multi_node_job(command: str) -> List[str]:
     """The launch checks of a command that runs as one process (``build sequences-index``, ``build sequences-seal``),
-    from the launch environment alone.
+    from the launch environment alone; returns the WARNINGs, for the caller to log.
 
     Refused: a process that is one of several ranks (I2, :func:`~foldmatch.utils.dist.multi_rank_launch`, which names
     the variable), and the batch step of a SLURM job of more than one node (I3, D34): the job's other nodes would stay
@@ -2199,6 +2206,11 @@ def _refuse_multi_node_job(command: str) -> None:
     WARNING. The advice never makes the command's job depend on this job, which it refuses (its ``afterok`` would
     never be met) or in which it keeps running: it is submitted once this job has ended, or next time from the GPU
     job's script before its work, with ``$SLURM_JOB_ID`` left for that script's shell.
+
+    It runs before ``set_log_level``, which imports Lightning and so torch: that import takes minutes from a cold file
+    system on a compute node (P8b, N3 case E: I3 refused 118 s after the launch), and a refusal needs no logging
+    (``main`` prints it). The checks import only :mod:`foldmatch.utils.dist`, which imports only the standard library.
+    The WARNINGs are returned instead of logged, so that they go through the logging ``set_log_level`` sets up.
     """
     from foldmatch.utils.dist import _whole_number, multi_rank_launch, srun_step_id
     launch = multi_rank_launch()
@@ -2209,7 +2221,7 @@ def _refuse_multi_node_job(command: str) -> None:
         )
     job = os.environ.get("SLURM_JOB_ID", "").strip()
     if not job:
-        return
+        return []
     nodes = _whole_number("SLURM_JOB_NUM_NODES")
     if nodes is not None and nodes > 1:
         chained = ("submit it from the GPU job's script before the job's work starts: sbatch -C cpu -N 1 "
@@ -2220,19 +2232,19 @@ def _refuse_multi_node_job(command: str) -> None:
                 f"would stay allocated until it ends. Run it as its own one-node CPU job instead: once this job has "
                 f"ended, sbatch -C cpu -N 1 ... (no dependency is needed then); next time, {chained}"
             )
-        logging.warning(
+        return [
             f"'{command}' runs in a one-task srun step of SLURM job {job}, which holds {nodes} nodes: the others stay "
             f"allocated until it ends. Next time, run it as its own one-node CPU job: {chained}"
-        )
-        return
+        ]
     gpus = [f"{name}={os.environ[name].strip()}" for name in ("SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS")
             if os.environ.get(name, "").strip()]
     if gpus:
-        logging.warning(
+        return [
             f"SLURM job {job} has GPUs ({', '.join(gpus)}), which '{command}' does not use: run it as its own job on a "
             f"CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it on one GPU node, where "
             f"ivf_pq fits (flat and hnsw may not)."
-        )
+        ]
+    return []
 
 
 def _split_code_store(record: dict, record_path: Path, *, residue_codes: Optional[bool],
