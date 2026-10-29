@@ -2213,9 +2213,10 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     WARNING. The advice never makes the command's job depend on this job, which it refuses (its ``afterok`` would
     never be met) or in which it keeps running: it is submitted once this job has ended, or next time from the GPU
     job's script before its work, with ``$SLURM_JOB_ID`` left for that script's shell. It ends with the command line to
-    run there (:func:`_command_line`, after a ``cd`` to this process's folder when the line depends on it); next time
-    with the paths and run id of the GPU job's build, whose run id step 1 derives from that job unless
-    ``FOLDMATCH_RUN_ID`` sets it, exported before the sbatch so that the CPU job has it too.
+    run there (:func:`_command_line`, after a ``cd`` to this process's folder when the line depends on it), on a line of
+    its own after :data:`_COMMAND_INDENT`, so that it can be selected and copied whole; next time with the paths and
+    run id of the GPU job's build, whose run id step 1 derives from that job unless ``FOLDMATCH_RUN_ID`` sets it,
+    exported before the sbatch so that the CPU job has it too.
 
     It runs before ``set_log_level`` and before torch or Lightning is imported, which takes minutes from a cold file
     system on a compute node (P8b, N3 case E: I3 refused 118 s after the launch, after ``set_log_level``'s Lightning
@@ -2228,7 +2229,7 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     if launch is not None:
         raise RefusalError(
             f"'{command}' runs as one process ({launch}): launch it once, directly in the batch script or with "
-            f"srun -n 1. The command: {_command_line(command)}"
+            f"srun -n 1. The command:{_COMMAND_INDENT}{_command_line(command)}"
         )
     job = os.environ.get("SLURM_JOB_ID", "").strip()
     if not job:
@@ -2245,12 +2246,12 @@ def _refuse_multi_node_job(command: str) -> List[str]:
                 f"SLURM job {job} holds {nodes} nodes, and '{command}' runs in one process on one of them: the others "
                 f"would stay allocated until it ends. Run it as its own one-node CPU job instead: once this job has "
                 f"ended, sbatch -C cpu -N 1 ... SCRIPT (no dependency is needed then); next time, {chained}. SCRIPT "
-                f"runs this command, without srun, next time {build}: {line}"
+                f"runs this command, without srun, next time {build}:{_COMMAND_INDENT}{line}"
             )
         return [
             f"'{command}' runs in a one-task srun step of SLURM job {job}, which holds {nodes} nodes: the others stay "
             f"allocated until it ends. Next time, run it as its own one-node CPU job: {chained}. SCRIPT runs this "
-            f"command, without srun, {build}: {line}"
+            f"command, without srun, {build}:{_COMMAND_INDENT}{line}"
         ]
     gpus = [f"{name}={os.environ[name].strip()}" for name in ("SLURM_GPUS_ON_NODE", "SLURM_JOB_GPUS")
             if os.environ.get(name, "").strip()]
@@ -2262,6 +2263,10 @@ def _refuse_multi_node_job(command: str) -> List[str]:
         ]
     return []
 
+
+#: What comes before the command line that the launch checks' advice ends with: a line of its own, indented, under the
+#: ``Error:`` line of a refusal or the log line of a WARNING (:func:`_refuse_multi_node_job`).
+_COMMAND_INDENT = "\n    "
 
 #: The options of 'build sequences-index' and 'build sequences-seal' that name a path (:func:`_command_line`).
 _PATH_OPTIONS = ("--fasta-file", "--output-db", "--from-shards")

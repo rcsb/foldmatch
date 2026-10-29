@@ -608,7 +608,7 @@ class RefusalTest(_DbCase):
         self.assertFalse(out.exists())
 
     def test_exit_status_of_a_refusal(self):
-        """fm-search prints a refusal on one line and exits 1 (D20)."""
+        """fm-search prints this refusal on one line and exits 1 (D20)."""
         db = self.database("plain")
         argv = ["fm-search", *map(str, _query_args(db, _FASTA, self.qshards, self.tmp / "o.tsv", *_esm()))]
         stderr = self.enterContext(mock.patch("sys.stderr", new_callable=io.StringIO))

@@ -1818,7 +1818,7 @@ class IndexStepTest(_SplitBuild):
                              "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
                              "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
                              "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT "
-                             "runs this command, without srun, " + _NEXT_BUILD + ": {command}"),
+                             "runs this command, without srun, " + _NEXT_BUILD + ":\n    {command}"),
             "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_GPUS_ON_NODE": 4},
                      "SLURM job 42 has GPUs (SLURM_GPUS_ON_NODE=4), which 'build sequences-index' does not use: run it "
                      "as its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it "
@@ -2148,7 +2148,7 @@ class IndexRefusalTest(_SplitBuild):
                 find_run.assert_not_called()
                 widen.assert_not_called()
             self.assertEqual(message, f"'build sequences-index' runs as one process ({launch}): launch it once, "
-                                      f"directly in the batch script or with srun -n 1. The command: "
+                                      f"directly in the batch script or with srun -n 1. The command:\n    "
                                       f"{_command_line(_index_args(self.fasta, self.db, self.shards))}")
 
     def test_i3_the_batch_step_of_a_multi_node_job(self):
@@ -2162,7 +2162,7 @@ class IndexRefusalTest(_SplitBuild):
             "Run it as its own one-node CPU job instead: once this job has ended, sbatch -C cpu -N 1 ... SCRIPT (no "
             "dependency is needed then); next time, submit it from the GPU job's script before the job's work starts: "
             "sbatch -C cpu -N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT runs "
-            "this command, without srun, next time " + _NEXT_BUILD + ": "
+            "this command, without srun, next time " + _NEXT_BUILD + ":\n    "
             + _command_line(_index_args(self.fasta, self.db, self.shards))), message)
         self.assertNotIn("afterok:4711", message)
 
@@ -2856,7 +2856,7 @@ class SealTest(_Sealing):
                              "nodes: the others stay allocated until it ends. Next time, run it as its own one-node "
                              "CPU job: submit it from the GPU job's script before the job's work starts: sbatch -C cpu "
                              "-N 1 --dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes ... SCRIPT. SCRIPT "
-                             "runs this command, without srun, " + _NEXT_BUILD + ": {command}"),
+                             "runs this command, without srun, " + _NEXT_BUILD + ":\n    {command}"),
             "GPUs": ({"SLURM_JOB_ID": 42, "SLURM_JOB_NUM_NODES": 1, "SLURM_JOB_GPUS": "0,1"},
                      "SLURM job 42 has GPUs (SLURM_JOB_GPUS=0,1), which 'build sequences-seal' does not use: run it as "
                      "its own job on a CPU node (sbatch -C cpu -N 1 ...); a project with GPU hours only may run it on "
@@ -2910,8 +2910,8 @@ class SealRefusalTest(_Sealing):
         read, and before set_log_level (P9.I1)."""
         self.unrecorded_run()
         command = _command_line(_seal_args(self.fasta, self.shards, "run"))
-        i2 = f" The command: {command}"
-        i3 = f" SCRIPT. SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: {command}"
+        i2 = f" The command:\n    {command}"
+        i3 = f" SCRIPT. SCRIPT runs this command, without srun, next time {_NEXT_BUILD}:\n    {command}"
         for env, text, end in (({"WORLD_SIZE": 2}, "'build sequences-seal' runs as one process (WORLD_SIZE=2): launch "
                                                    "it once, directly in the batch script or with srun -n 1.", i2),
                                ({"LOCAL_RANK": 1}, "(LOCAL_RANK=1)", i2),
@@ -3249,16 +3249,22 @@ class _HookedCommands:
         cd to ``self.tmp``, except through the console script (P9.I2)."""
         return [] if entry == "fm-search" else ["cd", os.path.realpath(self.tmp), "&&"]
 
-    def assert_refused_before_torch(self, result, start, logged=0):
-        """Exit status 1 with ``logged`` log lines on stderr, then one line, ``Error: `` and the refusal, which starts
-        with ``start``."""
+    def assert_refused_before_torch(self, result, start, logged=0, command=False):
+        """Exit status 1 with ``logged`` log lines on stderr, then ``Error: `` and the refusal, which starts with
+        ``start``: one line, or with ``command`` that line and the command line the launch checks' advice ends with, on
+        a line of its own indented by four spaces (P9.M). Returns the refusal's lines, the command line without its
+        indent."""
         self.assertNotIn("FORBIDDEN IMPORT", result.stderr)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
         lines = result.stderr.split("\n")
-        self.assertEqual(len(lines), logged + 2, result.stderr)
+        self.assertEqual(len(lines), logged + 2 + command, result.stderr)
         self.assertTrue(lines[logged].startswith(f"Error: {start}"), result.stderr)
         self.assertEqual(lines[-1], "", result.stderr)
+        if not command:
+            return [lines[logged]]
+        self.assertRegex(lines[logged + 1], "^    [^ ]", result.stderr)
+        return [lines[logged], lines[logged + 1][4:]]
 
 
 class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
@@ -3294,16 +3300,17 @@ class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
             for command, args in self.commands().items():
                 with self.subTest(entry=entry, command=command):
                     result = self.run_command(entry, args, **self.I3_ENV)
-                    self.assert_refused_before_torch(
+                    error, line = self.assert_refused_before_torch(
                         result, f"SLURM job 4711 holds 2 nodes, and '{command}' runs in one process on one of them: "
                                 f"the others would stay allocated until it ends. Run it as its own one-node CPU job "
-                                f"instead: ")
-                    self.assertIn("--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes", result.stderr)
+                                f"instead: ", command=True)
+                    self.assertIn("--dependency=afterok:$SLURM_JOB_ID --kill-on-invalid-dep=yes", error)
                     self.assertNotIn("afterok:4711", result.stderr)
-                    # P9.I2: the command to run in the one-node job, last, as it was invoked, shell-quoted.
-                    lead = f"SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: "
-                    self.assertIn(lead, result.stderr)
-                    self.assertEqual(shlex.split(result.stderr.split(lead, 1)[1]),
+                    # P9.I2: the command to run in the one-node job, last, as it was invoked, shell-quoted; P9.M: on
+                    # a line of its own.
+                    self.assertTrue(error.endswith(f" SCRIPT runs this command, without srun, next time "
+                                                   f"{_NEXT_BUILD}:"), error)
+                    self.assertEqual(shlex.split(line),
                                      [*self.in_this_folder(entry), *self.program(entry), *map(str, args)])
         self.assert_nothing_written()
 
@@ -3319,12 +3326,11 @@ class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
         env = self.command_env(PATH=os.pathsep.join([str(self.tmp / "bin"), os.environ.get("PATH", "")]))
         relative = {"build sequences-index": _index_args("in put/it's seqs.fasta", "out/db", "shards"),
                     "build sequences-seal": _seal_args("in put/it's seqs.fasta", "shards", "run")}
-        lead = f"SCRIPT runs this command, without srun, next time {_NEXT_BUILD}: "
         for command, args in relative.items():
             with self.subTest(command=command):
                 result = self.run_command("fm-search", args, **self.I3_ENV)
-                self.assert_refused_before_torch(result, f"SLURM job 4711 holds 2 nodes, and '{command}' runs ")
-                line = result.stderr.split(lead, 1)[1].rstrip("\n")
+                _, line = self.assert_refused_before_torch(
+                    result, f"SLURM job 4711 holds 2 nodes, and '{command}' runs ", command=True)
                 self.assertEqual(shlex.split(line), ["cd", os.path.realpath(self.tmp), "&&", "fm-search", *args])
                 rerun = subprocess.run(["/bin/sh", "-c", line], cwd=elsewhere, env=env, capture_output=True, text=True,
                                        timeout=600)
@@ -3335,8 +3341,9 @@ class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
                 self.assertEqual(without_cd.returncode, 2, without_cd.stderr)
                 self.assertIn("Invalid value for '--fasta-file'", without_cd.stderr)
                 i2 = self.run_command("fm-search", args, WORLD_SIZE="2")
-                self.assert_refused_before_torch(i2, f"'{command}' runs as one process (WORLD_SIZE=2): ")
-                self.assertEqual(shlex.split(i2.stderr.split(" The command: ", 1)[1]), ["fm-search", *args])
+                _, line = self.assert_refused_before_torch(i2, f"'{command}' runs as one process (WORLD_SIZE=2): ",
+                                                           command=True)
+                self.assertEqual(shlex.split(line), ["fm-search", *args])
         self.assert_nothing_written()
         self.assertEqual(list(elsewhere.iterdir()), [])
 
@@ -3347,11 +3354,10 @@ class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
                                   "SLURM_JOB_NUM_NODES": "2"}, "SLURM_STEP_NUM_TASKS=4")):
                 with self.subTest(command=command, env=env):
                     result = self.run_command("fm-search", args, **env)
-                    self.assert_refused_before_torch(
-                        result, f"'{command}' runs as one process ({launch}): launch it once, directly in the batch "
-                                f"script or with srun -n 1. The command: ")
-                    self.assertEqual(shlex.split(result.stderr.split(" The command: ", 1)[1]),
-                                     ["fm-search", *map(str, args)])
+                    error, line = self.assert_refused_before_torch(result, "", command=True)
+                    self.assertEqual(error, f"Error: '{command}' runs as one process ({launch}): launch it once, "
+                                            f"directly in the batch script or with srun -n 1. The command:")
+                    self.assertEqual(shlex.split(line), ["fm-search", *map(str, args)])
         self.assert_nothing_written()
 
     def test_without_a_launch_refusal(self):
@@ -3377,14 +3383,18 @@ class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
                     result = self.run_command("fm-search", [*args, "--log-level", level], hook=False,
                                               **self.SRUN_STEP_ENV)
                     self.assertEqual(result.returncode, 1, result.stderr)
-                    lines = [line for line in result.stderr.splitlines() if "one-task srun step" in line]
+                    stderr = result.stderr.splitlines()
+                    lines = [k for k, line in enumerate(stderr) if "one-task srun step" in line]
                     self.assertEqual(len(lines), 1, result.stderr)
-                    self.assertRegex(lines[0], "^" + prefix + re.escape(
+                    warning = stderr[lines[0]]
+                    self.assertRegex(warning, "^" + prefix + re.escape(
                         f"'{command}' runs in a one-task srun step of SLURM job 42, which holds 2 nodes: the others "
                         f"stay allocated until it ends. Next time, run it as its own one-node CPU job: "))
-                    self.assertTrue(lines[0].endswith(f" SCRIPT runs this command, without srun, {_NEXT_BUILD}: "
-                                                      + shlex.join(["fm-search", *map(str, args), "--log-level",
-                                                                    level])), lines[0])
+                    self.assertTrue(warning.endswith(f" SCRIPT runs this command, without srun, {_NEXT_BUILD}:"),
+                                    warning)
+                    # P9.M: the command on the next line, indented, without the log line's prefix.
+                    self.assertEqual(stderr[lines[0] + 1],
+                                     "    " + shlex.join(["fm-search", *map(str, args), "--log-level", level]))
                     self.assertEqual(len([line for line in result.stderr.splitlines() if line.startswith("Error: ")]),
                                      1, result.stderr)
 

@@ -314,7 +314,7 @@ class BuildRefusalTest(_Tmp):
                 self.assertIs(kwargs["scoring_system"], prepare.return_value)
 
     def test_exit_status_of_a_refusal(self):
-        """fm-search prints a refusal on one line and exits 1 (D20)."""
+        """fm-search prints this refusal on one line and exits 1 (D20)."""
         fasta = _write(self.tmp / "dup.fasta", ">a\nACDE\n>a\nACDE\n")
         argv = ["fm-search", *map(str, _build_args(fasta, self.tmp / "db", self.shards, "--residue-codes"))]
         stderr = self.enterContext(mock.patch("sys.stderr", new_callable=io.StringIO))

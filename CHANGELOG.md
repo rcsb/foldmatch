@@ -132,8 +132,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   (and the copy in its index) and the added `build.split: true`; `hnsw` and
   `ivf_pq` indexes are byte-identical, as between any two builds, only at one
   thread, and an `ivf_pq` index holds the path of its `.invlists`, so only at
-  the same `--output-db`. Every refusal of the three commands is a one-line
-  error with exit status 1 (2 for a usage error), with or without
+  the same `--output-db`. Every refusal of the three commands is an error
+  with exit status 1 (2 for a usage error), with or without
   `--residue-codes`. The recipe: run `fm-search download-models` once on a
   login node first (no rank of a multi-node `--residue-codes` run downloads);
   run step 1 in the GPU job as `srun --kill-on-bad-exit=1 ... fm-search build
@@ -173,7 +173,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   as it was invoked (`fm-search ...` through the console script), after a
   `cd` to the folder it ran in when the line depends on it (a relative path,
   or `python -m`); the refusal as one of several ranks ends with the command
-  to launch once. Step 2 sets FAISS's OpenMP threads to the
+  to launch once. The command is on a line of its own, indented, so that it
+  can be copied whole. Step 2 sets FAISS's OpenMP threads to the
   physical cores it may use (and the threads of the BLAS libraries
   threadpoolctl finds, which it logs), unless `OMP_NUM_THREADS` (for BLAS also
   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` or `VECLIB_MAXIMUM_THREADS`) is
