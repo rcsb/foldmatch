@@ -33,6 +33,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack, chdir, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -1396,7 +1397,7 @@ class _SplitBuild(_WithBundle):
         root.addHandler(recorder)
         try:
             with mock.patch.object(search, "set_log_level",
-                                   side_effect=lambda level: events.append(("set_log_level", level))):
+                                   side_effect=lambda level, **_: events.append(("set_log_level", level))):
                 call()
         finally:
             root.removeHandler(recorder)
@@ -2166,7 +2167,7 @@ class IndexRefusalTest(_SplitBuild):
         self.assertNotIn("afterok:4711", message)
 
     def test_i2_i3_before_the_logging_setup(self):
-        """P9.I1: I2 and I3 refuse before set_log_level, which imports Lightning and so torch."""
+        """P9.I1: I2 and I3 refuse before set_log_level (which, until P9.L2, imported Lightning and so torch)."""
         self.embed_run()
         for env in ({"WORLD_SIZE": 2}, {"SLURM_JOB_ID": 4711, "SLURM_JOB_NUM_NODES": 2, "SLURM_NTASKS": 8}):
             with self.subTest(env=env), mock.patch.object(search, "set_log_level",
@@ -2924,7 +2925,7 @@ class SealRefusalTest(_Sealing):
                 self.assertIn(text, message)
                 self.assertTrue(message.endswith(end), message)
                 refuse.assert_not_called()
-                setup.assert_not_called()  # P9.I1: before set_log_level, which imports Lightning and so torch
+                setup.assert_not_called()  # P9.I1: before set_log_level (until P9.L2 it imported Lightning)
 
     def test_s3_a_record_or_tmp(self):
         """A run with a record: use it. A record whose writer stopped (.tmp only): delete it, then seal again."""
@@ -3160,13 +3161,16 @@ class SealRefusalTest(_Sealing):
 
 # =====================================================================================================================
 # P9.I1, P9.I2: the launch checks of step 2 and the seal, before torch, and the command line in their advice
+# P9.L2: their later refusals, before torch too
 # =====================================================================================================================
-#: A sitecustomize for the commands that ``LaunchChecksBeforeTorchTest`` runs: any import of torch, Lightning, ESM or
-#: FAISS ends the process at once with status 97, naming the module, so that no ``except`` can hide it; one of them
-#: already imported when the interpreter starts (by a ``.pth`` file) ends it with status 98.
+#: A sitecustomize for the commands that ``_HookedCommands`` runs: any import of torch, Lightning, ESM, FAISS,
+#: transformers or huggingface_hub ends the process at once with status 97, naming the module and the innermost
+#: FoldMatch function that imported it, so that no ``except`` can hide it; one of them already imported when the
+#: interpreter starts (by a ``.pth`` file) ends it with status 98.
 _NO_HEAVY_IMPORTS = r"""
 import os, sys
-_BLOCKED = ("torch", "lightning", "lightning_fabric", "pytorch_lightning", "esm", "faiss")
+_BLOCKED = ("torch", "lightning", "lightning_fabric", "pytorch_lightning", "esm", "faiss", "transformers",
+            "huggingface_hub")
 _loaded = sorted(name for name in sys.modules if name.partition(".")[0] in _BLOCKED)
 if _loaded:
     sys.stderr.write(f"FORBIDDEN IMPORT at start-up: {', '.join(_loaded)}\n")
@@ -3175,7 +3179,11 @@ if _loaded:
 class _NoHeavyImports:
     def find_spec(self, name, path=None, target=None):
         if name.partition(".")[0] in _BLOCKED:
-            sys.stderr.write(f"FORBIDDEN IMPORT: {name}\n")
+            frame = sys._getframe(1)
+            while frame is not None and not frame.f_globals.get("__name__", "").startswith("foldmatch"):
+                frame = frame.f_back
+            where = f" (from {frame.f_globals['__name__']}.{frame.f_code.co_name})" if frame is not None else ""
+            sys.stderr.write(f"FORBIDDEN IMPORT: {name}{where}\n")
             sys.stderr.flush()
             os._exit(97)
         return None
@@ -3201,37 +3209,22 @@ def _fm_search_entry_point() -> str:
     return tomllib.loads(path.read_text())["project"]["scripts"]["fm-search"]
 
 
-class LaunchChecksBeforeTorchTest(unittest.TestCase):
-    """``build sequences-index`` and ``build sequences-seal`` as commands, through an ``fm-search`` console script of
-    the package's entry point and through ``python -m foldmatch.cli.search``, with ``_NO_HEAVY_IMPORTS``: I2 and I3
-    refuse with exit status 1 and their whole message on stderr, before torch or Lightning is imported (P8b, N3 case
-    E: I3 came 118 s after the launch, after ``set_log_level``'s Lightning import). Without a launch refusal the hook
-    stops the commands at that import (the control). The WARNING of a one-task srun step of a multi-node job, without
-    the hook, comes in the logging format ``set_log_level`` sets up."""
+class _HookedCommands:
+    """``fm-search`` commands as subprocesses in ``self.tmp``, through an ``fm-search`` console script of the
+    package's entry point or through ``python -m foldmatch.cli.search``, with ``_NO_HEAVY_IMPORTS`` unless ``hook``
+    is false. ``hooked_setup`` needs ``self.tmp`` and the environment the commands get, set."""
 
-    I3_ENV = {"SLURM_JOB_ID": "4711", "SLURM_JOB_NUM_NODES": "2", "SLURM_NTASKS": "8"}
-    SRUN_STEP_ENV = {"SLURM_JOB_ID": "42", "SLURM_JOB_NUM_NODES": "2", "SLURM_STEP_ID": "3",
-                     "SLURM_STEP_NUM_TASKS": "1", "SLURM_NTASKS": "8"}
-
-    def setUp(self):
-        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for name in ("site", "bin", "shards"):
+    def hooked_setup(self):
+        for name in ("site", "bin"):
             (self.tmp / name).mkdir()
         (self.tmp / "site" / "sitecustomize.py").write_text(_NO_HEAVY_IMPORTS)
         module, _, attr = _fm_search_entry_point().partition(":")
         self.fm_search = self.tmp / "bin" / "fm-search"
         self.fm_search.write_text(_CONSOLE_SCRIPT.format(python=sys.executable, module=module, attr=attr))
-        (self.tmp / "in put").mkdir()
-        self.fasta = Path(shutil.copyfile(_FASTA, self.tmp / "in put" / "it's seqs.fasta"))
-        self.db = self.tmp / "out" / "db"
         self.env = {k: v for k, v in os.environ.items()
                     if k not in _LAUNCH_ENV and k not in _DDP_ENV and k not in _JOB_ENV
                     and not k.startswith(_DDP_ENV_PREFIXES)}
         self.env["HF_HUB_OFFLINE"] = "1"
-
-    def commands(self) -> dict:
-        return {"build sequences-index": _index_args(self.fasta, self.db, self.tmp / "shards"),
-                "build sequences-seal": _seal_args(self.fasta, self.tmp / "shards", "run")}
 
     @staticmethod
     def program(entry) -> list:
@@ -3256,14 +3249,41 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
         cd to ``self.tmp``, except through the console script (P9.I2)."""
         return [] if entry == "fm-search" else ["cd", os.path.realpath(self.tmp), "&&"]
 
-    def assert_refused_before_torch(self, result, start):
-        """Exit status 1 with one line on stderr, ``Error: `` and the refusal, which starts with ``start``."""
+    def assert_refused_before_torch(self, result, start, logged=0):
+        """Exit status 1 with ``logged`` log lines on stderr, then one line, ``Error: `` and the refusal, which starts
+        with ``start``."""
         self.assertNotIn("FORBIDDEN IMPORT", result.stderr)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertTrue(result.stderr.startswith(f"Error: {start}"), result.stderr)
-        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
-        self.assertTrue(result.stderr.endswith("\n"), result.stderr)
+        lines = result.stderr.split("\n")
+        self.assertEqual(len(lines), logged + 2, result.stderr)
+        self.assertTrue(lines[logged].startswith(f"Error: {start}"), result.stderr)
+        self.assertEqual(lines[-1], "", result.stderr)
+
+
+class LaunchChecksBeforeTorchTest(_HookedCommands, unittest.TestCase):
+    """``build sequences-index`` and ``build sequences-seal`` as commands, through an ``fm-search`` console script of
+    the package's entry point and through ``python -m foldmatch.cli.search``, with ``_NO_HEAVY_IMPORTS``: I2 and I3
+    refuse with exit status 1 and their whole message on stderr, before torch or Lightning is imported (P8b, N3 case
+    E: I3 came 118 s after the launch, after ``set_log_level``'s Lightning import). Without a launch refusal they
+    refuse the empty shards folder, still before torch (P9.L2). The WARNING of a one-task srun step of a multi-node
+    job, without the hook, comes in the logging format ``set_log_level`` sets up."""
+
+    I3_ENV = {"SLURM_JOB_ID": "4711", "SLURM_JOB_NUM_NODES": "2", "SLURM_NTASKS": "8"}
+    SRUN_STEP_ENV = {"SLURM_JOB_ID": "42", "SLURM_JOB_NUM_NODES": "2", "SLURM_STEP_ID": "3",
+                     "SLURM_STEP_NUM_TASKS": "1", "SLURM_NTASKS": "8"}
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.tmp / "shards").mkdir()
+        self.hooked_setup()
+        (self.tmp / "in put").mkdir()
+        self.fasta = Path(shutil.copyfile(_FASTA, self.tmp / "in put" / "it's seqs.fasta"))
+        self.db = self.tmp / "out" / "db"
+
+    def commands(self) -> dict:
+        return {"build sequences-index": _index_args(self.fasta, self.db, self.tmp / "shards"),
+                "build sequences-seal": _seal_args(self.fasta, self.tmp / "shards", "run")}
 
     def assert_nothing_written(self):
         self.assertFalse(self.db.parent.exists())
@@ -3290,7 +3310,7 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
     def test_the_command_runs_from_another_folder(self):
         """P9.I2: with relative paths, the I3 refusal's command starts with a cd to the folder the command ran in, so
         that it runs from any folder (sbatch starts the one-node job in the folder it is submitted from). From another
-        folder it passes the paths' checks and reaches set_log_level, whose Lightning import the hook stops; without
+        folder it passes the paths' checks and refuses the empty shards folder (P9.L2: still before torch); without
         the cd it is refused there with exit status 2. The I2 refusal's command, for the same batch script, has no
         cd."""
         self.fm_search.chmod(0o755)
@@ -3308,7 +3328,8 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                 self.assertEqual(shlex.split(line), ["cd", os.path.realpath(self.tmp), "&&", "fm-search", *args])
                 rerun = subprocess.run(["/bin/sh", "-c", line], cwd=elsewhere, env=env, capture_output=True, text=True,
                                        timeout=600)
-                self.assertEqual((rerun.returncode, rerun.stderr), (97, "FORBIDDEN IMPORT: lightning\n"))
+                self.assert_refused_before_torch(rerun, "No run in " if "index" in command else
+                                                 "No embedding shards of run run ")
                 without_cd = subprocess.run(["/bin/sh", "-c", line.split(" && ", 1)[1]], cwd=elsewhere, env=env,
                                             capture_output=True, text=True, timeout=600)
                 self.assertEqual(without_cd.returncode, 2, without_cd.stderr)
@@ -3333,15 +3354,17 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                                      ["fm-search", *map(str, args)])
         self.assert_nothing_written()
 
-    def test_the_hook_stops_lightning(self):
-        """The control: without a launch refusal, each command, through each entry, reaches set_log_level, whose
-        Lightning import the hook stops."""
+    def test_without_a_launch_refusal(self):
+        """Without a launch refusal, each command, through each entry, goes on and refuses the empty shards folder,
+        still before torch or Lightning is imported (P9.L2; before it, set_log_level's Lightning import came first:
+        ``LaterRefusalsBeforeTorchTest`` has the hook's control)."""
+        starts = {"build sequences-index": f"No run in {os.path.realpath(self.tmp / 'shards')}: no run record",
+                  "build sequences-seal": "No embedding shards of run run (emb_run-<rank>.parquet) in "}
         for entry in ("fm-search", "python -m"):
             for command, args in self.commands().items():
                 with self.subTest(entry=entry, command=command):
-                    result = self.run_command(entry, args)
-                    self.assertEqual(result.returncode, 97, result.stderr)
-                    self.assertTrue(result.stderr.startswith("FORBIDDEN IMPORT: lightning\n"), result.stderr)
+                    self.assert_refused_before_torch(self.run_command(entry, args), starts[command])
+        self.assert_nothing_written()
 
     def test_the_srun_step_warning_in_the_logging_format(self):
         """Without the hook: the WARNING of a one-task srun step of a multi-node job, in the format of --log-level info,
@@ -3365,6 +3388,144 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                     self.assertEqual(len([line for line in result.stderr.splitlines() if line.startswith("Error: ")]),
                                      1, result.stderr)
 
+
+
+class LaterRefusalsBeforeTorchTest(_HookedCommands, _Sealing):
+    """P9.L2: the refusals of step 2 up to its index phase, and every refusal of the seal, come before torch or
+    Lightning is imported, through the ``fm-search`` console script with ``_NO_HEAVY_IMPORTS`` (before, they came
+    after ``set_log_level``'s Lightning import: minutes from a cold file system on a compute node). The control: with
+    nothing to refuse, step 2 reaches its deferred Lightning import after its last check before the index phase; the
+    seal seals without any of them."""
+
+    def setUp(self):
+        super().setUp()
+        self.hooked_setup()
+        self.inputs = self.tmp / "in"
+        self.inputs.mkdir()
+        self.fasta = Path(shutil.copyfile(_FASTA, self.inputs / "seqs.fasta"))
+
+    def refused_hooked(self, args, text):
+        """``args`` refused with exit status 1 before torch, Lightning, ESM, FAISS, transformers or huggingface_hub
+        was imported: log lines, then the ``Error:`` line, which holds ``text``. Returns the log lines."""
+        result = self.run_command("fm-search", args)
+        self.assertNotIn("FORBIDDEN IMPORT", result.stderr)
+        self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+        *logged, error, end = result.stderr.split("\n")
+        self.assertEqual(end, "", result.stderr)
+        self.assertTrue(error.startswith("Error: "), result.stderr)
+        self.assertIn(text, error)
+        for line in logged:
+            self.assertTrue(line.startswith("[proc-0] "), result.stderr)
+        return logged
+
+    def test_step_2_refusals(self):
+        """I4 (no run record: an empty folder, a run whose record is gone), I6, I8, I11, I12 (inside the build lock),
+        I16 and I17 (a FASTA that is not the one the run embedded: another size, one residue changed)."""
+        self.embed(fasta=self.fasta)
+        unrecorded = self.tmp / "unrecorded"
+        unrecorded.mkdir()
+        self.embed(fasta=self.fasta, shards=unrecorded, db=self.tmp / "other").unlink()
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        larger = _write(self.inputs / "larger.fasta", self.fasta.read_text() + ">late\nACDE\n")
+        changed = _one_residue_changed(shutil.copyfile(self.fasta, self.inputs / "changed.fasta"))
+        lock = Path(f"{self.db}.build.lock")
+        cases = [
+            ("I4", _index_args(self.fasta, self.db, empty), "No run in ", None),
+            ("I4", _index_args(self.fasta, self.db, unrecorded), "has no run record", None),
+            ("I6", _index_args(self.fasta, self.db, self.shards, "--run-id", "nope"), "Run nope has no run record",
+             None),
+            ("I8", _index_args(self.fasta, self.db, self.shards, "--residue-codes"), "computed no residue codes", None),
+            ("I11", _index_args(self.fasta, self.db, self.shards), f"{lock} exists", lock),
+            ("I12", _index_args(self.fasta, self.db, self.shards), "Database already exists at",
+             Path(f"{self.db}.index")),
+            ("I16", _index_args(larger, self.db, self.shards), "bytes, but the FASTA run run embedded", None),
+            ("I17", _index_args(changed, self.db, self.shards), "is not the FASTA run run embedded", None),
+        ]
+        for case, args, text, present in cases:
+            with self.subTest(case=case, text=text):
+                if present is not None:
+                    present.write_text("{}\n")
+                try:
+                    self.refused_hooked(args, text)
+                finally:
+                    if present is not None:
+                        present.unlink()
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), [])
+
+    def test_seal_refusals(self):
+        """S3 (a run with a record), S4 (no shards of the run), S7 (nothing to build) and S8 (a FASTA with more
+        entries than the shards hold rows)."""
+        self.embed(fasta=self.fasta)
+        unrecorded = self.tmp / "unrecorded"
+        unrecorded.mkdir()
+        self.embed(fasta=self.fasta, shards=unrecorded, db=self.tmp / "other").unlink()
+        larger = _write(self.inputs / "larger.fasta", self.fasta.read_text() + ">late\nACDEFGHIKL\n")
+        cases = [
+            ("S3", _seal_args(self.fasta, self.shards, "run"), "has its run record already"),
+            ("S4", _seal_args(self.fasta, unrecorded, "nope"), "No embedding shards of run nope"),
+            ("S7", _seal_args(self.fasta, unrecorded, "run", "--min-res-n", "1000"), "there is nothing to build"),
+            ("S8", _seal_args(larger, unrecorded, "run", "--min-res-n", "0"), "hold 2 row(s), but"),
+        ]
+        for case, args, text in cases:
+            with self.subTest(case=case):
+                self.refused_hooked(args, text)
+        self.assertEqual(sorted(p.name for p in unrecorded.iterdir()), ["emb_run-0.parquet"])
+
+    def test_the_seal_imports_none_of_them(self):
+        """A plain run and a residue-code run sealed with the hook: exit status 0, the record written."""
+        for codes in (False, True):
+            with self.subTest(codes=codes):
+                shards = self.tmp / f"unrecorded-{codes}"
+                shards.mkdir()
+                self.embed(*_codes_flag(codes), fasta=self.fasta, shards=shards, db=self.tmp / f"db-{codes}").unlink()
+                args = _seal_args(self.fasta, shards, "run", *(() if codes else ("--min-res-n", "0")))
+                result = self.run_command("fm-search", args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("FORBIDDEN IMPORT", result.stderr)
+                self.assertIn("[proc-0] Run run sealed: 2 entries in 1 shard(s) of 1 rank(s)", result.stderr)
+                self.assertTrue(split_run.read_run_record(shards / "emb_run.run.json")["sealed"])
+
+    def test_the_hook_stops_step_2_at_its_deferred_lightning_import(self):
+        """The control: with nothing to refuse, step 2 logs its last line before the index phase, then imports
+        Lightning in set_log_level's second call, which the hook stops; without the hook it builds the database."""
+        self.embed(fasta=self.fasta)
+        args = _index_args(self.fasta, self.db, self.shards)
+        result = self.run_command("fm-search", args)
+        self.assertEqual(result.returncode, 97, result.stderr)
+        *_, building, forbidden, end = result.stderr.split("\n")
+        self.assertTrue(building.startswith(f"[proc-0] Building {self.db} from run run in "), result.stderr)
+        self.assertEqual((forbidden, end),
+                         ("FORBIDDEN IMPORT: lightning (from foldmatch.cli.args_utils._import_lightning)", ""))
+        Path(f"{self.db}.build.lock").unlink()  # the hook ended the process inside the lock
+        result = self.run_command("fm-search", args, hook=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"[proc-0] Database {self.db} built from run run in ", result.stderr)
+
+    def test_set_log_level_and_the_build_time(self):
+        """In process: step 2 sets up logging without Lightning, then again before EmbeddingComputer, which imports
+        it; the build's time leaves that import out, as before. The seal sets up logging once, without Lightning."""
+        self.embed(fasta=self.fasta)
+        calls = []
+
+        def slow_import(level, defer_lightning=False):
+            calls.append((level, defer_lightning))
+            if not defer_lightning:
+                time.sleep(1.5)
+
+        with mock.patch.object(search, "set_log_level", side_effect=slow_import), \
+                self.assertLogs(level="INFO") as logs:
+            self.built(fasta=self.fasta)
+        self.assertEqual(calls, [(LogLevel.info, True), (LogLevel.info, False)])
+        [built] = [r.getMessage() for r in logs.records if " built from run run in " in r.getMessage()]
+        self.assertLess(float(built.rsplit(" in ", 1)[1].removesuffix(" s")), 1.5, built)
+        calls.clear()
+        unrecorded = self.tmp / "unrecorded"
+        unrecorded.mkdir()
+        self.embed(fasta=self.fasta, shards=unrecorded, db=self.tmp / "other").unlink()
+        with mock.patch.object(search, "set_log_level", side_effect=slow_import):
+            self.sealed("--min-res-n", "0", fasta=self.fasta, shards=unrecorded)
+        self.assertEqual(calls, [(LogLevel.info, True)])
 
 
 class CommandLineTest(unittest.TestCase):

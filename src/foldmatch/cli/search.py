@@ -692,8 +692,9 @@ def build_sequences_index(
 
     # Every refusal is a RefusalError, in both modes (D32). Up to the index phase nothing is written but the build lock
     # (and the database's folder when it is missing), which a refusal removes.
-    # The launch checks come before set_log_level, which imports Lightning and so torch (minutes from a cold file
-    # system on a compute node), so that I2 and I3 refuse within seconds; their WARNINGs wait for the logging setup.
+    # The refusals up to the index phase come before torch and Lightning are imported (minutes from a cold file system
+    # on a compute node): the launch checks first, I2 and I3 (their WARNINGs wait for the logging setup), then
+    # set_log_level without its Lightning import, which the second call, before EmbeddingComputer, makes.
     from foldmatch.utils.dist import is_run_id
     if run_id is not None and not is_run_id(run_id):
         raise typer.BadParameter(
@@ -701,7 +702,7 @@ def build_sequences_index(
             f"starting with a letter or digit.", param_hint="--run-id"
         )
     launch_warnings = _refuse_multi_node_job("build sequences-index")
-    set_log_level(log_level)
+    set_log_level(log_level, defer_lightning=True)
     start = time.monotonic()
     for message in launch_warnings:
         logging.warning(message)
@@ -721,6 +722,11 @@ def build_sequences_index(
             paths, preflight, fasta_stat = _split_index_checks(record, fasta_file=fasta_file, output_db=output_db,
                                                                from_shards=from_shards, codes=codes, system=system)
         _log_split_build(record, db_path=db_path, from_shards=from_shards, shards=len(paths), codes=codes)
+        # The Lightning import set_log_level deferred, before EmbeddingComputer imports Lightning and torch, and the
+        # index phase FAISS; not in the build's time, as before.
+        deferred = time.monotonic()
+        set_log_level(log_level)
+        start += time.monotonic() - deferred
         from foldmatch.search.embedding_computer import EmbeddingComputer
         computer = EmbeddingComputer(from_shards, run=run_id)
         with _refusals():
@@ -775,7 +781,8 @@ def build_sequences_seal(
     FASTA, then writes their record, sealed, so that 'build sequences-index' can build from them. No ESM3 or GPU."""
 
     # Every refusal is a RefusalError, in both modes (D32). Nothing is written but the record, last.
-    # The launch checks come before set_log_level, as in 'build sequences-index'.
+    # The launch checks come first, as in 'build sequences-index'. The seal never imports torch, Lightning or FAISS,
+    # so set_log_level does not import Lightning: every refusal comes before them.
     from foldmatch.utils.dist import is_run_id
     if not is_run_id(run_id):
         raise typer.BadParameter(
@@ -783,7 +790,7 @@ def build_sequences_seal(
             f"starting with a letter or digit.", param_hint="--run-id"
         )
     launch_warnings = _refuse_multi_node_job("build sequences-seal")
-    set_log_level(log_level)
+    set_log_level(log_level, defer_lightning=True)
     for message in launch_warnings:
         logging.warning(message)
 
@@ -2210,10 +2217,11 @@ def _refuse_multi_node_job(command: str) -> List[str]:
     with the paths and run id of the GPU job's build, whose run id step 1 derives from that job unless
     ``FOLDMATCH_RUN_ID`` sets it, exported before the sbatch so that the CPU job has it too.
 
-    It runs before ``set_log_level``, which imports Lightning and so torch: that import takes minutes from a cold file
-    system on a compute node (P8b, N3 case E: I3 refused 118 s after the launch), and a refusal needs no logging
-    (``main`` prints it). The checks import only :mod:`foldmatch.utils.dist`, which imports only the standard library.
-    The WARNINGs are returned instead of logged, so that they go through the logging ``set_log_level`` sets up.
+    It runs before ``set_log_level`` and before torch or Lightning is imported, which takes minutes from a cold file
+    system on a compute node (P8b, N3 case E: I3 refused 118 s after the launch, after ``set_log_level``'s Lightning
+    import); a refusal needs no logging (``main`` prints it). The checks import only :mod:`foldmatch.utils.dist`,
+    which imports only the standard library. The WARNINGs are returned instead of logged, so that they go through the
+    logging ``set_log_level`` sets up.
     """
     from foldmatch.utils.dist import _whole_number, multi_rank_launch, srun_step_id
     launch = multi_rank_launch()
