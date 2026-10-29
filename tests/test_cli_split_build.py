@@ -3344,10 +3344,10 @@ class LaunchChecksBeforeTorchTest(unittest.TestCase):
                     self.assertTrue(result.stderr.startswith("FORBIDDEN IMPORT: lightning\n"), result.stderr)
 
     def test_the_srun_step_warning_in_the_logging_format(self):
-        """Without the hook: the WARNING of a one-task srun step of a multi-node job, in the format of --log-level info
-        and of --log-level debug; then the empty shards folder is refused."""
-        formats = {"info": r"\[proc-0\] ",
-                   "debug": r"> \d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} - \[proc-0\] - WARNING - search\.py:\d+ - "}
+        """Without the hook: the WARNING of a one-task srun step of a multi-node job, in the format of --log-level info,
+        warn (P9.L1: it had no format) and debug; then the empty shards folder is refused."""
+        detailed = r"> \d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} - \[proc-0\] - WARNING - search\.py:\d+ - "
+        formats = {"info": r"\[proc-0\] ", "warn": detailed, "debug": detailed}
         for command, args in self.commands().items():
             for level, prefix in formats.items():
                 with self.subTest(command=command, level=level):

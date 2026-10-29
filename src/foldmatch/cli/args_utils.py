@@ -32,11 +32,13 @@ class RankFilter(logging.Filter):
 
 
 def set_log_level(level: LogLevel):
+    """Set up logging for a command at ``level`` (``--log-level``): ``info``, ``warn`` or ``debug``, the values of
+    :class:`LogLevel`. Any other value is refused with ``ValueError``."""
     handler = logging.StreamHandler()
     handler.addFilter(RankFilter())
 
     import lightning
-    if level == 'info':
+    if level == LogLevel.info:
         warnings.filterwarnings("ignore")
         logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
         logging.getLogger("lightning.fabric.utilities.distributed").setLevel(logging.ERROR)
@@ -44,16 +46,18 @@ def set_log_level(level: LogLevel):
         logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
         from huggingface_hub.utils import disable_progress_bars
         disable_progress_bars()
-    elif level == 'warning':
+    elif level == LogLevel.warn:
         handler.setFormatter(logging.Formatter(
             '> %(asctime)s - [proc-%(rank)s] - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
         ))
         logging.basicConfig(level=logging.WARN, handlers=[handler], force=True)
-    elif level == 'debug':
+    elif level == LogLevel.debug:
         handler.setFormatter(logging.Formatter(
             '> %(asctime)s - [proc-%(rank)s] - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
         ))
         logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
+    else:
+        raise ValueError(f"unknown log level {level!r}: one of {', '.join(member.value for member in LogLevel)}")
 
 
 DOWNLOAD_MODELS_HELP = (
