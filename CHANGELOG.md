@@ -161,14 +161,19 @@ While the major version is `0`, breaking changes are released in a minor bump.
   and pass the same value to step 2 as its `--run-id`. Step 2 and the seal
   refuse to run as one of several ranks, or in the batch step of a job of more
   than one node, and warn in a one-task srun step of such a job and in a
-  one-node job with GPUs. They refuse within seconds of the launch, before
-  Lightning and torch are imported (which can take minutes on a compute
-  node). The refusal in the batch step, like the srun step's warning, ends
-  with the command line to run in the one-node CPU job, as it was invoked
-  (`fm-search ...` through the console script), after a `cd` to the folder
-  it ran in when the line depends on it (a relative path, or `python -m`);
-  the refusal as one of several ranks ends with the command to launch
-  once. Step 2 sets FAISS's OpenMP threads to the
+  one-node job with GPUs. They refuse before Lightning and torch are
+  imported (which can take minutes on a compute node), and so do step 2's
+  other refusals up to its index phase (the run record, the residue-code
+  options, the build lock, existing database files, the shards and the FASTA
+  against the record) and every refusal of the seal, which never imports
+  them: within seconds of the launch once the file system has the
+  environment's files cached (a first launch on a node can take a minute).
+  The refusal in the batch step, like the srun step's warning, ends with the
+  command line to run in the one-node CPU job,
+  as it was invoked (`fm-search ...` through the console script), after a
+  `cd` to the folder it ran in when the line depends on it (a relative path,
+  or `python -m`); the refusal as one of several ranks ends with the command
+  to launch once. Step 2 sets FAISS's OpenMP threads to the
   physical cores it may use (and the threads of the BLAS libraries
   threadpoolctl finds, which it logs), unless `OMP_NUM_THREADS` (for BLAS also
   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` or `VECLIB_MAXIMUM_THREADS`) is
@@ -511,6 +516,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Fixed
 
+- **`--log-level warn` sets up logging.** It set up none in every command of
+  `fm-search`, `fm-embedding` and `inference` (the option's value is `warn`,
+  the set-up looked for `warning`), so a warning printed in Python's default
+  format (`WARNING:root:...`, `WARNING:foldmatch.<module>:...` or the bare
+  message). It now prints in the format of `--log-level debug`
+  (`> time - [proc-N] - WARNING - file:line - message`), at WARNING level. As
+  at `debug`, Lightning's own INFO lines (`GPU available: ...`) still show;
+  only `info` hides them.
 - **`fm-search build structures --granularity assembly` now honours `--min-res`
   and `--batch-size`.** Both were dropped for assembly builds, so every chain
   went into the assembly embedding, while `fm-search query structure
