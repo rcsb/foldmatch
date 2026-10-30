@@ -378,7 +378,8 @@ def build_database_from_embeddings(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Folder containing pre-computed embedding files (.pt, .csv, or .parquet).'
+            help='Folder of pre-computed chain or assembly embeddings: .pt or .csv files of one vector each, or '
+                 '.parquet files (columns id and embedding). Residue embeddings are refused.'
         )],
         output_db: Annotated[str, typer.Option(
             help='Path to save the FAISS database.'
@@ -999,7 +1000,8 @@ def query_database_from_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Directory containing pre-computed embedding files (.pt, .csv, or .parquet).'
+            help='Directory of pre-computed chain or assembly embeddings: .pt or .csv files of one vector each, or '
+                 '.parquet files (columns id and embedding). Residue embeddings are refused.'
         )],
         output_file: Annotated[str, typer.Option(
             help=_OUTPUT_FILE_HELP

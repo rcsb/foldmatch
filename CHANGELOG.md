@@ -514,6 +514,35 @@ While the major version is `0`, breaking changes are released in a minor bump.
   that must compile the kernel, runs the kernel self-test at build time and
   again in the compiler-free runtime stage, and no longer copies the source
   tree into `/app`.
+- **A `.pt` or `.csv` embedding file holds one vector: residue embeddings are
+  refused.** `fm-search build embeddings` and `fm-search query embedding`
+  read one embedding vector per `.pt` or `.csv` file: a tensor of shape
+  `[D]`, `[1, D]` or `[D, 1]`, or a CSV of one column (as `fm-embedding` and
+  `inference` write chain and assembly embeddings) or of one line. A file of
+  residue embeddings (one row per residue, as `fm-embedding from-structures
+  residue`, `fm-embedding from-sequences residue` and `inference
+  residue-embedding` write them), or any other table, now stops the command
+  with an error that names the file and its shape. Such a file was averaged
+  over its rows without a message, and the mean indexed or queried as the
+  chain's embedding, which it is not: on the test chains its cosine to the
+  chain embedding is -0.03 to 0.01, and the means of any two chains, related
+  or not, score 0.86 to 0.97. Compute chain embeddings with `fm-embedding
+  from-structures chain` or `fm-embedding from-sequences chain`, or from
+  residue files `NAME.CHAIN.pt` or `NAME.CHAIN.csv` with `inference
+  chain-embedding --src-file LIST --res-embedding-location DIR
+  --res-embedding-format pt|csv --output-folder OUT`, `LIST` holding one line
+  `NAME,,CHAIN` per file. **Rebuild databases built from residue
+  embeddings**: the mean has the width of the residue embeddings, which for
+  FoldMatch's ESM3 ones is the dimension of its chain embeddings (1536), so
+  `fm-search stats` cannot tell such a database apart, but building it again
+  from the same folder now stops with this error, which identifies it.
+  Results of such databases, and of residue embeddings used as queries, are
+  meaningless. A `[D, 1]` tensor is now read as its `D` values; it was read
+  as their mean, one value. A NaN or infinite value is now refused too (such
+  an embedding was never found, and as a query it found nothing), and so are
+  a file that cannot be read or holds no values, a `.pt` that does not hold a
+  dense tensor, and a CSV that is not numbers (its error named no file and
+  could quote a whole line), each with the file's name.
 
 ### Fixed
 
@@ -543,8 +572,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   embeddings` and `fm-search query embedding` read a CSV of several rows as
   residue embeddings and averaged its rows, so each vector became one number:
   a database built from such files had dimension 1 (every score was +1 or -1),
-  and a query with them failed. A one-column CSV is now read as one vector;
-  residue embeddings (one row per residue) are still averaged. **Rebuild
+  and a query with them failed. A one-column CSV is now read as one vector
+  (and residue embeddings are refused: see *Changed*). **Rebuild
   databases built from CSV chain or assembly embeddings**: `fm-search stats`
   shows them as `Dimension: 1`, and the `fm-search query embedding`,
   `query db`, `cluster` and `similarity-graph` results made with them are
