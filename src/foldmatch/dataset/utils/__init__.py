@@ -1,4 +1,4 @@
 
-from foldmatch.dataset.utils.utils import get_structure_location
+from foldmatch.dataset.utils.utils import get_structure_location, refuse_shared_names
 
-__all__ = ["get_structure_location"]
+__all__ = ["get_structure_location", "refuse_shared_names"]

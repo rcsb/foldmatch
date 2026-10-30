@@ -549,6 +549,20 @@ While the major version is `0`, breaking changes are released in a minor bump.
   shows them as `Dimension: 1`, and the `fm-search query embedding`,
   `query db`, `cluster` and `similarity-graph` results made with them are
   meaningless (every score is 1 or -1).
+- **A structure name that names two files or URLs is refused.** The commands
+  that read structures read a structure once for all the input rows that name
+  it (one per chain or assembly), from a file or a download alike, so rows
+  that gave one name to two files got the first file's structure for both.
+  Such an input now stops with an error that names the files when the command
+  reads its input list. A structure folder that holds one entry in two
+  formats or compressions (`1acb.cif` and `1acb.cif.gz` both take the name
+  `1acb`): keep one copy, or choose one with `--structure-file-extension`
+  (`fm-embedding`) or `--file-extension` (`fm-search build structures`). An
+  `inference` input that gives one name to several files, such as models of
+  one target: give each its own name. One file under two spellings (a
+  relative path, a link, a case variant on a case-insensitive volume) is one
+  file. **Recompute embeddings, and rebuild databases, made from inputs that
+  gave one name to more than one file or URL.**
 - **`--log-level warn` sets up logging.** It set up none in every command of
   `fm-search`, `fm-embedding` and `inference` (the option's value is `warn`,
   the set-up looked for `warning`), so a warning printed in Python's default

@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 
 from torch.utils.data import Dataset
 
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
 from foldmatch.utils.structure_parser import get_protein_chains
@@ -63,6 +63,8 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
             names=ResidueAssemblyEmbeddingFromParquet.COLUMNS
         )
         self.data = self.data.sort_values(by=self.data.columns[0])
+        refuse_shared_names(self.data, ResidueAssemblyEmbeddingFromParquet.STREAM_NAME_ATTR,
+                            ResidueAssemblyEmbeddingFromParquet.STREAM_ATTR)
 
     def __len__(self):
         return len(self.data)

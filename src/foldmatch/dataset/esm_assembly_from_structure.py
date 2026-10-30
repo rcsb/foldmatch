@@ -7,7 +7,7 @@ from esm.sdk.api import ESMProtein
 from esm.utils.structure.protein_chain import ProteinChain
 from torch.utils.data import IterableDataset, get_worker_info
 
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
 from foldmatch.utils.structure_parser import get_protein_chains, rename_atom_attr, filter_residues, get_assemblies
@@ -52,6 +52,7 @@ class EsmAssemblyFromStructure(IterableDataset):
             dtype=str,
             names=EsmAssemblyFromStructure.COLUMNS
         )
+        refuse_shared_names(self.data, EsmAssemblyFromStructure.STREAM_NAME_ATTR, EsmAssemblyFromStructure.STREAM_ATTR)
 
     def __iter__(self):
         # Handle multiple workers by splitting data across workers

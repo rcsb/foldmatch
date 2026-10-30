@@ -5,7 +5,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from foldmatch.dataset.residue_embedding_from_tensor_file import ResidueEmbeddingFromTensorFile
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
 from foldmatch.types.api_types import SrcLocation, StructureLocation, StructureFormat, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
@@ -59,6 +59,8 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
             names=ResidueEmbeddingFromStructure.COLUMNS
         )
         data = data.sort_values(by=data.columns[0])
+        refuse_shared_names(data, ResidueEmbeddingFromStructure.STREAM_NAME_ATTR,
+                            ResidueEmbeddingFromStructure.STREAM_ATTR)
         progress = tqdm(data.iterrows(), total=len(data), desc="Loading structures")
         for idx, row in progress:
             src_name = row[ResidueEmbeddingFromStructure.STREAM_NAME_ATTR]

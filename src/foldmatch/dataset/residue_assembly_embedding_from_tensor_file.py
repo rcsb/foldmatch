@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url, concatenate_tensors
@@ -57,6 +57,8 @@ class ResidueAssemblyEmbeddingFromTensorFile(Dataset):
             names=ResidueAssemblyEmbeddingFromTensorFile.COLUMNS
         )
         self.data = self.data.sort_values(by=self.data.columns[0])
+        refuse_shared_names(self.data, ResidueAssemblyEmbeddingFromTensorFile.STREAM_NAME_ATTR,
+                            ResidueAssemblyEmbeddingFromTensorFile.STREAM_ATTR)
 
     def __len__(self):
         return len(self.data)
