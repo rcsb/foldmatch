@@ -578,6 +578,39 @@ While the major version is `0`, breaking changes are released in a minor bump.
   shows them as `Dimension: 1`, and the `fm-search query embedding`,
   `query db`, `cluster` and `similarity-graph` results made with them are
   meaningless (every score is 1 or -1).
+- **Parquet embedding files, embedding dimensions and repeated ids.**
+  `fm-search build embeddings` and `fm-search query embedding` read one
+  embedding vector per row of a Parquet file's `embedding` column, a list of
+  floating-point values, and every row of a file must hold as many values as
+  its first. A file of residue embeddings, each chain's residue table
+  flattened into one row as FoldMatch wrote them, was cut into equal slices
+  that mixed chains (without a message when the values divided evenly) or
+  stopped on a numpy error that named no file. It is now refused at any
+  `--load-batch-size`, naming the file: compute chain embeddings with
+  `fm-embedding from-structures chain` or `fm-embedding from-sequences chain`.
+  A row with no embedding, whose batch was sliced the same way, a row with a
+  NaN or infinite value (never found, and as a query it found nothing) and an
+  `embedding` column of another type (a list of integers too, read before as
+  floats) are refused, naming the row or the type. An unreadable Parquet file
+  (empty, cut short by an interrupted run, or corrupted) and a file without
+  the `id` or `embedding` column are now refused, naming the file; they
+  stopped with pyarrow's message, which named no file, or with a traceback.
+  The embeddings read must have one dimension: files of two dimensions
+  stopped a build with a numpy error that named no file (or a FAISS error
+  with `--index-type ivf_pq`), and query embeddings of another dimension than
+  the database's stopped `fm-search query embedding` with an empty FAISS
+  `AssertionError`. Both are now refused as they are read, before FAISS,
+  naming the files (a Parquet file with its row) and the dimensions. A `.pt`
+  and a `.csv` file of one name in one folder (left, for example, by a
+  residue run and a chain run that wrote to one folder) were read as two
+  embeddings of one id; they are now refused, and `--file-extension .pt` or
+  `--file-extension .csv` reads one kind. Parquet stores no shape, so residue
+  embeddings whose rows all have one length (a single chain, or chains of one
+  length) still build a database, whose dimension is that length, but are
+  refused as queries. **Rebuild databases built from Parquet residue
+  embeddings** (`fm-search stats` shows a dimension other than that of the
+  chain embeddings, such as 236544) **or from a folder that held a `.pt` and
+  a `.csv` of one id.**
 - **A structure name that names two files or URLs is refused.** The commands
   that read structures read a structure once for all the input rows that name
   it (one per chain or assembly), from a file or a download alike, so rows

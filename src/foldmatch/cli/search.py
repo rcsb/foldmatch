@@ -1046,7 +1046,8 @@ def query_database_from_embedding(
     results = embedding_db.search_by_embeddings(
         embedding_batches=stream_embeddings(
             path=embedding_folder,
-            file_extension=file_extension
+            file_extension=file_extension,
+            expected_dim=embedding_db.db.dimension,
         ),
         top_k=top_k
     )

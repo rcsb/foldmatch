@@ -12,6 +12,8 @@ from requests import RequestException, ConnectTimeout
 from io import StringIO, BytesIO
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from foldmatch.errors import RefusalError
@@ -309,22 +311,139 @@ def _table_message(f: Path, values: np.ndarray, axes: List[int]) -> str:
     return text
 
 
+class _OneDimension:
+    """The one dimension of a stream's embeddings: the database's when given (a query), else the first item's."""
+
+    def __init__(self, dimension: Optional[int]):
+        self.dimension = dimension
+        self.first = None  # the item that set the dimension; None when it is the database's
+
+    def check(self, item: str, n: int) -> None:
+        """Refuse ``item`` (a file, or a Parquet file and row) when its ``n`` values are not the stream's dimension."""
+        if self.dimension is None:
+            self.dimension, self.first = n, item
+        elif n != self.dimension and self.first is None:
+            raise RefusalError(
+                f"{item} has {n} values, but the database has dimension {self.dimension}: query it with embeddings "
+                f"of the kind it was built from."
+            )
+        elif n != self.dimension:
+            raise RefusalError(
+                f"{item} has {n} values, but {self.first} has {self.dimension}: all embeddings of a database have one "
+                f"dimension."
+            )
+
+
+def _parquet_file(f: Path) -> pq.ParquetFile:
+    """The Parquet file ``f``, which must hold the columns id and embedding (``iter_batches`` and ``read`` would drop a
+    missing one without a word). A :class:`RefusalError` names a file that cannot be opened, with the system's reason
+    (a missing path or broken link, no read permission: pyarrow's message puts it after the whole path, past
+    :func:`_cause`'s cut), a folder, a file that cannot be read as Parquet (empty, or without the footer that an
+    interrupted run leaves out) and a file without one of the two columns."""
+    try:
+        pf = pq.ParquetFile(f)
+    except (OSError, pa.ArrowException) as exc:
+        if isinstance(exc, OSError) and exc.errno:  # not opened: a missing path or broken link, no read permission
+            raise RefusalError(f"{f} could not be opened ({os.strerror(exc.errno)}).") from exc
+        if isinstance(f, (str, Path)) and Path(f).is_dir():  # a dataset folder named *.parquet, as Spark writes one
+            raise RefusalError(f"{f} is a folder, not a Parquet file.") from exc
+        raise RefusalError(
+            f"{f} could not be read as Parquet ({_cause(exc)}). Write it again: an interrupted run or a damaged copy "
+            f"leaves an unreadable file."
+        ) from exc
+    missing = [f"'{name}'" for name in ('id', 'embedding') if name not in pf.schema_arrow.names]
+    if missing:
+        raise RefusalError(
+            f"{f} has no {' or '.join(missing)} column: a Parquet embedding file holds the columns id and embedding."
+        )
+    return pf
+
+
+def _read_batches(f: Path, batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+    """The ``batches`` of the Parquet file ``f``: a read error (a corrupted page) is a :class:`RefusalError` that names
+    the file. An error in the caller's loop body is raised in the caller, not in this generator, so it is not caught."""
+    try:
+        yield from batches
+    except (OSError, pa.ArrowException) as exc:
+        raise RefusalError(
+            f"{f} could not be read as Parquet ({_cause(exc)}). Write it again: an interrupted run or a damaged copy "
+            f"leaves an unreadable file."
+        ) from exc
+
+
+def _parquet_vectors(f: Path, batch_size: int, dimension: _OneDimension) -> Iterator[tuple[list, np.ndarray]]:
+    """The (ids, [B, D] float32) batches of a Parquet file's columns id and embedding, one vector per row.
+
+    A Parquet file stores no shape, so every row of the file must hold as many values as its first row, across all
+    its batches: a file of residue embeddings flattened one table per row, whose rows differ in length, is refused
+    (its values were cut into equal slices, one per row). So are an 'embedding' column that is not a list of floats,
+    a row with no values (null or empty) and NaN or infinite values. The file's first row is checked against the
+    stream's dimension.
+    """
+    pf = _parquet_file(f)
+    kind = pf.schema_arrow.field('embedding').type
+    if not ((pa.types.is_list(kind) or pa.types.is_large_list(kind) or pa.types.is_fixed_size_list(kind))
+            and pa.types.is_floating(kind.value_type)):
+        raise RefusalError(
+            f"{f}: its 'embedding' column is of type {kind}, not a list of floating-point numbers: a row holds one "
+            f"embedding vector."
+        )
+    first = None  # the file's first row (id, number of values)
+    for record in _read_batches(f, pf.iter_batches(batch_size=batch_size, columns=['id', 'embedding'])):
+        ids = record.column('id').to_pylist()
+        column = record.column('embedding')
+        lengths = pc.list_value_length(column).fill_null(0).to_numpy(zero_copy_only=False)
+        empty = np.flatnonzero(lengths == 0)
+        if empty.size:
+            raise RefusalError(f"{f}: row {ids[int(empty[0])]} has no embedding.")
+        first_batch = first is None
+        if first_batch:
+            first = (ids[0], int(lengths[0]))
+        other = np.flatnonzero(lengths != first[1])
+        if other.size:
+            i = int(other[0])
+            raise RefusalError(
+                f"{f}: row {first[0]} has {first[1]} values, but row {ids[i]} has {int(lengths[i])}. A row holds one "
+                f"embedding vector; rows of different lengths are usually residue embeddings flattened by an earlier "
+                f"FoldMatch: compute chain embeddings with 'fm-embedding from-structures chain' or 'fm-embedding "
+                f"from-sequences chain'."
+            )
+        if first_batch:  # after the row lengths, whose refusal says more about residue embeddings
+            dimension.check(f"{f} (row {first[0]})", first[1])
+        # flatten() honours a slice's offset (.values does not); the lengths are checked, so the reshape is exact.
+        flat = column.flatten().to_numpy(zero_copy_only=False)
+        arr = np.ascontiguousarray(flat.reshape(len(ids), first[1]).astype(np.float32, copy=False))
+        finite = np.isfinite(arr)
+        if not finite.all():
+            i = int(np.flatnonzero(~finite.all(axis=1))[0])
+            raise RefusalError(
+                f"{f}: row {ids[i]} holds {first[1] - int(finite[i].sum())} NaN or infinite value(s) among its "
+                f"{first[1]}: such an embedding is never found, and as a query it finds nothing."
+            )
+        yield ids, arr
+
+
 def stream_embeddings(
         path: Path,
         file_extension: Optional[str] = None,
         batch_size: int = 32768,
+        expected_dim: Optional[int] = None,
 ) -> Iterator[tuple[list[str], np.ndarray]]:
     """Yield (ids, [B, D] float32) batches from a file or directory of .pt / .csv / .parquet.
 
-    Parquet shards are streamed via ``ParquetFile.iter_batches`` (many chains per file).
-    .pt and .csv hold one chain or assembly vector per file (ID = filename stem) and are
-    chunked into batches of ``batch_size``: a tensor or CSV with at most one axis longer
-    than 1 ([D], [1, D], [D, 1]; a .csv of one column, as CsvBatchWriter writes a vector, or
-    of one line). A table, such as residue embeddings ([L, D], one row per residue), is
-    refused with a :class:`RefusalError` naming the file, not averaged: its mean is not a
-    chain embedding. So are files that cannot be read, of no values or with NaN or infinite
-    values (:func:`_file_vector`). A single file is handled as a degenerate directory-of-one;
-    ``file_extension`` is ignored in that case.
+    Parquet shards are streamed via ``ParquetFile.iter_batches`` (many chains per file): each
+    row of the 'embedding' column, a list of floats, holds one vector, every row of a file as
+    many values as its first row (:func:`_parquet_vectors`; flattened residue embeddings, null
+    rows and NaN are refused). .pt and .csv hold one chain or assembly vector per file (ID =
+    filename stem) and are chunked into batches of ``batch_size``: a tensor or CSV with at
+    most one axis longer than 1 ([D], [1, D], [D, 1]; a .csv of one column, as CsvBatchWriter
+    writes a vector, or of one line). A table, such as residue embeddings ([L, D], one row per
+    residue), is refused with a :class:`RefusalError` naming the file, not averaged: its mean
+    is not a chain embedding. So are files that cannot be read, of no values or with NaN or
+    infinite values (:func:`_file_vector`), and a .pt and a .csv of one stem (one id twice).
+    Every embedding has one dimension: ``expected_dim`` (a query's database's) when given,
+    else the first one's (Parquet files are read first, then .pt, then .csv). A single file is
+    handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case.
     """
     p = Path(path)
     if not p.exists():
@@ -356,21 +475,30 @@ def stream_embeddings(
     parquet_files = [f for f in files if f.suffix in _BATCH_EXTS]
     point_files = [f for f in files if f.suffix in _POINT_EXTS]
 
+    by_id = {}
+    for f in point_files:
+        by_id.setdefault(f.stem, []).append(f)
+    pairs = [same for same in by_id.values() if len(same) > 1]  # a .pt and a .csv of one stem
+    if pairs:
+        a, b = pairs[0][:2]
+        more = f", as do {len(pairs) - 1} more pair(s) of .pt and .csv files" if len(pairs) > 1 else ""
+        raise RefusalError(
+            f"{a} and {b} give the same id, {a.stem}{more}: the id of a .pt or .csv embedding is its file name "
+            f"without the extension. Read one kind of file with --file-extension .pt or --file-extension .csv (runs "
+            f"that write residue and chain embeddings to one folder leave such pairs)."
+        )
+
+    dimension = _OneDimension(expected_dim)
     for parquet_file in parquet_files:
-        pf = pq.ParquetFile(parquet_file)
-        for record in pf.iter_batches(batch_size=batch_size, columns=['id', 'embedding']):
-            ids = record.column('id').to_pylist()
-            flat = record.column('embedding').values.to_numpy(zero_copy_only=False)
-            arr = np.ascontiguousarray(
-                flat.reshape(len(record), -1).astype(np.float32, copy=False)
-            )
-            yield ids, arr
+        yield from _parquet_vectors(parquet_file, batch_size, dimension)
 
     ids_buf: list[str] = []
     emb_buf: list[np.ndarray] = []
     for f in point_files:
+        vector = _file_vector(f)
+        dimension.check(str(f), vector.shape[0])
         ids_buf.append(f.stem)
-        emb_buf.append(_file_vector(f))
+        emb_buf.append(vector)
         if len(ids_buf) >= batch_size:
             yield ids_buf, np.ascontiguousarray(np.stack(emb_buf))
             ids_buf, emb_buf = [], []
