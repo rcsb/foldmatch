@@ -29,13 +29,13 @@ class EsmProtFromStructure(IterableDataset):
             src_location: SrcLocation = SrcLocation.file,
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.min_res_n = min_res_n
         self.src_location = src_location
         self.structure_format = structure_format
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
 

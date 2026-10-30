@@ -517,6 +517,26 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Fixed
 
+- **Assembly embeddings of entries with more than one assembly.** Structures
+  were cached under the entry name alone, so assemblies of an entry read one
+  after another all got the first one's chains. `fm-search build structures
+  --granularity assembly` and `fm-embedding from-structures assembly` gave
+  every assembly of an entry the chains of its first; `inference
+  assembly-embedding` and `inference complete-embedding` did the same for
+  assemblies of one entry read in a row by one process (input rows are sorted
+  by entry). `fm-search query structure --granularity assembly` read the
+  requested assembly, so such queries were compared with wrong database
+  vectors. The cache now keys on the assembly too, and each dataset has its
+  own. An assembly with no protein chain long enough (`--min-res`,
+  `--min-res-n`) is now skipped with a warning by the first two commands
+  (before, it got the first assembly's chains, and a first assembly without
+  one stopped the build); the `inference` commands refuse it when their input
+  lists it (`No chains found for ...`), as they did for a first assembly.
+  Given a URL, the assembly inference of the library
+  (`foldmatch.inference.assembly_complete_inference`) read the download to its
+  end while listing its assemblies, then failed on every entry; it now reads
+  it from its start. **Rebuild assembly databases, and recompute assembly
+  embeddings, of entries with more than one assembly.**
 - **`--log-level warn` sets up logging.** It set up none in every command of
   `fm-search`, `fm-embedding` and `inference` (the option's value is `warn`,
   the set-up looked for `warning`), so a warning printed in Python's default

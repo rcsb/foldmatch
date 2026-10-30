@@ -16,6 +16,7 @@ def get_structure_from_src(
         assembly_id=None
 ):
     try:
+        __rewind(src_structure)
         if __is_path(src_structure) and Path(src_structure).suffix == ".gz":
             if structure_format == "mmcif" or structure_format == "pdb":
                 src_structure = gzip.open(src_structure, "rt")
@@ -55,6 +56,7 @@ def get_protein_chains(structure, min_res_n=0):
 
 def get_assemblies(structure, structure_format="mmcif"):
     try:
+        __rewind(structure)
         if __is_path(structure) and Path(structure).suffix == ".gz":
             if structure_format == "mmcif" or structure_format == "pdb":
                 structure = gzip.open(structure, "rt")
@@ -116,6 +118,13 @@ def __get_structure(cif_file, assembly_id=None):
         model=1,
         use_author_fields=False
     )
+
+def __rewind(src):
+    # A stream (a downloaded file) may be read more than once: its assemblies, then each assembly.
+    seekable = getattr(src, "seekable", None)
+    if seekable is not None and seekable():
+        src.seek(0)
+
 
 def __is_path(val):
     if isinstance(val, (str, os.PathLike)):

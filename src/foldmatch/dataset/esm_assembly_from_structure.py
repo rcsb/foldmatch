@@ -29,13 +29,13 @@ class EsmAssemblyFromStructure(IterableDataset):
             src_location: SrcLocation = SrcLocation.file,
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.min_res_n = min_res_n
         self.src_location = src_location
         self.structure_format = structure_format
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
 
@@ -92,11 +92,11 @@ class EsmAssemblyFromStructure(IterableDataset):
             src_structure = row[EsmAssemblyFromStructure.STREAM_ATTR]
             item_name = row[EsmAssemblyFromStructure.ITEM_NAME_ATTR]
 
-            structure = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
-            for assembly_id in get_assemblies(structure=structure, structure_format=self.structure_format):
+            src = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
+            for assembly_id in get_assemblies(structure=src, structure_format=self.structure_format):
                 structure = self.__structure_provider.get_structure(
                     src_name=src_name,
-                    src_structure=structure,
+                    src_structure=src,
                     structure_format=self.structure_format,
                     assembly_id=assembly_id
                 )
@@ -123,4 +123,8 @@ class EsmAssemblyFromStructure(IterableDataset):
                             raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
                         protein_chain_list.append(protein_chain)
                         break  # Only process first atom_ch (same as original logic)
+                if not protein_chain_list:
+                    logger.warning(f"Assembly {item_name}-{assembly_id} has no protein chain of at least "
+                                   f"{self.min_res_n} residues: skipped")
+                    continue
                 yield protein_chain_list, f"{item_name}-{assembly_id}"

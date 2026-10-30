@@ -30,10 +30,10 @@ class EsmProtFromChain(Dataset):
         src_stream: FileOrStreamTuple,
         src_location:SrcLocation = SrcLocation.file,
         structure_format: StructureFormat = StructureFormat.mmcif,
-        structure_provider: StructureProvider = StructureProvider()
+        structure_provider: StructureProvider = None
     ):
         super().__init__()
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         self.src_location = src_location
         self.structure_format = structure_format
         self.data = pd.DataFrame()

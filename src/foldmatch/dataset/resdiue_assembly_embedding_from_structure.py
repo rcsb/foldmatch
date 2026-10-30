@@ -30,7 +30,7 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
             min_res_n: int = 0,
             max_res_n: int = sys.maxsize,
             res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         self.src_location = src_location
         self.structure_format = structure_format

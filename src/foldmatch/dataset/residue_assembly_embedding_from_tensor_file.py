@@ -31,7 +31,7 @@ class ResidueAssemblyEmbeddingFromTensorFile(Dataset):
             min_res_n: int = 0,
             max_res_n: int = sys.maxsize,
             res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.res_embedding_location = res_embedding_location
@@ -42,7 +42,7 @@ class ResidueAssemblyEmbeddingFromTensorFile(Dataset):
         self.res_embedding_format = res_embedding_format
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
 
     def __load_stream(self, src_stream):
         self.data = pd.DataFrame(

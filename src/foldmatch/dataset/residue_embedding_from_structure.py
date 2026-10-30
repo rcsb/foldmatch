@@ -29,7 +29,7 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
             res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         if not os.path.isdir(res_embedding_location):
             raise FileNotFoundError(f"Folder {res_embedding_location} does not exist")
@@ -38,7 +38,7 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
         self.structure_format = structure_format
         self.min_res_n = min_res_n
         self.res_embedding_format = res_embedding_format
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         super().__init__(
             src_stream=self.__get_chains(src_stream),
             src_location=SrcLocation.stream,

@@ -33,7 +33,7 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
             max_res_n: int = sys.maxsize,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.src_location = src_location
@@ -43,7 +43,7 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
         self.embedding_dim = embedding_dim
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         self.table = pq.read_table(parquet_path)
         self._id_index = {
             self.table.column('id')[i].as_py(): i
