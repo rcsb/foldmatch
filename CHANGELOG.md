@@ -537,6 +537,18 @@ While the major version is `0`, breaking changes are released in a minor bump.
   end while listing its assemblies, then failed on every entry; it now reads
   it from its start. **Rebuild assembly databases, and recompute assembly
   embeddings, of entries with more than one assembly.**
+- **Chain and assembly embeddings saved as CSV.** `fm-embedding` and
+  `inference` write a chain or assembly embedding to CSV (their default
+  `--output-format`) as one column, one value per line. `fm-search build
+  embeddings` and `fm-search query embedding` read a CSV of several rows as
+  residue embeddings and averaged its rows, so each vector became one number:
+  a database built from such files had dimension 1 (every score was +1 or -1),
+  and a query with them failed. A one-column CSV is now read as one vector;
+  residue embeddings (one row per residue) are still averaged. **Rebuild
+  databases built from CSV chain or assembly embeddings**: `fm-search stats`
+  shows them as `Dimension: 1`, and the `fm-search query embedding`,
+  `query db`, `cluster` and `similarity-graph` results made with them are
+  meaningless (every score is 1 or -1).
 - **`--log-level warn` sets up logging.** It set up none in every command of
   `fm-search`, `fm-embedding` and `inference` (the option's value is `warn`,
   the set-up looked for `warning`), so a warning printed in Python's default

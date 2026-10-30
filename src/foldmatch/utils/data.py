@@ -212,8 +212,10 @@ def stream_embeddings(
 
     Parquet shards are streamed via ``ParquetFile.iter_batches`` (many chains per file).
     .pt and .csv hold one chain per file (ID = filename stem) and are chunked into
-    batches of ``batch_size``. A single file is handled as a degenerate directory-of-one;
-    ``file_extension`` is ignored in that case.
+    batches of ``batch_size``. A file of residue embeddings ([L, D]: a 2-D tensor, or a .csv
+    of D columns) is averaged over its residues; a .csv of one column is one vector, as
+    CsvBatchWriter writes a chain or assembly embedding (one value per line). A single file
+    is handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case.
     """
     p = Path(path)
     if not p.exists():
@@ -264,6 +266,8 @@ def stream_embeddings(
                 emb = emb.detach().cpu().numpy()
         else:  # .csv
             emb = pd.read_csv(f, header=None).values
+            if emb.ndim == 2 and emb.shape[1] == 1:
+                emb = emb[:, 0]
         emb = np.asarray(emb, dtype=np.float32)
         if emb.ndim > 1:
             emb = np.mean(emb, axis=0)

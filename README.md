@@ -167,14 +167,17 @@ The toolkit ships three CLIs. Each is invoked with `--help` for full option docu
 Two subcommand groups reflect input modality:
 
 ```bash
+# Output folders must exist; give each kind of embedding its own (residue and chain files share names)
+mkdir -p out/residue out/chain out/assembly out/seq-residue out/seq-chain
+
 # Residue / chain / assembly embeddings from a folder of 3D structures
-fm-embedding from-structures residue  --src-folder data/pdb --output-path out --structure-format mmcif
-fm-embedding from-structures chain    --src-folder data/pdb --output-path out --structure-format mmcif
-fm-embedding from-structures assembly --src-folder data/pdb --output-path out --structure-format mmcif
+fm-embedding from-structures residue  --src-folder data/pdb --output-folder out/residue  --structure-format mmcif
+fm-embedding from-structures chain    --src-folder data/pdb --output-folder out/chain    --structure-format mmcif
+fm-embedding from-structures assembly --src-folder data/pdb --output-folder out/assembly --structure-format mmcif
 
 # Residue / chain embeddings from protein sequences in a FASTA file (no 3D required)
-fm-embedding from-sequences  residue  --fasta-file seqs.fasta --output-path out
-fm-embedding from-sequences  chain    --fasta-file seqs.fasta --output-path out
+fm-embedding from-sequences  residue  --fasta-file seqs.fasta --output-folder out/seq-residue
+fm-embedding from-sequences  chain    --fasta-file seqs.fasta --output-folder out/seq-chain
 
 # One-shot model download
 fm-embedding download-models
@@ -190,12 +193,12 @@ Run `fm-embedding [from-structures|from-sequences] [command] --help` for full op
 # Build a similarity-search database from structures, FASTA, or pre-computed embeddings
 fm-search build structures  --structure-folder data/pdb --output-db dbs/my_db --tmp-embedding-folder tmp
 fm-search build sequences   --fasta-file seqs.fasta     --output-db dbs/my_db --tmp-embedding-folder tmp
-fm-search build embeddings  --embedding-folder out      --output-db dbs/my_db
+fm-search build embeddings  --embedding-folder out/chain --output-db dbs/my_db
 
 # Query the database (--output-file is required)
 fm-search query structure   --db-path dbs/my_db --query-structure q.cif --output-file hits.tsv
 fm-search query sequences   --db-path dbs/my_db --fasta-file q.fasta --tmp-embedding-folder tmp --output-file hits.tsv
-fm-search query embedding   --db-path dbs/my_db --embedding-folder out --output-file hits.tsv
+fm-search query embedding   --db-path dbs/my_db --embedding-folder out/chain --output-file hits.tsv
 fm-search query db          --query-db-path dbs/queries --subject-db-path dbs/my_db --output-file hits.tsv
 
 # Inspect, cluster, export
