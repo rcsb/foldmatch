@@ -20,7 +20,7 @@ If you are interested in training a new model with a new structure dataset, visi
 - **Sequence-based embeddings** from FASTA files without requiring 3D structures
 - **Structure-level embeddings** aggregated via a transformer-based aggregator network 
 - **Fast and efficient** FAISS-based similarity search
-- **Two-stage sequence search** — an embedding prefilter followed by exact pairwise Smith-Waterman alignment, reporting sequence identity, coverage, and calibrated E-values over selectable output columns
+- **Two-stage sequence search** — an embedding prefilter followed by exact pairwise Smith-Waterman alignment on FoldMatch's native SIMD kernel, reporting sequence identity, coverage, and calibrated E-values over selectable output columns
 - **Structural clustering** using the Leiden algorithm for biological assembly identification
 - **Command-line interface** implemented with Typer for high-throughput inference workflows  
 - **Python API** for interactive embedding computation and integration into analysis pipelines  
@@ -50,11 +50,16 @@ pip install -e .
 - ESM 3.2.3
 - Lightning 2.6.1
 - Typer 0.24.1
-- Biotite 1.6.0
+- Biotite 1.7.1
 - FAISS 1.15.1 (the `faiss-cpu` wheel)
 - igraph 1.0.0
 - leidenalg 0.11.0
 - PyTorch with CUDA support (recommended for GPU acceleration)
+- A C compiler (GCC 12 or later, or Clang 14 or later) when FoldMatch is built from source (an install from the
+  sdist, `pip install -e .`): it compiles the native Smith-Waterman kernel of the sequence search's Stage 2. The
+  platform wheels (Linux x86_64 and aarch64, macOS arm64 and x86_64) include it. Without a compiler the install
+  still succeeds, with a warning, as a pure-Python package in which Stage 2 refuses to run and prints the reinstall
+  command; everything else works.
 
 **Optional Dependencies:**
 
@@ -250,6 +255,8 @@ chain_id   cluster_id   cluster_size
 
 `build sequences` also writes a sidecar `{db}.sequences` store next to the FAISS index. This lets sequence-built databases report **exact** sequence identity, not just embedding similarity: when you run `query sequences` (or `query db`) against such a database, a second stage pairwise-aligns each embedding hit (local Smith-Waterman, BLOSUM62) and re-ranks the surviving hits by identity.
 
+Stage 2 aligns on FoldMatch's native SIMD Smith-Waterman kernel, a compiled library (see *Requirements*). It reproduces biotite 1.7.1's `align_optimal` (local, affine gaps), ties included, which Stage 2 used before: the same scores, coordinates and alignments, so the same output. Without the kernel, `query sequences` and `query db` refuse to run Stage 2 before the queries are embedded or the database is searched, and print the command that rebuilds it; `--no-seq-identity` still runs an embedding-only search.
+
 Stage-2 hits use the same **tab-separated, no-header** format as every other query output. Pick the columns with `--format-output`:
 
 ```bash
@@ -283,7 +290,7 @@ Supported `--format-output` fields:
 
 - **Auto by default**: Stage 2 runs when the database(s) carry a sequence store and falls back to embedding-only otherwise. Force it with `--seq-identity` (errors if no store is present) or disable with `--no-seq-identity`. `query db` requires **both** databases to have sequence stores.
 - Hits below `--min-seq-identity` (default `0.3`) or `--min-coverage` (default `0.8`) are dropped, as are hits above `--max-evalue` (default `1e-3`; pass `inf` to keep every hit). `--max-evalue` turns the significance pass on even when neither `evalue` nor `bits` is in `--format-output`.
-- Tuning: `--gap-open`, `--gap-extend`, and `--align-workers` (defaults to all CPUs on the node).
+- Tuning: `--gap-open` (default `11`) and `--gap-extend` (default `1`), where a gap of length L costs gap-open + (L − 1) × gap-extend, and `--align-workers` (defaults to all CPUs on the node). `--gap-open` must be at least 1 and `--gap-extend` at least 0, both at most 1,048,576; the sign is ignored. With `--significance-mode default`, a run that needs significance (an `evalue` or `bits` column, or a finite `--max-evalue`, which the default `1e-3` is) needs the gap costs 11/1: for other gap costs use `--significance-mode sampled`, or `--max-evalue inf` with neither column in `--format-output`. Both rules are checked before the queries are embedded (`query sequences`) or the database is searched (`query db`).
 - Compositional bias correction: off by default, so alignments are scored with plain BLOSUM62. `--comp-bias-corr` (scaled by `--comp-bias-corr-scale`, default `1`) applies mmseqs's correction for locally biased amino-acid composition, which mmseqs enables by default; use it when comparing with `mmseqs search`. With the same setting on both tools, raw scores, bit scores and E-values match `mmseqs search` (18-8cc5c) on the same pairs, except for alignments containing a non-standard residue (`X`, `B`, `Z`, `J`, `U`, `O`, `*`), which the two tools score differently. The correction can shorten alignments over biased regions, so coordinates, identity and coverage change too.
 - `evalue`/`bits` use calibrated Karlin–Altschul statistics by default (`--significance-mode default`). `--significance-mode sampled` estimates λ/K by sampling for other gap penalties, but its absolute magnitudes are relative-only. The significance pass is skipped automatically when neither `evalue` nor `bits` is in `--format-output`.
 

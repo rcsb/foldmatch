@@ -352,7 +352,9 @@ While the major version is `0`, breaking changes are released in a minor bump.
   queries were embedded first and the command then failed with exit status 1
   (and the Python function `query_database_from_fasta` raised `ValueError`;
   it now raises `typer.BadParameter`). An embedding-only search does not use
-  the option and still ignores it; `fm-search query db` is unchanged.
+  the option and still ignores it. `fm-search query db` now checks it too,
+  before its search (see *BREAKING — the BLOSUM62 Stage 2 needs the native
+  kernel* below).
 - **An interrupted sequence-store build is detected.** A `.sequences` file
   whose build stopped part way (it now records its totals last) is refused
   with an "incomplete" error instead of being read as the whole database:
@@ -413,9 +415,69 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `fm-search query db`: a hit is kept only if the query coverage and the subject
   coverage both reach the value, so it is dropped when either side is below.
   The old text suggested the opposite. Filtering itself is unchanged.
-- **Faster BLOSUM62 Stage 2.** Sequence identity is computed vectorised from the
-  alignment trace, which makes `align_candidates` about 1.1-1.3x faster in a
-  serial run. The output is byte-identical.
+- **The BLOSUM62 Stage 2 aligns on FoldMatch's native SIMD kernel: the same
+  output, about 23 times faster.** `fm-search query sequences`
+  (`--scoring blosum62`, the default), `fm-search query db` and
+  `align_candidates` align each (query, candidate) pair with `fmswi_align`, an
+  integer Smith-Waterman added to FoldMatch's compiled library (the one of the
+  esm-codes kernel), instead of biotite's `align_optimal`. It uses a striped
+  query profile in 16-bit SIMD lanes (SSE2, AVX2, NEON, or a portable build) and
+  redoes a pair in 32-bit lanes when its score could overflow them; the scores
+  are exact integers, so every build gives the same results. It reproduces
+  biotite 1.7.1's `align_optimal` with `local=True` and affine gaps, ties
+  included: the same score, end cell and path, hence the same value in every
+  output column. On the full nbt.3988 benchmark, the Stage-2 tables were
+  byte-identical: 17,733,246 rows at `--threshold 0.7` and 9,503,077 at `0.8`.
+  Stage 2 of the 0.7 search took 486 s instead of 11,403 s (468 to 486 s over
+  the runs with the slices described below), on the CPU of one Perlmutter GPU
+  node (a 64-core AMD EPYC 7763) with 128 workers. The kernel alone aligned the
+  benchmark's largest query in 72 s instead of 9,864 s, and cut the end of the
+  run that waited on the longest queries from 8,459 s to 4 s. Pairs are now also
+  handed to the workers in slices of about a quarter of each worker's share of
+  the DP cells (a pair larger than that is a slice of its own), the largest
+  first, which shortens that end of the run to under 1 s. The composition-bias
+  correction (`--comp-bias-corr`) is part of the query profile and costs nothing
+  more. The traceback needs one byte per DP cell (359 MB for the benchmark's
+  largest pair, where biotite took 4.87 GB). A worker process that cannot load
+  the kernel now fails Stage 2 instead of hanging it.
+  `python -m foldmatch.search.swkern`, the kernel's self-test, also checks
+  `fmswi_align` against a golden digest and reports it under `fmswi`. biotite
+  remains a dependency: it supplies the BLOSUM62 matrix and the
+  `--significance-mode sampled` statistics.
+- **BREAKING — the BLOSUM62 Stage 2 needs the native kernel, and its gap costs
+  are checked before Stage 1.** A search that runs Stage 2 under BLOSUM62 now
+  needs FoldMatch's compiled kernel, as `--scoring esm-codes` already did. An
+  install without it (the pure-Python package a build from source falls back to
+  when it finds no C compiler; see *Platform wheels* below) aligned with
+  biotite; `fm-search query sequences` and `fm-search query db` now refuse it
+  before Stage 1, with exit status 1 and the command that rebuilds or reinstalls
+  the kernel, and `align_candidates` raises `KernelError`. There is no fallback.
+  Embedding-only searches (`--no-seq-identity`, or a database without a sequence
+  store) do not need the kernel. `--gap-open` must now be at least 1 (0 was
+  accepted) and `--gap-extend` at least 0, both at most 1,048,576; the sign is
+  still ignored. Called from Python, a gap cost must be a whole number: a float
+  such as `11.0` is still taken as 11, but `10.5`, which biotite truncated to
+  10, is now refused. Under `--significance-mode default`, gap costs other than
+  11/1 are refused, as before, whenever the run needs significance (an `evalue`
+  or `bits` column in `--format-output`, or a finite `--max-evalue`, `1e-3` by
+  default). `--significance-sample-size` must now be at least 2 (the Python
+  functions check it when they compute the sampled significance): under
+  `--significance-mode sampled`, 1 and 0 gave infinite or NaN bit scores and
+  E-values, and a negative size failed after Stage 1. These refusals now come
+  before Stage 1, before the queries are embedded (`query sequences`, on every
+  rank) or the database is loaded (`query db`), as usage errors (exit status 2)
+  that name the options and, for 11/1, the ways out
+  (`--gap-open 11 --gap-extend 1`; `--significance-mode sampled`; or
+  `--max-evalue inf` with neither column); the 11/1 refusal came after Stage 1,
+  with exit status 1 (the Python functions `query_database_from_fasta` and
+  `query_database_from_database` now raise `typer.BadParameter` for them).
+  `align_candidates` checks the gap costs the same way before it reads a
+  sequence or starts a worker (`ValueError`, or `TypeError` for one that is not
+  a whole number). A gap cost of `-11`/`-1` now counts as 11/1 under
+  `--significance-mode default` (it was refused there). Whenever Stage 2 runs,
+  `query db` also refuses an unknown or empty `--format-output` field before its
+  search, as a usage error (exit status 2); it failed with exit status 1 after
+  the search.
 - **Long FASTA sequences need far less ESM3 memory.** For sequence-only input
   (the FASTA paths of `fm-search`, `fm-embedding` and `inference`, and
   `FoldMatch.sequence_embedding` in the Python API), ESM3 now runs without its
@@ -438,7 +500,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `pip install --no-binary foldmatch`), an editable install (`pip install -e
   .`, `uv sync`) and `hatch test`. Without a usable compiler the install still
   succeeds, with a warning, as a pure-Python package: everything works as
-  before except the residue-code scoring (`--scoring esm-codes`), which refuses
+  before except the Stage 2 of a search (under either scoring, and in `query
+  db`: the BLOSUM62 Stage 2 aligns on the kernel too, see above), which refuses
   to run and prints the reinstall command, `pip install --no-cache-dir --force-reinstall
   --no-binary foldmatch foldmatch` (pip caches the pure-Python wheel, hence
   `--no-cache-dir`). Set `FOLDMATCH_REQUIRE_NATIVE=1` to make a failed compile
