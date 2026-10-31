@@ -1036,18 +1036,27 @@ class GapCostsTest(unittest.TestCase):
             raise AssertionError("subject sequences fetched before the gap check")
         common = dict(query_sequences={"q1": _STORE["s1"]}, prefilter_results={"q1": (["s1"], [0.9])},
                       fetch_subject_sequences=fetch, subject_db_size=1000, num_workers=1)
-        cases = [  # (options, message)
-            (dict(gap_open=0, max_evalue=None, compute_significance=False), "gap_open must be between 1 and"),
-            (dict(gap_extend=swint.MAX_GAP + 1, max_evalue=None), "gap_extend must be between 0 and"),
-            (dict(gap_open=5, gap_extend=2, max_evalue=None), "No calibrated statistics"),
-            (dict(gap_open=5, gap_extend=2, compute_significance=False), "E-value filtering"),
+        cases = [  # (options, exception, message)
+            (dict(gap_open=0, max_evalue=None, compute_significance=False), ValueError,
+             "gap_open must be between 1 and"),
+            (dict(gap_extend=swint.MAX_GAP + 1, max_evalue=None), ValueError, "gap_extend must be between 0 and"),
+            (dict(gap_open=10.5, max_evalue=None, compute_significance=False), TypeError,
+             "gap_open must be a whole number"),
+            (dict(gap_open=5, gap_extend=2, max_evalue=None), ValueError, "No calibrated statistics"),
+            (dict(gap_open=5, gap_extend=2, compute_significance=False), ValueError, "E-value filtering"),
         ]
-        for options, message in cases:
+        for options, exception, message in cases:
             for prefilter in (common["prefilter_results"], {}):
-                with self.subTest(**options, queries=len(prefilter)), \
-                        mock.patch.object(swint, "load", side_effect=AssertionError("kernel loaded")):
-                    with self.assertRaisesRegex(ValueError, message):
-                        alignment.align_candidates(**{**common, "prefilter_results": prefilter, **options})
+                for workers in (1, 4, None):                        # serial, a pool, the default pool
+                    with self.subTest(**options, queries=len(prefilter), workers=workers), \
+                            mock.patch.object(swint, "load", side_effect=AssertionError("kernel loaded")), \
+                            mock.patch.object(alignment, "_expand_cpu_affinity",
+                                              side_effect=AssertionError("worker pool set up")), \
+                            mock.patch.object(multiprocessing, "get_context",
+                                              side_effect=AssertionError("worker pool started")):
+                        with self.assertRaisesRegex(exception, message):
+                            alignment.align_candidates(**{**common, "prefilter_results": prefilter, **options,
+                                                          "num_workers": workers})
 
     @pytest.mark.usefixtures("fmsw_libs")
     def test_align_candidates_aligns_with_the_absolute_costs(self):

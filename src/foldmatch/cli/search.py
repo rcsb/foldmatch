@@ -1,6 +1,7 @@
 import glob
 import os
 import logging
+import math
 import shlex
 import sqlite3
 import sys
@@ -1144,10 +1145,12 @@ def query_database_from_fasta(
             help=_QUERY_MAX_EVALUE_HELP
         )] = None,
         gap_open: Annotated[Optional[int], typer.Option(
-            help='Gap-open penalty (positive) for Stage-2 alignment. Default: 11.' + _BLOSUM62_ONLY
+            help='Gap-open cost for Stage-2 alignment, 1 to 1048576 (the sign is ignored). Default: 11.'
+                 + _BLOSUM62_ONLY
         )] = None,
         gap_extend: Annotated[Optional[int], typer.Option(
-            help='Gap-extend penalty (positive) for Stage-2 alignment. Default: 1.' + _BLOSUM62_ONLY
+            help='Gap-extend cost for Stage-2 alignment, 0 to 1048576 (the sign is ignored). Default: 1.'
+                 + _BLOSUM62_ONLY
         )] = None,
         comp_bias_corr: Annotated[Optional[bool], typer.Option(
             help='Correct Stage-2 alignment scores for locally biased amino-acid '
@@ -1168,6 +1171,7 @@ def query_database_from_fasta(
                  "Default: 'default'." + _BLOSUM62_ONLY
         )] = None,
         significance_sample_size: Annotated[Optional[int], typer.Option(
+            min=2,
             help="For --significance-mode sampled: number of random alignments "
                  "sampled to estimate lambda/K for the BitScore/Pvalue/Evalue "
                  "columns. Larger is slower; ignored when mode is 'default'. "
@@ -1229,9 +1233,13 @@ def query_database_from_fasta(
         f"--seq-identity requires a database built from FASTA (fm-search build sequences).",
     )
     if run_stage2:
-        # The Stage-2 columns, refused (exit status 2) before ESM3, as under esm-codes.
-        _output_fields(format_output)
+        # The Stage-2 columns and gap costs, refused (exit status 2) before ESM3, as under esm-codes; then the stores
+        # Stage 2 reads and the kernel it aligns with.
+        fields = _output_fields(format_output)
+        _check_blosum62_gap_costs(gap_open, gap_extend, significance_mode, fields, max_evalue)
+        _check_significance_sample_size(significance_sample_size, significance_mode, fields, max_evalue)
         _check_stage2_stores(subject_store, max_evalue)
+        _check_blosum62_kernel()
 
     from foldmatch.search.embedding_computer import EmbeddingComputer
     embedding_computer = EmbeddingComputer(
@@ -1348,10 +1356,10 @@ def query_database_from_database(
                  "'inf' to disable E-value filtering."
         )] = 1e-3,
         gap_open: Annotated[int, typer.Option(
-            help='Gap-open penalty (positive) for Stage-2 alignment.'
+            help='Gap-open cost for Stage-2 alignment, 1 to 1048576 (the sign is ignored).'
         )] = 11,
         gap_extend: Annotated[int, typer.Option(
-            help='Gap-extend penalty (positive) for Stage-2 alignment.'
+            help='Gap-extend cost for Stage-2 alignment, 0 to 1048576 (the sign is ignored).'
         )] = 1,
         comp_bias_corr: Annotated[bool, typer.Option(
             help='Correct Stage-2 alignment scores for locally biased amino-acid '
@@ -1370,6 +1378,7 @@ def query_database_from_database(
                  "values are unreliable and comparable only within this tool."
         )] = SignificanceMode.default,
         significance_sample_size: Annotated[int, typer.Option(
+            min=2,
             help="For --significance-mode sampled: number of random alignments "
                  "sampled to estimate lambda/K for the BitScore/Pvalue/Evalue "
                  "columns. Larger is slower; ignored when mode is 'default'."
@@ -1415,7 +1424,12 @@ def query_database_from_database(
         f"Build databases with 'fm-search build sequences'.",
     )
     if run_stage2:
+        # As in 'query sequences': the Stage-2 columns and gap costs (exit status 2), then the stores and the kernel.
+        fields = _output_fields(format_output)
+        _check_blosum62_gap_costs(gap_open, gap_extend, significance_mode, fields, max_evalue)
+        _check_significance_sample_size(significance_sample_size, significance_mode, fields, max_evalue)
         _check_stage2_stores(subject_store, max_evalue, query_store=query_store)
+        _check_blosum62_kernel()
 
     # Load subject database
     logging.info("\nLoading subject database...")
@@ -2989,6 +3003,94 @@ def _check_stage2_stores(subject_store, max_evalue: Optional[float], query_store
     check_evalue_search_space(max_evalue, subject_store.total_residues())
 
 
+def _check_blosum62_gap_costs(gap_open: int, gap_extend: int, significance_mode: SignificanceMode,
+                              output_fields: List[str], max_evalue: Optional[float]) -> None:
+    """The gap costs of a BLOSUM62 Stage 2, refused with ``typer.BadParameter`` (exit status 2, D20) before ESM3 or
+    the search; ``align_candidates`` runs the same check (:func:`~foldmatch.search.alignment.check_gap_costs`) before
+    it reads a sequence.
+
+    The costs are the absolute values of the options (the sign is ignored, as it always was), whole numbers (the
+    Python functions also take a float such as 11.0, as before): ``--gap-open`` must be between 1 and
+    :data:`~foldmatch.search.swint.MAX_GAP` and ``--gap-extend`` between 0 and that maximum, the range of the native
+    kernel. Under ``--significance-mode default``, a run that needs significance (an ``evalue`` or ``bits`` column in
+    ``--format-output``, or a finite ``--max-evalue``) must use 11/1, the only gap costs with calibrated statistics;
+    the message names what needs it and the three ways out. The costs and the mode are checked here first, so the
+    only refusal ``check_gap_costs`` has left is that 11/1 rule.
+    """
+    from foldmatch.search import alignment, swint
+    from foldmatch.search.output import SIGNIFICANCE_FIELDS
+    costs = []
+    for flag, value, low, default in (("--gap-open", gap_open, 1, 11), ("--gap-extend", gap_extend, 0, 1)):
+        cost = alignment.whole_number(value)
+        if cost is None:
+            raise typer.BadParameter(f"must be a whole number, got {value!r}. The default is {default}.",
+                                     param_hint=flag)
+        if not low <= abs(cost) <= swint.MAX_GAP:
+            raise typer.BadParameter(
+                f"must be between {low} and {swint.MAX_GAP} (the sign is ignored), the range of the Stage-2 "
+                f"Smith-Waterman kernel; got {value}. The default is {default}.", param_hint=flag)
+        costs.append(abs(cost))
+    significance_mode = _significance_mode(significance_mode)
+    columns = [field for field in dict.fromkeys(output_fields) if field in SIGNIFICANCE_FIELDS]
+    try:
+        alignment.check_gap_costs(gap_open, gap_extend, significance_mode, bool(columns), max_evalue)
+    except ValueError:
+        needs, without = [], []
+        if columns:
+            needs.append(f"the {' and '.join(columns)} column{'s' if len(columns) > 1 else ''} of --format-output")
+            without.append("a --format-output without evalue and bits")
+        if max_evalue is not None and math.isfinite(max_evalue):
+            needs.append(f"the E-value filter --max-evalue {max_evalue:g}")
+            without.insert(0, "--max-evalue inf")
+        raise typer.BadParameter(
+            f"--significance-mode default has calibrated statistics only for the gap costs 11/1, and this run needs "
+            f"them for {' and '.join(needs)}; the gap costs given are {costs[0]}/{costs[1]}. Use "
+            f"--gap-open 11 --gap-extend 1; or --significance-mode sampled, whose E-values and bit scores work at any "
+            f"gap costs but are comparable only within this tool; or {' and '.join(without)}, to run without "
+            f"significance.", param_hint=["--gap-open", "--gap-extend"]) from None
+
+
+def _significance_mode(significance_mode) -> SignificanceMode:
+    """``--significance-mode`` as a :class:`SignificanceMode` (the Python functions may be given its value as a
+    string); anything else is refused with ``typer.BadParameter``."""
+    try:
+        return SignificanceMode(significance_mode)
+    except ValueError:
+        raise typer.BadParameter(f"{significance_mode!r} is not a significance mode; expected one of "
+                                 f"{', '.join(m.value for m in SignificanceMode)}.",
+                                 param_hint="--significance-mode") from None
+
+
+def _check_significance_sample_size(significance_sample_size: int, significance_mode: SignificanceMode,
+                                    output_fields: List[str], max_evalue: Optional[float]) -> None:
+    """``--significance-sample-size`` of a BLOSUM62 Stage 2 that samples its statistics (``--significance-mode
+    sampled``, with an ``evalue`` or ``bits`` column or a finite ``--max-evalue``) must be at least 2, else
+    ``typer.BadParameter`` before ESM3 or the search: from 1 or 0 alignments lambda and K come out infinite or NaN,
+    and a negative size failed after Stage 1. The option itself has ``min=2``; this check serves the Python
+    functions, which typer does not parse."""
+    from foldmatch.search.output import needs_significance
+    filtering = max_evalue is not None and math.isfinite(max_evalue)
+    if _significance_mode(significance_mode) is SignificanceMode.sampled and (
+            needs_significance(output_fields) or filtering) and not significance_sample_size >= 2:
+        raise typer.BadParameter(f"must be at least 2 with --significance-mode sampled, got "
+                                 f"{significance_sample_size!r}. The default is 500.",
+                                 param_hint="--significance-sample-size")
+
+
+def _check_blosum62_kernel() -> None:
+    """The native kernel of the BLOSUM62 Stage 2 (:func:`foldmatch.search.swint.load`), loaded before ESM3 or the
+    search, as under esm-codes (:func:`resolve_esm_codes_database`, step 4): a library that is missing (an install
+    built without a C compiler), stale or of another ABI is a :class:`RefusalError` (exit status 1) whose message
+    gives the rebuild command. There is no other aligner."""
+    from foldmatch.search import swint, swkern
+    try:
+        swint.load()
+    except swkern.KernelError as exc:
+        raise RefusalError(
+            f"Stage 2 (sequence identity) needs the native Smith-Waterman kernel, which cannot be used here: {exc}. "
+            f"--no-seq-identity runs an embedding-only search, which does not need it.") from exc
+
+
 def _resolve_stage2(seq_identity: Optional[bool], stores_available: bool, missing_msg: str) -> bool:
     """Decide whether to run Stage-2 sequence-identity alignment.
 
@@ -3105,8 +3207,8 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
 
 
 def _output_fields(format_output: str) -> List[str]:
-    """The ``--format-output`` fields of a ``query sequences`` Stage 2, parsed before ESM3: an empty list or an
-    unknown field is refused with ``typer.BadParameter`` (exit status 2)."""
+    """The ``--format-output`` fields of a ``query sequences`` or ``query db`` Stage 2, parsed before ESM3 or the
+    search: an empty list or an unknown field is refused with ``typer.BadParameter`` (exit status 2)."""
     from foldmatch.search import output
     try:
         return output.parse_format_output(format_output)

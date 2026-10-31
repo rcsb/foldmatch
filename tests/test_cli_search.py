@@ -5,6 +5,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, DEFAULT_OUTPUT_FIELDS
 from foldmatch.types.api_types import StructureFormat, Accelerator, Granularity, FormatMode
 
@@ -553,6 +555,7 @@ class TestCliSearch(unittest.TestCase):
         nodes = root.findall('.//g:node', ns)
         self.assertGreater(len(nodes), 0)
 
+    @pytest.mark.usefixtures("fmsw_libs")    # Stage 2 runs on the native kernel
     def test_25_stage2_format_output_tsv(self):
         """Stage-2 sequence-identity search emits mmseqs-style TSV columns.
 
@@ -669,6 +672,7 @@ class TestCliSearch(unittest.TestCase):
             )
         self.assertIn("not_a_field", str(ctx.exception))
 
+    @pytest.mark.usefixtures("fmsw_libs")    # Stage 2 runs on the native kernel
     def test_27_fasta_min_res_n_filters_index_store_and_queries(self):
         """--min-res-n drops short sequences from the index, the sequence store
         and the embedded queries alike.
