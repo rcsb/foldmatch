@@ -155,6 +155,47 @@ class TestKernelAgainstBiotite(unittest.TestCase):
                         np.testing.assert_array_equal(other.out, base.out, err_msg=msg)
                         self.assertEqual(other.ops, base.ops, msg)
 
+    def test_the_golden_set_against_biotite(self):
+        """The biotite-free golden digest (swint.GOLDEN_SHA256, checked on every build by test_swkern.py) pins
+        biotite's alignments: every pair of swint.golden_cases (synthetic profiles, offsets, long gaps, gap_extend >
+        gap_open, the 32-bit path, the 16-bit limit to the unit, the long lazy-F loop, empty alignments and targets)
+        aligns as biotite aligns it with the same position-specific scores, every output field and the path."""
+        import biotite.sequence as seq
+        import biotite.sequence.align as align
+        wide = 0
+        for case in swint.golden_cases():
+            res = swint.run_golden(case, 1)
+            n = len(case.qcodes)
+            alphabet = seq.Alphabet(list(range(n)))
+            positional = seq.GeneralSequence(alphabet, list(range(n)))
+            matrix = align.SubstitutionMatrix(alphabet, seq.ProteinSequence.alphabet, case.qprof)
+            for k, t in enumerate(case.targets):
+                o = res.out[k]
+                msg = f"{case.kind} n={n} m={len(t)} gaps {case.gap_open}/{case.gap_extend}"
+                wide += int(o[swint.WIDE])
+                if len(t) == 0:
+                    self.assertFalse(o.any(), msg)
+                    continue
+                target = seq.ProteinSequence()
+                target.code = t
+                want = align.align_optimal(positional, target, matrix, local=True, max_number=1,
+                                           gap_penalty=(-case.gap_open, -case.gap_extend))[0]
+                self.assertEqual(int(o[swint.SCORE]), int(want.score), msg)
+                self.assertEqual(int(o[swint.ALNLEN]), len(want.trace), msg)
+                if not len(want.trace):
+                    continue
+                trace = want.trace
+                np.testing.assert_array_equal(_trace_from_ops(res.path(k), int(o[swint.QSTART]),
+                                                              int(o[swint.TSTART])), trace, err_msg=msg)
+                gaps = trace < 0                                 # [L, 2]: 'D' (query side), 'I' (target side)
+                both = ~gaps.any(axis=1)
+                self.assertEqual((int(o[swint.QEND]), int(o[swint.TEND])), tuple(trace.max(axis=0) + 1), msg)
+                self.assertEqual(int(o[swint.NIDENT]), int((case.qcodes[trace[both, 0]] == t[trace[both, 1]]).sum()),
+                                 msg)
+                self.assertEqual(int(o[swint.GAPOPEN]), int(gaps[0].sum() + (gaps[1:] & ~gaps[:-1]).sum()), msg)
+                self.assertEqual((int(o[swint.NQGAP]), int(o[swint.NTGAP])), tuple(gaps.sum(axis=0)), msg)
+        self.assertEqual(wide, 10)
+
     def test_score_only_and_arguments(self):
         res = swint.align_batch(swint.codes_of(b"MKV"), swint.query_profile(swint.codes_of(b"MKV"), self.mat),
                                 swint.codes_of(b"MKVMKV"), [0, 3], [3, 3], 11, 1, traceback=False)
