@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
-from biotite.structure import filter_amino_acids, filter_polymer, chain_iter, get_chains, get_residues, \
+from biotite.structure import filter_amino_acids, filter_polymer, chain_iter, get_residues, \
     filter_peptide_backbone, residue_iter, array
 from biotite.structure.io.pdb import PDBFile, get_structure as get_pdb_structure, get_assembly as get_pdb_assembly, list_assemblies as list_pdb_assemblies
 from biotite.structure.io.pdbx import CIFFile, get_structure, get_assembly, BinaryCIFFile, list_assemblies
@@ -44,14 +44,18 @@ def get_structure_from_src(
     return structure
 
 
-def get_protein_chains(structure, min_res_n=0):
-    chain_ids = []
+def protein_chain_iter(structure, min_res_n=0):
+    """Each chain_iter piece of the structure with polymer amino-acid residues, at least min_res_n of them, in order.
+    The copies of a chain in an assembly share its chain ID."""
     for atom_ch in chain_iter(structure):
         atom_res = atom_ch[filter_polymer(atom_ch)]
         atom_res = atom_res[filter_amino_acids(atom_res)]
         if len(atom_res) > 0 and len(get_residues(atom_res)[0]) >= min_res_n:
-            chain_ids.append(str(get_chains(atom_res)[0]))
-    return tuple(chain_ids)
+            yield atom_ch
+
+
+def get_protein_chains(structure, min_res_n=0):
+    return tuple(str(atom_ch.chain_id[0]) for atom_ch in protein_chain_iter(structure, min_res_n))
 
 
 def get_assemblies(structure, structure_format="mmcif"):

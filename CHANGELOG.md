@@ -616,6 +616,59 @@ While the major version is `0`, breaking changes are released in a minor bump.
   end while listing its assemblies, then failed on every entry; it now reads
   it from its start. **Rebuild assembly databases, and recompute assembly
   embeddings, of entries with more than one assembly.**
+- **Assembly embeddings of assemblies with copies of a chain.** The copies of
+  a chain that an assembly's operators make keep the chain's ID, and
+  `fm-search build structures --granularity assembly` and `fm-embedding
+  from-structures assembly`, with the assembly inference of the library
+  (`foldmatch.inference.assembly_complete_inference`), read each protein
+  chain of an assembly by its ID, from the first stretch of atoms with that
+  ID: in mmCIF, BinaryCIF and PDB files alike, every copy of a chain was
+  embedded with the first copy's coordinates. Each copy is now read from its
+  own atoms, as `fm-search query structure --granularity assembly` already
+  read it. ESM reads each chain as PDB text, which cannot hold a coordinate
+  of -1000 Å or less, or of 10000 Å or more: a copy with one, embedded before
+  with its first copy's coordinates, now stops the first two commands and the
+  library (`Error while creating ESMProtein from structure chain ...`), as it
+  already stopped the query (none of the 1,341 assemblies with copies
+  checked, in 1,083 entries, has one). The number and order of the chains are
+  unchanged, and in mmCIF and BinaryCIF files laid out as the PDB archive's
+  are (each ligand with an asym ID of its own, each chain's records in one
+  block, with residue numbers that never decrease), the first copy of each
+  chain is read as before, bit for bit; any other mmCIF or BinaryCIF file
+  (one whose asym IDs are author chains, ligands included, as biotite writes
+  from a PDB structure, say) changes as a PDB file does, below, with its
+  `asym_id_list` for the REMARK 350 list. `inference assembly-embedding` and
+  `inference complete-embedding`, which repeat a chain's stored residue
+  embeddings for each of its copies, and the chain-level commands are
+  unaffected. PDB files name chains by their author IDs, and one ID can cover
+  several pieces of a chain; in them the residues embedded change too. A
+  chain whose residue numbers decrease is cut where they do, and each piece,
+  read before as the first one, is now read as itself. Where records of
+  another chain of the same REMARK 350 list (`APPLY THE FOLLOWING TO CHAINS`)
+  lie between a chain's records in the file, the chain is now cut there too:
+  a chain whose ATOM records are in separate blocks, read before whole for
+  each block, is read block by block, and amino-acid HETATM groups with the
+  chain's ID listed after other chains (free amino-acid ligands) are no
+  longer added to the chain; two or more of them with consecutive numbers
+  make a chain of their own once they reach `--min-res-n` (`--min-res` for
+  `fm-search`), which was embedded as the whole chain with them and is now
+  embedded as them alone. A chain is cut nowhere else: its blocks and
+  amino-acid HETATM groups with no other chain of the list between them (in a
+  list of that chain alone, say) stay together, as before and as the query
+  reads them. ESM3 embeds each chain on its own, and a copy differs from the
+  chain it copies only by a rigid motion and by the rounding of its
+  coordinates to 0.001 Å (after the motion, each atom within 0.0015 Å of its
+  first copy's, on 3,720 copies in 346 assemblies of 241 entries), so its
+  embeddings stay close to its first copy's, which it was given before: on 10
+  assemblies with copies, from C2 dimers to a 60-copy capsid, 30 of the
+  copies' 17,875 structure tokens changed, and the assembly embeddings kept a
+  cosine of at least 0.99987 to the old ones (at least 0.99999999 for 8 of
+  them), no value moving by more than 0.31% of the vector's norm. Rebuilding
+  assembly databases, or recomputing assembly embeddings, for the copies is
+  therefore optional. **Rebuild assembly databases, and recompute assembly
+  embeddings, made from PDB files, or from mmCIF and BinaryCIF files not laid
+  out as the archive's, with such chains**, whose residues change (34 chains
+  changed residues in PDB versions of 10 such entries).
 - **Chain and assembly embeddings saved as CSV.** `fm-embedding` and
   `inference` write a chain or assembly embedding to CSV (their default
   `--output-format`) as one column, one value per line. `fm-search build
