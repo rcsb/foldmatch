@@ -34,7 +34,7 @@ def predict(
         out_folder: Path = None,
         inference_set=None,
         res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-        embedding_dim: int = 1536,
+        *,
         return_predictions: bool = True,
 ):
     logger = logging.getLogger(__name__)
@@ -42,8 +42,7 @@ def predict(
     if inference_set is None:
         if src_from == SrcTensorFrom.parquet:
             inference_set = ResidueEmbeddingFromParquet(
-                parquet_path=src_stream,
-                embedding_dim=embedding_dim
+                parquet_path=src_stream
             )
         elif src_from == SrcTensorFrom.file:
             inference_set = ResidueEmbeddingFromTensorFile(

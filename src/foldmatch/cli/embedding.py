@@ -78,7 +78,7 @@ def from_structures_residue(
             help='Output folder to store predictions.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
-            help='Format of the output. Options: csv, pt, parquet, json.'
+            help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per chain, with one list of D values per residue.'
         )] = OutFormat.csv,
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
@@ -325,7 +325,7 @@ def from_sequences_residue(
             help='Output folder to store predictions.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
-            help='Format of the output. Options: csv, pt, parquet, json.'
+            help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per sequence, with one list of D values per residue.'
         )] = OutFormat.csv,
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'

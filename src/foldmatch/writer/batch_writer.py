@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import pandas as pd
 import pyarrow as pa
@@ -8,11 +9,13 @@ from collections import deque
 
 from lightning.pytorch.callbacks import BasePredictionWriter
 
+from foldmatch.errors import RefusalError
 from foldmatch.search.residue_shards import (
     SEQ_SHA1, SEQ_SHA1_BYTES, SEQ_SHA1_TYPE, check_residue_output, large_binary_array, pass_record, shard_schema,
 )
 
-#: Default byte budget of a writer with a residue column: buffered rows are written once they hold this many bytes.
+#: Default byte budget of a writer with a residue column or residue embeddings: buffered rows are written once they
+#: hold this many bytes.
 DEFAULT_BYTE_BUDGET = 256 * 1024 * 1024
 
 
@@ -147,8 +150,17 @@ class JsonStorage(DataFrameStorage):
 class ParquetBatchWriter(BasePredictionWriter):
     """Per-rank Parquet shard ``{output_path}/{df_id}-{rank}.parquet``, written in row groups.
 
-    Without ``residue_output`` the schema is the legacy ``id | embedding`` (no metadata) and a prediction's elements
-    beyond ``(embeddings, ids)`` are dropped, so plain passes write the same bytes as before.
+    Without ``residue_output`` the schema is the legacy ``id | embedding`` (``list<float32>``, no metadata) and a
+    prediction's elements beyond ``(embeddings, ids)`` are dropped, so plain passes write the same bytes as before. A
+    row holds one embedding vector (a chain, assembly or sequence embedding), so a tensor with more than one axis
+    longer than 1 is refused.
+
+    With ``residue_embeddings=True`` (``fm-embedding ... residue``, ``inference residue-embedding``) a row holds the
+    residue embeddings of one chain, a 2-D ``[L, D]`` tensor (ESM3's BOS and EOS rows included), as one list of D
+    values per residue: ``embedding`` is ``list<fixed_size_list<float32, D>>``, built from offsets, with no metadata.
+    D is stored in the schema, fixed at the first row group (the writer opens lazily; :attr:`schema` is None until
+    then), so every embedding must be 2-D and of one D. Not with ``residue_output``, whose ``embedding`` holds chain
+    embeddings.
 
     With ``residue_output`` (``"residue_codes"`` for builds, ``"query_encoding"`` for queries) and the scoring
     ``system``, the schema, fixed here, adds the payload column (``large_binary``) and ``seq_sha1``
@@ -161,8 +173,9 @@ class ParquetBatchWriter(BasePredictionWriter):
 
     Buffered rows are written as one row group once ``buffer_size`` rows (16,384) or ``byte_budget`` bytes are
     buffered, whichever comes first. The byte budget defaults to 256 MB with a residue column (query encodings take
-    128 B per residue) and to none without one, which keeps the plain row groups, and so the plain bytes, unchanged
-    (chain embeddings take 6 KiB a row, so 16,384 rows stay below 256 MB anyway).
+    128 B per residue) or with ``residue_embeddings`` (6 KiB per residue at D = 1536, so 16,384 chains would buffer
+    tens of GB), and to none otherwise, which keeps the plain row groups, and so the plain bytes, unchanged (chain
+    embeddings take 6 KiB a row, so 16,384 rows stay below 256 MB anyway).
     """
 
     def __init__(
@@ -176,18 +189,22 @@ class ParquetBatchWriter(BasePredictionWriter):
             byte_budget=None,
             min_res_n=None,
             esm_revision=None,
+            residue_embeddings=False,
     ):
         super().__init__(write_interval)
         self.out_path = output_path
         self.df_id = df_id
         self.buffer_size = buffer_size
         self.residue_output = check_residue_output(residue_output)
+        if residue_embeddings and self.residue_output is not None:
+            raise ValueError(f"a {self.residue_output} writer stores chain embeddings, not residue embeddings")
+        self.residue_embeddings = bool(residue_embeddings)
         if self.residue_output is None and (system is not None or min_res_n is not None or esm_revision is not None):
             raise ValueError("a scoring system and a pass record are only used by a writer with a residue output")
         if self.residue_output is not None and system is None:
             raise ValueError(f"a {self.residue_output} writer needs the scoring system (its schema metadata)")
         self.system = system
-        if byte_budget is None and self.residue_output is not None:
+        if byte_budget is None and (self.residue_output is not None or self.residue_embeddings):
             byte_budget = DEFAULT_BYTE_BUDGET
         if byte_budget is not None and int(byte_budget) <= 0:
             raise ValueError(f"byte_budget must be > 0, got {byte_budget!r}")
@@ -198,11 +215,15 @@ class ParquetBatchWriter(BasePredictionWriter):
         self._payload_buffer = []
         self._sha1_buffer = []
         self._buffered_bytes = 0
-        # Fixed here (the pass record is completed in on_predict_start, before the first row group): every row
-        # group of a rank has exactly this schema and metadata.
+        # Fixed here (the pass record is completed in on_predict_start, before the first row group; residue
+        # embeddings at the first row group, once D is known): every row group of a rank has exactly this schema and
+        # metadata.
         self._pass = None if self.residue_output is None else {"min_res_n": min_res_n, "esm_revision": esm_revision}
-        self._schema = shard_schema(self.residue_output, system,
-                                    None if self._pass is None else pass_record(**self._pass))
+        self._schema = None if self.residue_embeddings else shard_schema(
+            self.residue_output, system, None if self._pass is None else pass_record(**self._pass))
+        # Residue embeddings: D, set by the first table (its id kept for the refusal of another D).
+        self._residue_dim = None
+        self._residue_dim_id = None
 
     @property
     def schema(self):
@@ -247,6 +268,31 @@ class ParquetBatchWriter(BasePredictionWriter):
             raise ValueError(f"seq_sha1 must be {SEQ_SHA1_BYTES} bytes (e.g. for {bad[0]!r})")
         return payloads, digests
 
+    def _check_shapes(self, embeddings, dom_ids):
+        """Refuse an embedding this writer cannot store, before any of the batch is buffered: a row holds one vector
+        (a tensor with at most one axis longer than 1) or, with ``residue_embeddings``, one ``[L, D]`` table (D > 0),
+        of the first table's D."""
+        for emb, dom_id in zip(embeddings, dom_ids):
+            shape = list(emb.shape)
+            if not self.residue_embeddings:
+                if sum(n > 1 for n in shape) > 1:
+                    raise RefusalError(
+                        f"this Parquet writer stores one embedding vector per row, but {dom_id} has shape {shape}: "
+                        f"residue embeddings are written with residue_embeddings=True"
+                    )
+            elif len(shape) != 2 or shape[1] == 0:
+                raise RefusalError(
+                    f"this Parquet writer stores residue embeddings, one [L, D] table per row, but {dom_id} has shape "
+                    f"{shape}"
+                )
+            elif self._residue_dim is None:
+                self._residue_dim, self._residue_dim_id = shape[1], dom_id
+            elif shape[1] != self._residue_dim:
+                raise RefusalError(
+                    f"this Parquet writer stores residue embeddings of one dimension, but {dom_id} has {shape[1]} "
+                    f"values per residue and {self._residue_dim_id} has {self._residue_dim}"
+                )
+
     def write_on_batch_end(
             self,
             trainer,
@@ -260,14 +306,16 @@ class ParquetBatchWriter(BasePredictionWriter):
         if prediction is None:
             return
         # Without a residue column, extra tuple elements beyond (embeddings, ids)
-        # are dropped: this writer's schema is fixed at construction.
+        # are dropped: this writer's columns are fixed at construction.
         embeddings, dom_ids = prediction[0], prediction[1]
         if self.residue_output is not None:
             payloads, digests = self._residue_columns(prediction, dom_ids)
+        self._check_shapes(embeddings, dom_ids)
         self._id_buffer.extend(dom_ids)
         # Keep flattened float32 arrays (not Python lists) in the buffer — far
         # cheaper in memory until we flush. .flatten() copies, so the buffer
         # never aliases tensors that Lightning may reuse on the next batch.
+        # A residue table is kept flattened too: _flush counts its rows.
         flat = [emb.detach().to('cpu', torch.float32).numpy().flatten() for emb in embeddings]
         self._emb_buffer.extend(flat)
         if self.byte_budget is not None:
@@ -284,9 +332,13 @@ class ParquetBatchWriter(BasePredictionWriter):
         """Write the buffered rows as a single Parquet row group."""
         if not self._id_buffer:
             return
+        if self.residue_embeddings:
+            embedding = self._residue_embedding_array()
+        else:
+            embedding = pa.array(self._emb_buffer, type=pa.list_(pa.float32()))
         columns = {
             'id': self._id_buffer,
-            'embedding': pa.array(self._emb_buffer, type=pa.list_(pa.float32())),
+            'embedding': embedding,
         }
         if self.residue_output is not None:
             columns[self.residue_output] = large_binary_array(self._payload_buffer)
@@ -298,6 +350,16 @@ class ParquetBatchWriter(BasePredictionWriter):
         self._payload_buffer.clear()
         self._sha1_buffer.clear()
         self._buffered_bytes = 0
+
+    def _residue_embedding_array(self):
+        """The buffered residue tables as ``list<fixed_size_list<float32, D>>``: one list of D values per residue,
+        grouped into rows by offsets. The first call fixes the schema, with D."""
+        dim = self._residue_dim
+        if self._schema is None:
+            self._schema = pa.schema([('id', pa.string()), ('embedding', pa.list_(pa.list_(pa.float32(), dim)))])
+        offsets = np.concatenate(([0], np.cumsum([flat.size // dim for flat in self._emb_buffer])))
+        residues = pa.FixedSizeListArray.from_arrays(pa.array(np.concatenate(self._emb_buffer)), dim)
+        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), residues)
 
     def on_predict_end(self, trainer, pl_module):
         # Flush whatever didn't reach a full buffer before closing.

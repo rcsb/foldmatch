@@ -543,6 +543,56 @@ While the major version is `0`, breaking changes are released in a minor bump.
   a file that cannot be read or holds no values, a `.pt` that does not hold a
   dense tensor, and a CSV that is not numbers (its error named no file and
   could quote a whole line), each with the file's name.
+- **BREAKING — residue embeddings in Parquet keep their shape.** With
+  `--output-format parquet`, `fm-embedding from-structures residue`,
+  `fm-embedding from-sequences residue` and `inference residue-embedding`
+  write one row per chain whose `embedding` holds one list of `D` values per
+  residue (ESM3's BOS and EOS rows included, as before): its type is
+  `list<fixed_size_list<float32, D>>`, so the file stores `D`. They wrote each
+  chain's residue table flattened into one row of `list<float32>`, which
+  stores no shape. The Python readers `ResidueEmbeddingFromParquet` and
+  `ResidueAssemblyEmbeddingFromParquet`, and `chain_inference.predict`, lose
+  their `embedding_dim` argument, so a call that passes it now fails (for
+  `chain_inference.predict`, whatever its `src_from`), and the arguments of
+  `ResidueAssemblyEmbeddingFromParquet` after `parquet_path`, and
+  `return_predictions` of `chain_inference.predict`, are now keyword-only, so
+  that an old positional call fails too. The readers take `D` from the file,
+  read only the new layout and refuse a flat file, or one that cannot be read,
+  naming it. They read one file, or a list of files
+  (`ResidueEmbeddingFromParquet` only), such as the shards of a multi-device
+  run: `sorted(Path(OUT).glob("*.parquet"))`. A folder, which they read
+  before, is refused. `fm-search build embeddings` and `fm-search query
+  embedding` refuse the new files as residue embeddings, whatever their row
+  lengths. The files are written in row groups of about 256 MB, so a residue
+  run no longer holds up to 16,384 chains in memory. `ParquetBatchWriter`
+  writes the new layout with `residue_embeddings=True` (not with a residue
+  output); without it, it now refuses a tensor with more than one axis longer
+  than 1, and the chain, assembly and sequence embeddings and the residue-code
+  shards it writes are unchanged byte for byte. Recompute the residue Parquet
+  files of earlier versions, or convert one with this function (pyarrow only),
+  giving the number of values per residue (1536 for FoldMatch's ESM3), as in
+  `nest("inference-0.parquet", "inference-0-nested.parquet", 1536)`:
+
+  ```python
+  import pyarrow as pa
+  import pyarrow.parquet as pq
+
+  def nest(src, dst, d):
+      table = pq.read_table(src)
+      chunks = []
+      for flat in table.column("embedding").chunks:
+          offsets = flat.offsets.to_numpy() - flat.offsets[0].as_py()
+          if (offsets % d).any():
+              raise ValueError(f"{src}: a row is not a multiple of {d} values")
+          values = flat.flatten().cast(pa.float32())
+          offsets = pa.array(offsets // d, pa.int32())  # in residues
+          residues = pa.FixedSizeListArray.from_arrays(values, d)
+          chunks.append(pa.ListArray.from_arrays(offsets, residues))
+      kind = pa.list_(pa.list_(pa.float32(), d))
+      nested = pa.chunked_array(chunks, type=kind)
+      i = table.column_names.index("embedding")
+      pq.write_table(table.set_column(i, "embedding", nested), dst)
+  ```
 
 ### Fixed
 
@@ -604,7 +654,7 @@ While the major version is `0`, breaking changes are released in a minor bump.
   and a `.csv` file of one name in one folder (left, for example, by a
   residue run and a chain run that wrote to one folder) were read as two
   embeddings of one id; they are now refused, and `--file-extension .pt` or
-  `--file-extension .csv` reads one kind. Parquet stores no shape, so residue
+  `--file-extension .csv` reads one kind. A flat row stores no shape, so residue
   embeddings whose rows all have one length (a single chain, or chains of one
   length) still build a database, whose dimension is that length, but are
   refused as queries. **Rebuild databases built from Parquet residue

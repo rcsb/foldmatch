@@ -130,13 +130,14 @@ class AssemblyDatasetTest(unittest.TestCase):
 
     def test_from_parquet(self):
         ids = ["1acb.A", "1acb.B"]
-        embeddings = [_embedding(i[-1]).numpy().flatten().tolist() for i in ids]
+        embeddings = [_embedding(i[-1]).numpy().tolist() for i in ids]  # one list of D values per residue
+        kind = pa.list_(pa.list_(pa.float32(), _embedding("A").shape[1]))
         parquet = self.tmp / "residues.parquet"
         pq.write_table(pa.table({"id": ids, "embedding": embeddings},
-                                schema=pa.schema([("id", pa.string()), ("embedding", pa.list_(pa.float32()))])), parquet)
+                                schema=pa.schema([("id", pa.string()), ("embedding", kind)])), parquet)
         self.assert_assemblies(ResidueAssemblyEmbeddingFromParquet(
             src_stream=[("1acb", str(self.cif), "1", "1acb-1"), ("1acb", str(self.cif), "2", "1acb-2")],
-            parquet_path=parquet, embedding_dim=_embedding("A").shape[1], src_location=SrcLocation.stream))
+            parquet_path=parquet, src_location=SrcLocation.stream))
 
     def test_esm_proteins_of_every_assembly(self):
         """The ESM3 inputs of each assembly (fm-search build structures --granularity assembly, fm-embedding

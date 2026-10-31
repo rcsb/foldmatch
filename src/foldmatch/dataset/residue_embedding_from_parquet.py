@@ -3,10 +3,10 @@ from pathlib import Path
 from typing import List
 
 import torch
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 from torch.utils.data import Dataset
+
+from foldmatch.utils.data import residue_embeddings_from_parquet
 
 logger = logging.getLogger(__name__)
 
@@ -14,23 +14,24 @@ class ResidueEmbeddingFromParquet(Dataset):
 
     def __init__(
             self,
-            parquet_path: Path | List[Path],
-            embedding_dim: int
+            parquet_path: Path | List[Path]
     ):
         super().__init__()
-        self.embedding_dim = embedding_dim
         if isinstance(parquet_path, (str, Path)):
             paths = [parquet_path]
         else:
             paths = parquet_path
         logger.info(f"Loading {len(paths)} parquet file(s): {[str(p) for p in paths]}")
-        self.table = pa.concat_tables([pq.read_table(p) for p in paths])
+        # One row per chain, one list of D values per residue: the [L, D] tables, D from each file's column type.
+        self.ids = []
+        self.embeddings = []
+        for path in paths:
+            ids, embeddings = residue_embeddings_from_parquet(path)
+            self.ids.extend(ids)
+            self.embeddings.extend(embeddings)
 
     def __len__(self):
-        return len(self.table)
+        return len(self.ids)
 
     def __getitem__(self, idx):
-        item_id = self.table.column('id')[idx].as_py()
-        embedding_flat = self.table.column('embedding')[idx].as_py()
-        tensor = torch.tensor(embedding_flat, dtype=torch.float32).reshape(-1, self.embedding_dim)
-        return tensor, item_id
+        return torch.tensor(self.embeddings[idx]), self.ids[idx]

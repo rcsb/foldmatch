@@ -32,6 +32,61 @@ def load_residue_embedding(
         return torch.from_numpy(values).float()
     return torch.load(file_path, map_location=torch.device('cpu'), weights_only=True)
 
+
+def residue_dimension(kind: pa.DataType) -> Optional[int]:
+    """D when ``kind`` is the Parquet type of residue embeddings, ``list<fixed_size_list<float, D>>`` (one row per
+    chain, one list of D values per residue, as ParquetBatchWriter(residue_embeddings=True) writes them), else None."""
+    if ((pa.types.is_list(kind) or pa.types.is_large_list(kind)) and pa.types.is_fixed_size_list(kind.value_type)
+            and pa.types.is_floating(kind.value_type.value_type)):
+        return kind.value_type.list_size
+    return None
+
+
+def residue_embeddings_from_parquet(parquet_path: Path) -> Tuple[List[str], List[np.ndarray]]:
+    """The ids and the residue embeddings ([L, D] float32 arrays) of a Parquet file whose 'embedding' column holds one
+    list of D values per residue (:func:`residue_dimension`): D comes from the column type.
+
+    The column is combined once, and each table is a view of its values (Arrow flatten and a numpy reshape, no Python
+    lists). A :class:`RefusalError` names the file when it cannot be read as Parquet (a folder too) or lacks the column
+    id or embedding, and when the column is flat (a list of numbers per row: chain or assembly embeddings, or residue
+    embeddings as earlier versions wrote them, each table flattened), of another type, or holds a null row, residue
+    or value (flatten skips them, which would shift the tables after them).
+    """
+    pf = _parquet_file(parquet_path)
+    kind = pf.schema_arrow.field('embedding').type
+    dim = residue_dimension(kind)
+    if dim is None:
+        if ((pa.types.is_list(kind) or pa.types.is_large_list(kind) or pa.types.is_fixed_size_list(kind))
+                and pa.types.is_floating(kind.value_type)):
+            raise RefusalError(
+                f"{parquet_path} holds flat 'embedding' rows (one list of numbers per row): chain or assembly "
+                f"embeddings, or residue embeddings as earlier versions wrote them, each table flattened. Residue "
+                f"embeddings in Parquet now hold one list of D values per residue: recompute them, or convert an "
+                f"earlier file as the CHANGELOG shows."
+            )
+        raise RefusalError(
+            f"{parquet_path}: its 'embedding' column is of type {kind}, not residue embeddings, which are of type "
+            f"list<fixed_size_list<float32, D>> (D in the type), as ParquetBatchWriter(residue_embeddings=True) writes "
+            f"them. A column of lists of D values per residue converts with .cast(pa.list_(pa.list_(pa.float32(), D)))."
+        )
+    try:
+        table = pf.read(columns=['id', 'embedding'])
+    except (OSError, pa.ArrowException) as exc:  # a corrupted page, a null residue that pyarrow cannot read back
+        raise RefusalError(
+            f"{parquet_path} could not be read as Parquet ({_cause(exc)}). Write it again: an interrupted run or a "
+            f"damaged copy leaves an unreadable file."
+        ) from exc
+    column = table.column('embedding').combine_chunks()
+    residues = column.flatten()
+    values = residues.flatten()
+    if column.null_count or residues.null_count or values.null_count:
+        raise RefusalError(f"{parquet_path}: its 'embedding' column holds a null row, residue or value.")
+    values = values.to_numpy(zero_copy_only=False).astype(np.float32, copy=False).reshape(-1, dim)
+    offsets = column.offsets.to_numpy()
+    offsets = offsets - offsets[0]
+    return table.column('id').to_pylist(), [values[start:end] for start, end in zip(offsets[:-1], offsets[1:])]
+
+
 def collate_seq_embeddings(
         batch_list: List[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -374,14 +429,22 @@ def _read_batches(f: Path, batches: Iterator[pa.RecordBatch]) -> Iterator[pa.Rec
 def _parquet_vectors(f: Path, batch_size: int, dimension: _OneDimension) -> Iterator[tuple[list, np.ndarray]]:
     """The (ids, [B, D] float32) batches of a Parquet file's columns id and embedding, one vector per row.
 
-    A Parquet file stores no shape, so every row of the file must hold as many values as its first row, across all
+    A list of floats stores no shape, so every row of the file must hold as many values as its first row, across all
     its batches: a file of residue embeddings flattened one table per row, whose rows differ in length, is refused
-    (its values were cut into equal slices, one per row). So are an 'embedding' column that is not a list of floats,
-    a row with no values (null or empty) and NaN or infinite values. The file's first row is checked against the
-    stream's dimension.
+    (its values were cut into equal slices, one per row). So are residue embeddings as FoldMatch writes them (one
+    list of values per residue, :func:`residue_dimension`), any other 'embedding' column that is not a list of
+    floats, a row with no values (null or empty) and NaN or infinite values. The file's first row is checked against
+    the stream's dimension.
     """
     pf = _parquet_file(f)
     kind = pf.schema_arrow.field('embedding').type
+    if residue_dimension(kind) is not None:
+        raise RefusalError(
+            f"{f} holds residue embeddings (one list of values per residue), not one embedding vector per row: compute "
+            f"chain embeddings with 'fm-embedding from-structures chain' or 'fm-embedding from-sequences chain', or in "
+            f"Python with foldmatch.inference.chain_inference.predict(src_stream=FILE, src_from=SrcTensorFrom.parquet, "
+            f"out_folder=OUT), which writes one chain embedding per .csv file to the existing folder OUT."
+        )
     if not ((pa.types.is_list(kind) or pa.types.is_large_list(kind) or pa.types.is_fixed_size_list(kind))
             and pa.types.is_floating(kind.value_type)):
         raise RefusalError(
@@ -433,7 +496,7 @@ def stream_embeddings(
 
     Parquet shards are streamed via ``ParquetFile.iter_batches`` (many chains per file): each
     row of the 'embedding' column, a list of floats, holds one vector, every row of a file as
-    many values as its first row (:func:`_parquet_vectors`; flattened residue embeddings, null
+    many values as its first row (:func:`_parquet_vectors`; residue embeddings, null
     rows and NaN are refused). .pt and .csv hold one chain or assembly vector per file (ID =
     filename stem) and are chunked into batches of ``batch_size``: a tensor or CSV with at
     most one axis longer than 1 ([D], [1, D], [D, 1]; a .csv of one column, as CsvBatchWriter

@@ -47,8 +47,9 @@ class SharedNameTest(unittest.TestCase):
         os.symlink(_CIF, self.link)
         self.parquet = self.tmp / "residues.parquet"
         embeddings = [torch.load(_EMBEDDINGS / f"1acb.{c}.pt", map_location="cpu") for c in "AB"]
-        pq.write_table(pa.table({"id": ["1acb.A", "1acb.B"], "embedding": [e.numpy().flatten().tolist() for e in embeddings]},
-                                schema=pa.schema([("id", pa.string()), ("embedding", pa.list_(pa.float32()))])),
+        kind = pa.list_(pa.list_(pa.float32(), embeddings[0].shape[1]))  # one list of D values per residue
+        pq.write_table(pa.table({"id": ["1acb.A", "1acb.B"], "embedding": [e.numpy().tolist() for e in embeddings]},
+                                schema=pa.schema([("id", pa.string()), ("embedding", kind)])),
                        self.parquet)
 
     def datasets(self, sources):
@@ -64,7 +65,7 @@ class SharedNameTest(unittest.TestCase):
             "ResidueAssemblyEmbeddingFromTensorFile": lambda: ResidueAssemblyEmbeddingFromTensorFile(
                 src_stream=assemblies, res_embedding_location=_EMBEDDINGS, src_location=stream),
             "ResidueAssemblyEmbeddingFromParquet": lambda: ResidueAssemblyEmbeddingFromParquet(
-                src_stream=assemblies, parquet_path=self.parquet, embedding_dim=1536, src_location=stream),
+                src_stream=assemblies, parquet_path=self.parquet, src_location=stream),
             "ResidueAssemblyDatasetFromStructure": lambda: ResidueAssemblyDatasetFromStructure(
                 src_stream=three, res_embedding_location=_EMBEDDINGS, src_location=stream),
             "ResidueEmbeddingFromStructure": lambda: ResidueEmbeddingFromStructure(

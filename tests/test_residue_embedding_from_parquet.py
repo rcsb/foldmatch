@@ -21,14 +21,15 @@ class TestResidueEmbeddingFromParquet(unittest.TestCase):
                 os.unlink(fp)
 
     def _write_parquet(self, embeddings, ids, path):
+        # One row per chain, one list of D values per residue.
         schema = pa.schema([
             ('id', pa.string()),
-            ('embedding', pa.list_(pa.float32()))
+            ('embedding', pa.list_(pa.list_(pa.float32(), embeddings[0].shape[1])))
         ])
         table = pa.table(
             {
                 'id': ids,
-                'embedding': [emb.numpy().flatten().tolist() for emb in embeddings]
+                'embedding': [emb.numpy().tolist() for emb in embeddings]
             },
             schema=schema
         )
@@ -47,8 +48,7 @@ class TestResidueEmbeddingFromParquet(unittest.TestCase):
         self._write_parquet(originals, ids, parquet_path)
 
         dataset = ResidueEmbeddingFromParquet(
-            parquet_path=parquet_path,
-            embedding_dim=embedding_dim
+            parquet_path=parquet_path
         )
 
         self.assertEqual(len(dataset), 3)
@@ -65,7 +65,7 @@ class TestResidueEmbeddingFromParquet(unittest.TestCase):
         parquet_path = os.path.join(self.__tmp_path, "single.parquet")
         self._write_parquet([original], ["single"], parquet_path)
 
-        dataset = ResidueEmbeddingFromParquet(parquet_path, embedding_dim)
+        dataset = ResidueEmbeddingFromParquet(parquet_path)
         tensor, item_id = dataset[0]
 
         self.assertEqual(item_id, "single")

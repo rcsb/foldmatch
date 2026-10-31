@@ -53,7 +53,7 @@ def predict(
 
     if out_folder is not None:
         if out_format == OutFormat.parquet:
-            inference_writer = ParquetBatchWriter(out_folder, out_name)
+            inference_writer = ParquetBatchWriter(out_folder, out_name, residue_embeddings=True)
         elif out_format == OutFormat.json:
             inference_writer = JsonStorage(out_folder, out_name)
         elif out_format == OutFormat.pt:

@@ -25,11 +25,8 @@ class TestResidueAssemblyEmbeddingFromParquet(unittest.TestCase):
                 os.unlink(fp)
 
     def _build_parquet_from_tensor_files(self):
-        """Write the test .pt embeddings into a single Parquet file."""
-        schema = pa.schema([
-            ('id', pa.string()),
-            ('embedding', pa.list_(pa.float32()))
-        ])
+        """Write the test .pt embeddings into a single Parquet file: one row per chain, one list of D values per
+        residue."""
         ids = []
         embeddings = []
         for pt_file in sorted(os.listdir(self.__embeddings_path)):
@@ -40,8 +37,12 @@ class TestResidueAssemblyEmbeddingFromParquet(unittest.TestCase):
                 )
                 item_id = pt_file[:-3]  # strip .pt
                 ids.append(item_id)
-                embeddings.append(tensor.numpy().flatten().tolist())
+                embeddings.append(tensor.numpy().tolist())
 
+        schema = pa.schema([
+            ('id', pa.string()),
+            ('embedding', pa.list_(pa.list_(pa.float32(), len(embeddings[0][0]))))
+        ])
         table = pa.table({'id': ids, 'embedding': embeddings}, schema=schema)
         parquet_path = os.path.join(self.__tmp_path, "residue-embeddings.parquet")
         pq.write_table(table, parquet_path)
@@ -62,11 +63,9 @@ class TestResidueAssemblyEmbeddingFromParquet(unittest.TestCase):
             structure_format=StructureFormat.mmcif
         )
 
-        embedding_dim = 1536
         parquet_dataset = ResidueAssemblyEmbeddingFromParquet(
             src_stream=src_stream,
             parquet_path=parquet_path,
-            embedding_dim=embedding_dim,
             src_location=SrcLocation.stream,
             structure_format=StructureFormat.mmcif
         )
