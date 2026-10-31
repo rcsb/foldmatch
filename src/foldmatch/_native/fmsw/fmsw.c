@@ -21,11 +21,14 @@
  *      the values and the DP golden hash are unchanged.
  * -0 results are canonicalised to +0 (S8).
  */
+#define _POSIX_C_SOURCE 200112L     /* posix_memalign under -std=c11 (swi_alloc) */
+
 #include "fmsw.h"
 
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define F_HY 1   /* H[i,j] = Y[i,j]            */
@@ -587,4 +590,283 @@ FMSW_API int fmsw_align(const float *sim, int n, const int64_t *pair_off, const 
         if (path_off) path_off[k + 1] = po;
     }
     return FMSW_OK;
+}
+
+/* ================================================================================================================ */
+/* Integer local Smith-Waterman for the BLOSUM62 Stage 2 (DP id fmswi/1): output-equivalent to biotite 1.7.1        */
+/* align_optimal(local=True, max_number=1) with affine gaps (the same score, end cell and path; its own tables, not */
+/* biotite's). Model, layout and limits: fmsw.h. From a standalone prototype (Farrar striped query profile, lazy F, */
+/* 16-bit lanes with a 32-bit redo) validated against biotite; here with a position-specific profile (composition   */
+/* bias), a batch entry point, the lazy-F clamp and the two-pass traceback.                                         */
+/* ================================================================================================================ */
+#if !defined(FMSW_GENERIC) && defined(__ARM_NEON)
+#define SWI_VBYTES 16
+typedef int16_t swi_v16 __attribute__((vector_size(SWI_VBYTES)));
+typedef int32_t swi_v32 __attribute__((vector_size(SWI_VBYTES)));
+static inline swi_v16 swi_max16(swi_v16 a, swi_v16 b) { return (swi_v16)vmaxq_s16((int16x8_t)a, (int16x8_t)b); }
+static inline swi_v32 swi_max32(swi_v32 a, swi_v32 b) { return (swi_v32)vmaxq_s32((int32x4_t)a, (int32x4_t)b); }
+static inline int swi_any16(swi_v16 m) { return vmaxvq_u16((uint16x8_t)m) != 0; }
+static inline int swi_any32(swi_v32 m) { return vmaxvq_u32((uint32x4_t)m) != 0; }
+#elif !defined(FMSW_GENERIC) && defined(__AVX2__)
+#define SWI_VBYTES 32
+typedef int16_t swi_v16 __attribute__((vector_size(SWI_VBYTES)));
+typedef int32_t swi_v32 __attribute__((vector_size(SWI_VBYTES)));
+static inline swi_v16 swi_max16(swi_v16 a, swi_v16 b) { return (swi_v16)_mm256_max_epi16((__m256i)a, (__m256i)b); }
+static inline swi_v32 swi_max32(swi_v32 a, swi_v32 b) { return (swi_v32)_mm256_max_epi32((__m256i)a, (__m256i)b); }
+static inline int swi_any16(swi_v16 m) { return _mm256_movemask_epi8((__m256i)m) != 0; }
+static inline int swi_any32(swi_v32 m) { return _mm256_movemask_epi8((__m256i)m) != 0; }
+#elif !defined(FMSW_GENERIC) && (defined(__SSE2__) || defined(__x86_64__))
+#define SWI_VBYTES 16
+typedef int16_t swi_v16 __attribute__((vector_size(SWI_VBYTES)));
+typedef int32_t swi_v32 __attribute__((vector_size(SWI_VBYTES)));
+static inline swi_v16 swi_max16(swi_v16 a, swi_v16 b) { return (swi_v16)_mm_max_epi16((__m128i)a, (__m128i)b); }
+static inline swi_v32 swi_max32(swi_v32 a, swi_v32 b) { swi_v32 m = (swi_v32)(a > b); return (a & m) | (b & ~m); }
+static inline int swi_any16(swi_v16 m) { return _mm_movemask_epi8((__m128i)m) != 0; }
+static inline int swi_any32(swi_v32 m) { return _mm_movemask_epi8((__m128i)m) != 0; }
+#else
+#define SWI_VBYTES 16
+typedef int16_t swi_v16 __attribute__((vector_size(SWI_VBYTES)));
+typedef int32_t swi_v32 __attribute__((vector_size(SWI_VBYTES)));
+static inline swi_v16 swi_max16(swi_v16 a, swi_v16 b) { swi_v16 m = (swi_v16)(a > b); return (a & m) | (b & ~m); }
+static inline swi_v32 swi_max32(swi_v32 a, swi_v32 b) { swi_v32 m = (swi_v32)(a > b); return (a & m) | (b & ~m); }
+static inline int swi_any16(swi_v16 m) { for (int l = 0; l < SWI_VBYTES / 2; l++) if (m[l]) return 1; return 0; }
+static inline int swi_any32(swi_v32 m) { for (int l = 0; l < SWI_VBYTES / 4; l++) if (m[l]) return 1; return 0; }
+#endif
+#define SWI_L16 (SWI_VBYTES / 2)
+#define SWI_L32 (SWI_VBYTES / 4)
+typedef uint8_t swi_b16 __attribute__((vector_size(SWI_L16)));
+typedef uint8_t swi_b32 __attribute__((vector_size(SWI_L32)));
+
+/* shift by one lane toward higher lanes, x into lane 0 */
+#if SWI_L16 == 16
+#define SWI_SH16(v, x) __builtin_shufflevector((swi_v16){0} + (int16_t)(x), (v), 0, 16, 17, 18, 19, 20, 21, 22, 23, \
+                                               24, 25, 26, 27, 28, 29, 30)
+#define SWI_SH32(v, x) __builtin_shufflevector((swi_v32){0} + (int32_t)(x), (v), 0, 8, 9, 10, 11, 12, 13, 14)
+#else
+#define SWI_SH16(v, x) __builtin_shufflevector((swi_v16){0} + (int16_t)(x), (v), 0, 8, 9, 10, 11, 12, 13, 14)
+#define SWI_SH32(v, x) __builtin_shufflevector((swi_v32){0} + (int32_t)(x), (v), 0, 4, 5, 6)
+#endif
+
+/* flag bits of one cell */
+#define SWI_SRC_G1 1    /* M's predecessor (diagonal) is in state G1 */
+#define SWI_SRC_G2 2    /* M's predecessor (diagonal) is in state G2 */
+#define SWI_DEAD 4      /* M <= 0 before the clip: a path never passes through this M */
+#define SWI_G1X 8       /* G1 extends G1[i, j-1] (else opens from M[i, j-1]) */
+#define SWI_G2X 16      /* G2 extends G2[i-1, j] (else opens from M[i-1, j]) */
+
+#define SWI_T int16_t
+#define SWI_V swi_v16
+#define SWI_L SWI_L16
+#define SWI_VB swi_b16
+#define SWI_TMIN INT16_MIN
+#define SWI_MAX(a, b) swi_max16((a), (b))
+#define SWI_ANY(m) swi_any16((SWI_V)(m))
+#define SWI_SH1(v, x) SWI_SH16((v), (x))
+#define SWI_FN(x) x##_16
+#include "fmswi_body.h"
+#undef SWI_T
+#undef SWI_V
+#undef SWI_L
+#undef SWI_VB
+#undef SWI_TMIN
+#undef SWI_MAX
+#undef SWI_ANY
+#undef SWI_SH1
+#undef SWI_FN
+
+#define SWI_T int32_t
+#define SWI_V swi_v32
+#define SWI_L SWI_L32
+#define SWI_VB swi_b32
+#define SWI_TMIN INT32_MIN
+#define SWI_MAX(a, b) swi_max32((a), (b))
+#define SWI_ANY(m) swi_any32((SWI_V)(m))
+#define SWI_SH1(v, x) SWI_SH32((v), (x))
+#define SWI_FN(x) x##_32
+#include "fmswi_body.h"
+#undef SWI_T
+#undef SWI_V
+#undef SWI_L
+#undef SWI_VB
+#undef SWI_TMIN
+#undef SWI_MAX
+#undef SWI_ANY
+#undef SWI_SH1
+#undef SWI_FN
+
+FMSW_API const char *fmswi_dp_id(void) { return FMSWI_DP_ID; }
+
+/* scalar traceback over the striped flags (biotite rules); fills the alignment fields of o and, when ops is given,
+   the path as 'M' / 'D' / 'I' in forward order. Returns the alignment length. */
+static int swi_traceback(const uint8_t *fl, int seg, int lanes, const uint8_t *q, const uint8_t *t, int bi, int bj,
+                         int32_t *o, char *ops)
+{
+    int i = bi, j = bj, st = 0, k = 0, nid = 0, gaps = 0, prev = 0, nd = 0, ni = 0;   /* st: 0 M, 1 G1, 2 G2 */
+    int si = bi, sj = bj;
+    while (i > 0 && j > 0) {
+        const uint8_t f = fl[((size_t)(j - 1) * (size_t)seg + (size_t)((i - 1) % seg)) * (size_t)lanes
+                             + (size_t)((i - 1) / seg)];
+        if (st == 0) {
+            if (f & SWI_DEAD) break;
+            if (ops) ops[k] = 'M';
+            nid += q[i - 1] == t[j - 1];
+            si = i; sj = j;
+            st = f & (SWI_SRC_G1 | SWI_SRC_G2);
+            i--; j--;
+            prev = 0;
+        } else if (st == 1) {                       /* G1: target residue against a gap in the query */
+            if (ops) ops[k] = 'D';
+            nd++;
+            if (prev != 1) gaps++;
+            prev = 1;
+            st = (f & SWI_G1X) ? 1 : 0;
+            j--;
+        } else {                                    /* G2: query residue against a gap in the target */
+            if (ops) ops[k] = 'I';
+            ni++;
+            if (prev != 2) gaps++;
+            prev = 2;
+            st = (f & SWI_G2X) ? 2 : 0;
+            i--;
+        }
+        k++;
+    }
+    if (ops)
+        for (int a = 0, b = k - 1; a < b; a++, b--) { const char x = ops[a]; ops[a] = ops[b]; ops[b] = x; }
+    o[FMSWI_QSTART] = si; o[FMSWI_TSTART] = sj;
+    o[FMSWI_ALNLEN] = k; o[FMSWI_NIDENT] = nid; o[FMSWI_GAPOPEN] = gaps; o[FMSWI_NQGAP] = nd; o[FMSWI_NTGAP] = ni;
+    return k;
+}
+
+/* 64-byte aligned, freed with free(). posix_memalign rather than C11 aligned_alloc, which macOS has only from 10.15
+   (an x86_64 wheel may target older releases). */
+static void *swi_alloc(size_t bytes)
+{
+    void *p = NULL;
+    return posix_memalign(&p, 64, bytes ? bytes : 1) ? NULL : p;
+}
+
+FMSW_API int fmswi_align(const uint8_t *q, const int32_t *qprof, int n, int A, const uint8_t *t,
+                         const int64_t *t_off, const int32_t *m, int K, int gap_open, int gap_extend, int traceback_on,
+                         int32_t *out, char *ops, size_t ops_cap, int64_t *ops_off)
+{
+    if (n < 0 || n > FMSW_MAX_LEN || A < 1 || A > 255 || K < 0 || traceback_on < 0 || traceback_on > 2)
+        return FMSW_ERR_ARGS;
+    if (gap_open < 1 || gap_open > FMSWI_MAX_GAP || gap_extend < 0 || gap_extend > FMSWI_MAX_GAP)
+        return FMSW_ERR_ARGS;
+    if (K > 0 && (!out || !m || !t_off)) return FMSW_ERR_ARGS;
+    if (n > 0 && (!q || !qprof)) return FMSW_ERR_ARGS;
+    int smax = 0, smin = 0;
+    for (int i = 0; i < n; i++) {
+        if (q[i] >= A) return FMSW_ERR_ARGS;
+        for (int a = 0; a < A; a++) {
+            const int32_t s = qprof[(size_t)i * (size_t)A + (size_t)a];
+            if (s > FMSWI_MAX_SCORE || s < -FMSWI_MAX_SCORE) return FMSW_ERR_ARGS;
+            smax = s > smax ? s : smax;
+            smin = s < smin ? s : smin;
+        }
+    }
+    int64_t mmax = 0;
+    for (int k = 0; k < K; k++) {
+        if (m[k] < 0 || m[k] > FMSW_MAX_LEN || t_off[k] < 0) return FMSW_ERR_ARGS;
+        if (m[k] > 0 && !t) return FMSW_ERR_ARGS;
+        const uint8_t *tk = t + t_off[k];
+        for (int j = 0; j < m[k]; j++)
+            if (tk[j] >= A) return FMSW_ERR_ARGS;
+        mmax = m[k] > mmax ? m[k] : mmax;
+    }
+    const int use16 = smin >= -16384 && smax <= 16383 && gap_open + gap_extend <= 16384;
+    const int seg16 = (n + SWI_L16 - 1) / SWI_L16, seg32 = (n + SWI_L32 - 1) / SWI_L32;
+    const size_t lanes_rows = (size_t)seg16 * SWI_L16 > (size_t)seg32 * SWI_L32 ? (size_t)seg16 * SWI_L16
+                                                                                 : (size_t)seg32 * SWI_L32;
+    const size_t segmax = (size_t)(seg16 > seg32 ? seg16 : seg32);
+    swi_v16 *P16 = NULL, *Pp16 = NULL;
+    swi_v32 *P32 = NULL, *Pp32 = NULL;
+    void *ws = NULL;
+    uint8_t *fl = NULL;
+    int status = FMSW_OK;
+    if (n > 0 && K > 0) {
+        ws = swi_alloc(4 * segmax * SWI_VBYTES);
+        fl = traceback_on ? swi_alloc(lanes_rows * (size_t)(mmax > 0 ? mmax : 1)) : NULL;
+        if (use16) {
+            P16 = swi_alloc((size_t)A * (size_t)seg16 * sizeof(swi_v16));
+            if (P16) swi_profile_16(P16, qprof, n, A, seg16);
+        }
+        if (!ws || (traceback_on && !fl) || (use16 && !P16)) { status = FMSW_ERR_WORKSPACE; goto done; }
+    }
+    int64_t po = 0;
+    if (ops_off) ops_off[0] = 0;
+    for (int k = 0; k < K; k++) {
+        int32_t *o = out + (size_t)k * FMSWI_NOUT;
+        for (int f = 0; f < FMSWI_NOUT; f++) o[f] = 0;
+        const int mk = m[k];
+        if (n > 0 && mk > 0) {
+            const uint8_t *tk = t + t_off[k];
+            if (traceback_on && ops && (size_t)po + (size_t)n + (size_t)mk > ops_cap) {
+                status = FMSW_ERR_WORKSPACE;
+                goto done;
+            }
+            /* traceback 1: one pass with flags; 2: a score-only pass, then flags for rows 1..bi x columns 1..bj only
+               (their DP values depend on no other cell, so the second pass meets the same end cell first) */
+            const int one = traceback_on == 1;
+            int of = 1, bi = 0, bj = 0, best = 0, wide = 0;
+            if (use16)
+                best = swi_sw_16(P16, seg16, tk, mk, (int16_t)-gap_open, (int16_t)-gap_extend, one, (swi_v16 *)ws, fl,
+                                 32767 - smax, &of, &bi, &bj);
+            if (of) {
+                if (!P32) {
+                    P32 = swi_alloc((size_t)A * (size_t)seg32 * sizeof(swi_v32));
+                    if (!P32) { status = FMSW_ERR_WORKSPACE; goto done; }
+                    swi_profile_32(P32, qprof, n, A, seg32);
+                }
+                best = swi_sw_32(P32, seg32, tk, mk, -gap_open, -gap_extend, one, (swi_v32 *)ws, fl, INT32_MAX - smax,
+                                 &of, &bi, &bj);
+                if (of) { status = FMSW_ERR_ARGS; goto done; }        /* a score beyond int32 */
+                wide = 1;
+                o[FMSWI_WIDE] = 1;
+            }
+            o[FMSWI_SCORE] = best;
+            o[FMSWI_QEND] = bi; o[FMSWI_TEND] = bj;
+            if (best > 0 && traceback_on) {
+                int seg = wide ? seg32 : seg16;
+                const int lanes = wide ? SWI_L32 : SWI_L16;
+                if (!one) {
+                    int b2, i2 = 0, j2 = 0, of2 = 0;
+                    if (!wide) {
+                        const swi_v16 *P = P16;
+                        if (bi < n) {
+                            if (!Pp16 && !(Pp16 = swi_alloc((size_t)A * (size_t)seg16 * sizeof(swi_v16)))) {
+                                status = FMSW_ERR_WORKSPACE;
+                                goto done;
+                            }
+                            seg = (bi + SWI_L16 - 1) / SWI_L16;
+                            swi_profile_16(Pp16, qprof, bi, A, seg);
+                            P = Pp16;
+                        }
+                        b2 = swi_sw_16(P, seg, tk, bj, (int16_t)-gap_open, (int16_t)-gap_extend, 1, (swi_v16 *)ws, fl,
+                                       32767 - smax, &of2, &i2, &j2);
+                    } else {
+                        const swi_v32 *P = P32;
+                        if (bi < n) {
+                            if (!Pp32 && !(Pp32 = swi_alloc((size_t)A * (size_t)seg32 * sizeof(swi_v32)))) {
+                                status = FMSW_ERR_WORKSPACE;
+                                goto done;
+                            }
+                            seg = (bi + SWI_L32 - 1) / SWI_L32;
+                            swi_profile_32(Pp32, qprof, bi, A, seg);
+                            P = Pp32;
+                        }
+                        b2 = swi_sw_32(P, seg, tk, bj, -gap_open, -gap_extend, 1, (swi_v32 *)ws, fl, INT32_MAX - smax,
+                                       &of2, &i2, &j2);
+                    }
+                    if (b2 != best || i2 != bi || j2 != bj || of2) { status = FMSWI_ERR_INTERNAL; goto done; }
+                }
+                po += swi_traceback(fl, seg, lanes, q, tk, bi, bj, o, ops ? ops + po : NULL);
+            }
+        }
+        if (ops_off) ops_off[k + 1] = po;
+    }
+done:
+    free(P16); free(P32); free(Pp16); free(Pp32); free(ws); free(fl);
+    return status;
 }

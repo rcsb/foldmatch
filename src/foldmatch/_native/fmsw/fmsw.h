@@ -86,7 +86,9 @@ extern "C" {
 #define FMSW_ERR_WORKSPACE 1
 #define FMSW_ERR_ARGS 2
 
-#define FMSW_MAX_LEN (1 << 30)      /* n, m[k] limits (int arithmetic headroom); Stage 2 caps n m at 2^28 cells */
+/* n, m[k] limits (int arithmetic headroom). The esm-codes Stage 2 caps n m at 2^28 cells; the BLOSUM62 Stage 2
+   (fmswi_align) has no cell cap: its flag buffer is n_pad x the longest target (review finding 6, left open). */
+#define FMSW_MAX_LEN (1 << 30)
 
 /* provenance and dispatch */
 FMSW_API int fmsw_abi_version(void);                 /* FMSW_ABI_VERSION */
@@ -119,6 +121,72 @@ FMSW_API int fmsw_align(const float *sim, int n, const int64_t *pair_off, const 
 
 FMSW_API size_t fmsw_ws_floats(int n, int64_t mmax);
 FMSW_API size_t fmsw_flag_bytes(int n, int64_t mmax);
+
+/*
+ * ------------------------------------------------------------------------------------------------------------------
+ * Integer local Smith-Waterman for the BLOSUM62 Stage 2 (DP id "fmswi/1"; same library and ABI, separate entry point)
+ *
+ * Output-equivalent to biotite 1.7.1 align_optimal(query, target, matrix, gap_penalty=(-open, -extend), local=True,
+ * max_number=1): the same score, end cell and path (so every column FoldMatch derives from the path). With
+ * s(i, j) = qprof[i - 1][t_{j-1}] (a position-specific query profile: the BLOSUM62 row of each query residue, plus its
+ * composition-bias offset when that correction is on), go = open, ge = extend, the kernel computes:
+ *   M[i,j]  = max(0, s(i, j) + max(M, G1, G2)[i-1, j-1])    aligned pair; M <= 0 before the clip is "dead"
+ *   G1[i,j] = max(M[i, j-1] - go, G1[i, j-1] - ge)          target residue against a gap in the query ('D')
+ *   G2[i,j] = max(M[i-1, j] - go, G2[i-1, j] - ge)          query residue against a gap in the target ('I')
+ *   boundary row / column: M = 0, G1 = G2 = -go. Gaps open from M only: unlike Gotoh / parasail / SSW / MMseqs2 no
+ *   insertion run is directly followed by a deletion run. A gap of length L costs go + (L - 1) ge.
+ *   score    = max M; empty alignment (all zero outputs) when it is 0.
+ *   end cell = the FIRST cell in row-major (query-major) order with M == score (numpy.where order).
+ *   traceback from the end cell in state M: M -> predecessor M if M >= G1 and M >= G2, else G1 if G1 >= G2, else G2
+ *   (diagonal first, then 'D', then 'I'); a G state extends only if G_prev - ge > M_prev - go (ties open, so gaps sit
+ *   as early as possible); the path stops before a dead M. Paths start and end with an aligned pair.
+ * These are the kernel's own tables, not biotite's literal ones: biotite starts from M = -inf on the boundary (except
+ * M[0,0] = 0), G1 = 0 on row 0 and G2 = 0 on column 0 (-inf elsewhere), and leaves a G cell at -inf when its value is
+ * <= 0. The table values differ; the score, end cell and path do not. That equivalence is checked against biotite
+ * (tests/test_swint.py), not derived from its code.
+ *
+ * Arguments
+ *   q        uint8 [n] query codes (< A): used for the identity count (nident compares q and t codes).
+ *   qprof    int32 [n, A] row-major position-specific scores, |s| <= FMSWI_MAX_SCORE.
+ *   t        uint8 target codes (< A), pair k at t + t_off[k], m[k] residues (m[k] == 0: empty alignment).
+ *   gap_open >= 1 (the end-cell rule relies on it), gap_extend >= 0, both <= FMSWI_MAX_GAP.
+ *   traceback 0: score, QEND, TEND and WIDE only (the other fields 0); 1: every field, one pass that stores a flag byte
+ *            per cell; 2: every field, a score-only pass and then a flag pass over rows 1..QEND x columns 1..TEND only
+ *            (exact: those cells' DP values depend on no other cell, so the second pass meets the same end cell; on
+ *            the Fig. 2 sample that rectangle is 35% of the DP cells, cell-weighted). 1 and 2 give identical outputs.
+ *   out      int32 [K, FMSWI_NOUT].
+ *   ops      optional (traceback only): the paths as 'M' / 'D' / 'I' in forward order, pair k at
+ *            ops[ops_off[k] .. ops_off[k + 1]); before pair k the kernel needs ops_off[k] + n + m[k] <= ops_cap.
+ *   ops_off  optional int64 [K + 1] (filled with the running offsets; all zero without ops).
+ * Implementation: Farrar striped profile with lazy F in 16-bit lanes (16 on AVX2, 8 on SSE2 / NEON / generic); a pair
+ * whose score reaches 32767 - max(s) (or a profile / gap cost outside +-16384) is computed in 32-bit lanes (out WIDE
+ * = 1). Values are exact integers on every ISA, so every build returns identical results. Workspace is allocated per
+ * call: the profiles (A x n_pad x 2 or 4 bytes), 4 n_pad vectors and, with traceback, one flag byte per cell of the
+ * longest target (n_pad x mmax bytes). Status: 0 ok, 1 allocation failure or ops buffer too small, 2 bad arguments
+ * (or a score beyond int32), 3 internal check failed (traceback 2: the second pass did not meet the first pass's end
+ * cell; never expected).
+ */
+#define FMSWI_DP_ID "fmswi/1"
+#define FMSWI_MAX_SCORE (1 << 20)
+#define FMSWI_MAX_GAP (1 << 20)
+#define FMSWI_ERR_INTERNAL 3
+#define FMSWI_NOUT 11
+#define FMSWI_SCORE 0      /* raw score (>= 0) */
+#define FMSWI_QSTART 1     /* 1-based first aligned query residue (0 = empty alignment or traceback off) */
+#define FMSWI_QEND 2       /* 1-based end cell (query) */
+#define FMSWI_TSTART 3
+#define FMSWI_TEND 4
+#define FMSWI_ALNLEN 5     /* path columns, gaps included */
+#define FMSWI_NIDENT 6     /* aligned pairs with equal codes */
+#define FMSWI_GAPOPEN 7    /* maximal gap runs, both sides */
+#define FMSWI_NQGAP 8      /* 'D' columns: target residue against a gap in the query */
+#define FMSWI_NTGAP 9      /* 'I' columns: query residue against a gap in the target */
+#define FMSWI_WIDE 10      /* 1 when the pair was computed in 32-bit lanes */
+
+FMSW_API const char *fmswi_dp_id(void);              /* FMSWI_DP_ID */
+FMSW_API int fmswi_align(const uint8_t *q, const int32_t *qprof, int n, int A, const uint8_t *t,
+                         const int64_t *t_off, const int32_t *m, int K, int gap_open, int gap_extend, int traceback,
+                         int32_t *out, char *ops, size_t ops_cap, int64_t *ops_off);
 
 #ifdef __cplusplus
 }

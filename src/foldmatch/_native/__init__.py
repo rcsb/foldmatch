@@ -1,6 +1,7 @@
 """Native Smith-Waterman kernel (``fmsw``): library discovery.
 
-The kernel source lives in ``fmsw/fmsw.c`` and ``fmsw/fmsw.h``. It is compiled into one shared library per
+The kernel source lives in ``fmsw/fmsw.c``, ``fmsw/fmsw.h`` and ``fmsw/fmswi_body.h`` (the integer Smith-Waterman
+template that ``fmsw.c`` includes twice). It is compiled into one shared library per
 instruction set, named ``_fmsw_<isa><suffix>`` and loaded with ctypes by :mod:`foldmatch.search.swkern`:
 
 ==========  =====================  ======================================
@@ -29,7 +30,7 @@ from typing import Iterable, Optional, Tuple
 
 NATIVE_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = NATIVE_DIR / "fmsw"
-SOURCE_FILES = ("fmsw.h", "fmsw.c")
+SOURCE_FILES = ("fmsw.h", "fmsw.c", "fmswi_body.h")
 ISAS = ("sse2", "avx2", "neon", "generic")
 
 REBUILD_COMMAND = "python -m foldmatch._native.build"
@@ -78,7 +79,7 @@ def find_library(isa: str, search_dirs: Optional[Iterable[Path]] = None) -> Opti
 
 
 def source_sha256(source_dir: Optional[Path] = None) -> Optional[str]:
-    """sha256 identifying the kernel source: over each of ``fmsw.h`` and ``fmsw.c`` (in that order) the bytes
+    """sha256 identifying the kernel source: over each of ``SOURCE_FILES`` (in that order) the bytes
     ``<name> NUL <decimal size> NUL <content>``. The build injects it into the library (``fmsw_source_sha256()``);
     a library whose value differs from the tree's is stale. None when the source files are not present."""
     d = Path(source_dir) if source_dir is not None else SOURCE_DIR
