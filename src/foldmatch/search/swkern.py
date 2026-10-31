@@ -1093,7 +1093,9 @@ def blas_info() -> Dict[str, object]:
 def selftest(kernel: Optional[Kernel] = None, *, count: int = 1000) -> Dict[str, object]:
     """Check this install: the DP golden hash through ``fmsw_sim_ref`` (bit-identical on every conforming build),
     then the production BLAS path against the golden values within S16 (scores; paths identical unless the float64
-    path scores tie within the S16 margin). Logs the kernel and numpy's BLAS. Raises KernelError on failure."""
+    path scores tie within the S16 margin), then the library's integer DP (``fmswi_align``, the BLOSUM62 Stage 2):
+    its golden digest (:func:`foldmatch.search.swint.selftest`, bit-identical on every conforming build). Logs the
+    kernel and numpy's BLAS. Raises KernelError on failure."""
     t0 = time.perf_counter()
     k = kernel or load()
     pairs = golden_pairs(count)
@@ -1124,8 +1126,9 @@ def selftest(kernel: Optional[Kernel] = None, *, count: int = 1000) -> Dict[str,
             path_ties += 1
     if worst > 1.0:
         raise KernelError(f"selftest: BLAS scores outside S16 (max |delta| / bound = {worst:.3g})")
+    from foldmatch.search import swint                   # imports this module: loaded here, not at the top
     report.update(s16_max_score_ratio=worst, blas_path_differences=path_diff, blas_path_near_ties=path_ties,
-                  seconds=round(time.perf_counter() - t0, 3))
+                  fmswi=swint.selftest(k), seconds=round(time.perf_counter() - t0, 3))
     logger.info("fmsw selftest passed: %s", report)
     return report
 
@@ -1150,4 +1153,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Run the package module's main: swint imports foldmatch.search.swkern, a second copy of this module under -m, and
+    # its KernelError is the one this copy's main would not catch.
+    from foldmatch.search.swkern import main as _main
+    raise SystemExit(_main())

@@ -3,7 +3,12 @@
 The libraries come from the session fixture ``fmsw_libs`` (conftest.py: developer build in place when missing or
 stale). Tolerances are the S16 contract: S_f / S_r within 5e-5 max(|ref|, 1); paths identical unless the float64
 oracle's best-cell or traceback margin is below 1e-4 + 2e-6 |S_f|; Q90 and ln E within 1e-4.
+
+The same library's integer DP (``fmswi_align``, the BLOSUM62 Stage 2) is checked here by its golden digest, without
+biotite, so the kernel jobs and the sanitizer job run it on every ISA (section 3b); tests/test_swint.py checks it
+against biotite.
 """
+import ctypes
 import functools
 import hashlib
 import json
@@ -24,7 +29,7 @@ import pytest
 import foldmatch
 from foldmatch import _native
 from foldmatch._native import build as native_build
-from foldmatch.search import swkern
+from foldmatch.search import swint, swkern
 
 import esm_codes_reference as ref
 
@@ -37,6 +42,8 @@ D = swkern.SETTING_D
 GOLDEN_F1_SYNTH_SHA256 = "30ec40c6d57f9b7d28c2502b7a40b5ec8e97d46b83ce69d97fbcd44b2fe281e3"
 # sha256 of the golden_pairs(1000) input bytes (kind, q fp16, codes): the generator is integer-only and portable
 GOLDEN_INPUTS_SHA256 = "6725eda9e247c975f722e85fdefd1d71dbd74c0d2b28ee4c016c2027b634955d"
+# sha256 of swint.golden_cases()'s input records (swint.golden_digest_update in mode 0 with all-zero outputs)
+FMSWI_GOLDEN_INPUTS_SHA256 = "3b9907272b7e9aad2363b870d4d365fce5a3d59aad84e77dbdf02246619f8f6e"
 
 _AA = np.frombuffer(b"ACDEFGHIKLMNPQRSTVWY", np.uint8)
 
@@ -381,6 +388,212 @@ class GoldenHashTest(unittest.TestCase):
         self.assertLessEqual(report["s16_max_score_ratio"], 1.0)
         self.assertIn("blas", report["blas"])
         self.assertEqual(report["kernel"]["isa"], swkern.load().isa)
+        self.assertEqual(report["fmswi"]["golden_sha256"], swint.GOLDEN_SHA256)
+
+
+# =====================================================================================================================
+# 3b. fmswi golden digest (the integer DP of the BLOSUM62 Stage 2; numpy only, no biotite)
+# =====================================================================================================================
+@pytest.mark.usefixtures("fmsw_libs")
+class FmswiGoldenTest(unittest.TestCase):
+
+    def test_golden_digest_on_every_build(self):
+        """Every ISA library of the machine (avx2 on an AVX2 CPU) gives the golden digest, in the three traceback
+        modes, and its modes agree (swint.selftest); the selftest of the dispatched library includes it."""
+        kernels = _kernels()
+        self.assertIn(swkern.load().isa, [k.isa for k in kernels])
+        for k in kernels:
+            with self.subTest(isa=k.isa):
+                report = swint.selftest(k)
+                self.assertEqual(report["golden_sha256"], swint.GOLDEN_SHA256, k.info())
+                self.assertEqual((report["cases"], report["pairs"]), (129, 477))
+
+    def test_golden_cases_reach_every_path(self):
+        """The golden set exercises what the digest must pin: 16-bit and 32-bit pairs (32-bit with gaps, and from the
+        start, also for a profile whose only large score 16-bit lanes would wrap), the 16-bit limit to the unit, a
+        lazy-F loop long enough to wrap 16 bits without the clamp of F at -open (for 8 and for 16 lanes), long gaps
+        both ways, gaps dearer to extend than to open, position-specific offsets, empty alignments and targets."""
+        cases = swint.golden_cases()
+        self.assertEqual({c.kind for c in cases}, {"random", "related", "bias", "longgap", "wide", "carry", "edge"})
+        self.assertIn((1, 4), {(c.gap_open, c.gap_extend) for c in cases})
+        wide = narrow = wide_gapped = empty = 0
+        runs = {"D": 0, "I": 0}
+        for c in cases:
+            r = swint.run_golden(c, 1)
+            w = r.out[:, swint.WIDE] == 1
+            wide += int(w.sum())
+            narrow += int((~w & (r.out[:, swint.ALNLEN] > 0)).sum())
+            wide_gapped += int((w & (r.out[:, swint.GAPOPEN] > 0)).sum())
+            empty += int((r.out[:, swint.ALNLEN] == 0).sum())
+            for k in range(len(c.targets)):
+                path = r.path(k)
+                for op in runs:
+                    runs[op] = max([runs[op]] + [len(x) for x in path.split("M") if x.startswith(op)])
+        self.assertEqual(wide, 10)
+        self.assertGreater(narrow, 400)
+        self.assertGreaterEqual(wide_gapped, 3)
+        self.assertGreaterEqual(empty, 2)
+        self.assertGreaterEqual(min(runs.values()), 60)
+        self.assertEqual(sum(1 for c in cases if c.kind == "edge" and any(len(t) == 0 for t in c.targets)), 1)
+        # the limit: column 2,978's best is 32,757 = 32768 - 11, so the pair ends in 32 bits at 32,768
+        limit = [c for c in cases if c.kind == "wide" and len(c.qcodes) == 2979]
+        self.assertEqual(len(limit), 1)
+        out = swint.run_golden(limit[0], 0).out[0]
+        self.assertEqual((out[swint.SCORE], out[swint.TEND], out[swint.WIDE]), (32768, 2979, 1))
+        # the floor: one code at -40,000 (+25,536 if it wrapped to 16 bits) and no score above 11, so 32 bits from the
+        # start at a score far below the limit
+        floor = [c for c in cases if c.qprof.min() < -32768]
+        self.assertEqual([(c.kind, int(c.qprof.max())) for c in floor], [("wide", 11)])
+        self.assertIn(int(floor[0].qprof.argmin() % floor[0].qprof.shape[1]), floor[0].targets[0])
+        out = swint.run_golden(floor[0], 0).out[0]
+        self.assertEqual((out[swint.SCORE], out[swint.WIDE]), (750, 1))
+        # the carry: 1000/1000, a 128-row lane with 8 lanes (n = 1024) and with 16 (n = 2048); 16 bits, 32,400
+        carry = [c for c in cases if c.kind == "carry"]
+        self.assertEqual(sorted((len(c.qcodes), c.gap_open, c.gap_extend) for c in carry),
+                         [(1024, 1000, 1000), (2048, 1000, 1000)])
+        for c in carry:
+            out = swint.run_golden(c, 1).out[0]
+            self.assertEqual(tuple(out[[swint.SCORE, swint.QEND, swint.TEND, swint.WIDE]]), (32400, 384, 201, 0))
+
+    def test_golden_inputs_are_stable(self):
+        """The generator is integer-only (splitmix64), so the inputs are the same bytes everywhere: a changed digest
+        means changed outputs."""
+        h = hashlib.sha256()
+        for c in swint.golden_cases():
+            swint.golden_digest_update(h, c, 0, np.zeros((len(c.targets), swint.NOUT), np.int32), None, None)
+        self.assertEqual(h.hexdigest(), FMSWI_GOLDEN_INPUTS_SHA256)
+
+    def test_a_changed_result_fails_the_selftest(self):
+        real = swint.run_golden
+
+        def off_by_one(case, mode, kernel=None):
+            r = real(case, mode, kernel)
+            if case.kind == "wide" and mode:                 # the same in both traceback modes
+                r.out[0, swint.NIDENT] += 1
+            return r
+
+        def modes_disagree(case, mode, kernel=None):
+            r = real(case, mode, kernel)
+            if mode == 2 and case.kind == "related":
+                r.out[0, swint.QSTART] += 1
+            return r
+
+        for fake, message in ((off_by_one, "golden digest"), (modes_disagree, "traceback modes disagree")):
+            with self.subTest(message), mock.patch.object(swint, "run_golden", fake):
+                with self.assertRaisesRegex(swkern.KernelError, message):
+                    swint.selftest()
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class FmswiArgumentsTest(unittest.TestCase):
+    """fmswi_align's refusals (status 2: bad arguments, or a score beyond int32; status 1: an ops buffer too small for
+    the next pair) and its empty inputs, on every ISA library, called directly (swint.align_batch checks nothing and
+    always sizes the ops buffer itself). No biotite, so the kernel jobs and the sanitizer job run them."""
+
+    A = 24
+
+    def setUp(self):
+        rng = np.random.default_rng(7)
+        self.q = rng.integers(0, self.A, 30).astype(np.uint8)
+        self.prof = rng.integers(-4, 12, (30, self.A)).astype(np.int32)
+        self.t = rng.integers(0, self.A, 70).astype(np.uint8)
+        self.kernels = [swint.IntKernel(k) for k in _kernels()]
+
+    def call(self, ik, *, q=None, prof=None, t=None, off=(0, 40), lens=(40, 30), go=11, ge=1, mode=1, cap=None,
+             n=None, A=None, K=None, ops=True):
+        """One raw fmswi_align call; ``n``, ``A`` and ``K`` default to the arrays' sizes and ``cap`` to the bytes
+        align_batch would give. Returns (status, out, ops_off)."""
+        q = self.q if q is None else q
+        prof = self.prof if prof is None else prof
+        t = self.t if t is None else t
+        off, lens = np.asarray(off, np.int64), np.asarray(lens, np.int32)
+        cap = len(lens) * len(q) + int(lens.sum()) if cap is None else cap
+        buf = ctypes.create_string_buffer(max(cap, 1)) if ops else None
+        out = np.full((max(len(lens), 1), swint.NOUT), -7, np.int32)
+        ops_off = np.full(len(lens) + 1, -7, np.int64)
+        st = ik.lib.fmswi_align(q.ctypes.data, prof.ctypes.data, len(q) if n is None else n,
+                                prof.shape[1] if A is None else A, t.ctypes.data, off.ctypes.data, lens.ctypes.data,
+                                len(lens) if K is None else K, go, ge, mode, out.ctypes.data, buf, cap,
+                                ops_off.ctypes.data)
+        return st, out, ops_off
+
+    def test_bad_arguments_return_status_2(self):
+        big, bad_q, bad_t = self.prof.copy(), self.q.copy(), self.t.copy()
+        bad_q[5] = self.A
+        bad_t[50] = self.A                                   # in the second target
+        cases = {"code >= A in the query": dict(q=bad_q), "code >= A in a target": dict(t=bad_t),
+                 "A > 255": dict(prof=np.zeros((30, 256), np.int32)), "A < 1": dict(A=0), "n < 0": dict(n=-1),
+                 "K < 0": dict(K=-1), "m < 0": dict(lens=(40, -1)), "t_off < 0": dict(off=(0, -1)),
+                 "traceback 3": dict(mode=3), "traceback -1": dict(mode=-1)}
+        for score in (swint.MAX_SCORE + 1, -swint.MAX_SCORE - 1):
+            big[3, 4] = score
+            cases[f"score {score}"] = dict(prof=big.copy())
+        for go, ge in ((0, 1), (-1, 1), (swint.MAX_GAP + 1, 1), (11, -1), (11, swint.MAX_GAP + 1)):
+            cases[f"gaps {go}/{ge}"] = dict(go=go, ge=ge)
+        # a score beyond int32: 2,100 x 2^20 on the diagonal (refused after the 32-bit pass, in every mode)
+        n = 2100
+        cases["a score beyond int32"] = dict(q=np.zeros(n, np.uint8), prof=np.full((n, self.A), swint.MAX_SCORE,
+                                                                                   np.int32),
+                                             t=np.zeros(n, np.uint8), off=(0,), lens=(n,), mode=0)
+        for ik in self.kernels:
+            self.assertEqual(self.call(ik)[0], swkern.STATUS_OK, ik)
+            edge = np.full((30, self.A), swint.MAX_SCORE, np.int32)
+            edge[:, 0] = -swint.MAX_SCORE
+            self.assertEqual(self.call(ik, prof=edge, go=swint.MAX_GAP, ge=swint.MAX_GAP)[0], swkern.STATUS_OK, ik)
+            self.assertEqual(self.call(ik, go=1, ge=0)[0], swkern.STATUS_OK, ik)
+            for what, kw in cases.items():
+                with self.subTest(isa=ik.isa, case=what):
+                    self.assertEqual(self.call(ik, **kw)[0], swkern.STATUS_ARGS)
+
+    def test_short_ops_buffer_returns_status_1(self):
+        """Before each pair the kernel needs ops_off[k] + n + m[k] bytes of ops; without ops it needs none."""
+        for ik in self.kernels:
+            for mode in (1, 2):
+                with self.subTest(isa=ik.isa, traceback=mode):
+                    one = dict(off=(0,), lens=(70,), mode=mode)
+                    self.assertEqual(self.call(ik, cap=30 + 70, **one)[0], swkern.STATUS_OK)
+                    self.assertEqual(self.call(ik, cap=30 + 70 - 1, **one)[0], swkern.STATUS_WORKSPACE)
+                    st, _, ops_off = self.call(ik, mode=mode)
+                    self.assertEqual(st, swkern.STATUS_OK)
+                    cap = int(ops_off[1]) + 30 + 30 - 1          # room for pair 0 and its path, not for pair 1
+                    self.assertGreaterEqual(cap, 30 + 40)
+                    self.assertEqual(self.call(ik, cap=cap, mode=mode)[0], swkern.STATUS_WORKSPACE)
+                    self.assertEqual(self.call(ik, cap=0, ops=False, mode=mode)[0], swkern.STATUS_OK)
+
+    def test_empty_inputs(self):
+        for ik in self.kernels:
+            with self.subTest(isa=ik.isa):
+                st, out, ops_off = self.call(ik, lens=(0, 0))                   # all-empty targets
+                self.assertEqual(st, swkern.STATUS_OK)
+                self.assertFalse(out.any())
+                self.assertEqual(ops_off.tolist(), [0, 0, 0])
+                st, out, ops_off = self.call(ik, n=0)                           # an empty query
+                self.assertEqual(st, swkern.STATUS_OK)
+                self.assertFalse(out.any())
+                self.assertEqual(ops_off.tolist(), [0, 0, 0])
+                st, out, _ = self.call(ik, K=0)                                 # no target: nothing written
+                self.assertEqual(st, swkern.STATUS_OK)
+                self.assertTrue((out == -7).all())
+                r = swint.align_batch(self.q, self.prof, self.t, [0, 0, 40], [40, 0, 30], 11, 1, ops=True, kernel=ik)
+                self.assertEqual(r.out[1].tolist(), [0] * swint.NOUT)          # an empty target among others
+                self.assertEqual(r.path(1), "")
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class SelftestCommandTest(unittest.TestCase):
+
+    def test_a_failed_fmswi_check_is_reported(self):
+        """``python -m foldmatch.search.swkern`` reports a failed fmswi golden check as a failed selftest (exit status
+        1, no traceback): swint raises the KernelError of the package module, not that of ``__main__``."""
+        code = ("import runpy\n"
+                "from foldmatch.search import swint\n"
+                "swint.GOLDEN_SHA256 = '0' * 64\n"
+                "runpy.run_module('foldmatch.search.swkern', run_name='__main__', alter_sys=True)\n")
+        out = subprocess.run([sys.executable, "-W", "ignore::RuntimeWarning", "-c", code], env=_subprocess_env(),
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("fmsw selftest failed: fmswi selftest: golden digest", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
 
 
 # =====================================================================================================================

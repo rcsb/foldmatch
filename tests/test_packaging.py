@@ -59,6 +59,8 @@ TREE = _load_by_path("_packaging_test_native", NATIVE_SRC / "__init__.py")
 TREE_SHA = TREE.source_sha256()
 DP_GOLDEN = re.search(r'^DP_GOLDEN_SYNTH_SHA256 = "([0-9a-f]{64})"',
                       (ROOT / "src" / "foldmatch" / "search" / "swkern.py").read_text(), re.M).group(1)
+FMSWI_GOLDEN = re.search(r'^GOLDEN_SHA256 = "([0-9a-f]{64})"',
+                         (ROOT / "src" / "foldmatch" / "search" / "swint.py").read_text(), re.M).group(1)
 
 
 # =====================================================================================================================
@@ -152,7 +154,8 @@ def _installable_here(path: Path) -> bool:
 
 
 def _source_files_sha(files: Dict[str, bytes], tmp: Path) -> Optional[str]:
-    """The kernel source sha256 (TREE.source_sha256 algorithm) of fmsw.h / fmsw.c given as bytes."""
+    """The kernel source sha256 (TREE.source_sha256 algorithm) of the kernel source files (TREE.SOURCE_FILES) given
+    as bytes."""
     d = tmp / "fmsw_src"
     d.mkdir(parents=True, exist_ok=True)
     for name, data in files.items():
@@ -312,17 +315,17 @@ def test_sdist_contents(sdist):
         def read(rel):
             return t.extractfile(files[rel]).read()
 
+        kernel_sources = [f"src/foldmatch/_native/fmsw/{name}" for name in TREE.SOURCE_FILES]
         required = ["pyproject.toml", "hatch_build.py", "README.md", "LICENSE.md", "PKG-INFO",
-                    "src/foldmatch/_native/__init__.py", "src/foldmatch/_native/build.py",
-                    "src/foldmatch/_native/fmsw/fmsw.c", "src/foldmatch/_native/fmsw/fmsw.h",
-                    "src/foldmatch/search/swkern.py", "tests/conftest.py", "tests/test_swkern.py",
-                    "tests/esm_codes_reference.py", "tests/test_packaging.py"]
+                    "src/foldmatch/_native/__init__.py", "src/foldmatch/_native/build.py", *kernel_sources,
+                    "src/foldmatch/search/swkern.py", "src/foldmatch/search/swint.py", "tests/conftest.py",
+                    "tests/test_swkern.py", "tests/esm_codes_reference.py", "tests/test_swint.py",
+                    "tests/blosum62_reference.py", "tests/test_packaging.py"]
         required += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "tests/resources/esm_codes").rglob("*"))
                      if p.is_file()]
         missing = [r for r in required if r not in files]
         assert not missing, f"missing from {sdist.name}: {missing}"
-        for rel in ("pyproject.toml", "hatch_build.py", "src/foldmatch/_native/fmsw/fmsw.c",
-                    "src/foldmatch/_native/fmsw/fmsw.h", "src/foldmatch/_native/build.py"):
+        for rel in ("pyproject.toml", "hatch_build.py", *kernel_sources, "src/foldmatch/_native/build.py"):
             assert read(rel) == (ROOT / rel).read_bytes(), f"{sdist.name}: {rel} differs from the tree"
         compiled = [r for r in files if Path(r).name.startswith(("_fmsw_", "._fmsw_"))
                     or r.endswith((".so", ".dylib", ".pyc", ".o")) or "__pycache__" in r]
@@ -371,6 +374,7 @@ def test_wheel_selftest_in_clean_venv(wheels, tmp_path):
         assert "error" not in out, out.get("error")
         report = out["selftest"]
         assert report["dp_golden_sha256"] == DP_GOLDEN
+        assert report["fmswi"]["golden_sha256"] == FMSWI_GOLDEN
         assert report["s16_max_score_ratio"] <= 1.0
         kernel = report["kernel"]
         assert kernel["abi"] == 1 and kernel["source_sha256"] == TREE_SHA == out["source_sha256"]
@@ -389,6 +393,7 @@ def test_wheel_selftest_in_clean_venv(wheels, tmp_path):
                 continue
             assert "error" not in o, o.get("error")
             assert (o["selftest"]["kernel"]["isa"], o["selftest"]["dp_golden_sha256"]) == (isa, DP_GOLDEN)
+            assert o["selftest"]["fmswi"]["golden_sha256"] == FMSWI_GOLDEN
 
 
 # =====================================================================================================================
