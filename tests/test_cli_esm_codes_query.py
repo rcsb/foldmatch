@@ -450,7 +450,10 @@ class RefusalTest(_DbCase):
             with self.subTest(rank_env=rank_env):
                 message = self.refused(self.run_esm(db, rank_env=rank_env, prepare_ok=False), FileNotFoundError)
                 self.assertIn("was built without --residue-codes", message)
-                self.assertIn("--scoring blosum62 still works", message)
+                # BLOSUM62 needs the kernel too: offered without saying it works (step 4 has not loaded it)
+                self.assertIn("--scoring blosum62 can query this database (its Stage 2 needs the native kernel too)",
+                              message)
+                self.assertNotIn("still works", message)
                 self.assertNotIn("partial", message)
 
     def test_partial_build(self):
@@ -512,6 +515,9 @@ class RefusalTest(_DbCase):
                 _edit_manifest(db, edit)
                 message = self.refused(self.run_esm(db, prepare_ok=False), IncompatibleCodeStoreError)
                 self.assertIn(text, message)
+                if case != "manifest version":                 # a newer manifest asks for an upgrade instead
+                    self.assertIn("--scoring blosum62 can query this database (its Stage 2 needs the native kernel "
+                                  "too)", message)
 
     def test_missing_kernel(self):
         db = self.database("codes")
@@ -521,6 +527,9 @@ class RefusalTest(_DbCase):
                 message = self.refused(self.run_esm(db, rank_env=rank_env, prepare_ok=False), swkern.KernelError)
                 self.assertIn("native Smith-Waterman kernel", message)
                 self.assertIn("python -m foldmatch._native.build", message)  # the rebuild command
+                # BLOSUM62's Stage 2 aligns on the same kernel (P9.S3): it is no way out here
+                self.assertNotIn("still works", message)
+                self.assertIn("--scoring blosum62 needs it too", message)
 
     def test_a_bundle_problem(self):
         db = self.database("codes")

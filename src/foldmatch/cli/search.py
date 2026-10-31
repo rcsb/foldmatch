@@ -3259,7 +3259,8 @@ def resolve_esm_codes_database(db_path: str, max_evalue: Optional[float], *, num
     )
     code_store = ResidueCodeStore.from_db_path(db_path)
     database = code_store.base
-    blosum = "--scoring blosum62 still works with this database."
+    # BLOSUM62's Stage 2 needs the kernel too (P9.S3), which step 4 has not loaded yet
+    blosum = "--scoring blosum62 can query this database (its Stage 2 needs the native kernel too)."
     sequence_store = code_store.sequence_store()
     if not sequence_store.exists():
         raise RefusalError(
@@ -3302,7 +3303,7 @@ def resolve_esm_codes_database(db_path: str, max_evalue: Optional[float], *, num
     except swkern.KernelError as exc:
         raise RefusalError(
             f"--scoring esm-codes needs the native Smith-Waterman kernel, which cannot be used here: {exc}. "
-            f"{blosum}") from exc
+            f"--scoring blosum62 needs it too, for its Stage 2.") from exc
     # 5. The bundle: one fetch, then cached-only on every other rank.
     from foldmatch.inference.chain_complete_inference import prepare_scoring_system
     from foldmatch.search.residue_shards import QUERY_ENCODING

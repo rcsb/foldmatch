@@ -668,7 +668,8 @@ class ResidueCodeStore:
         if problems:
             raise IncompatibleCodeStoreError(
                 f"Residue-code store {self.base}.rescodes.* cannot be used with {system.name}: " + "; ".join(problems)
-                + f". --scoring blosum62 still works. {_REBUILD_HINT}.")
+                + f". --scoring blosum62 can query this database (its Stage 2 needs the native kernel too). "
+                f"{_REBUILD_HINT}.")
         return manifest
 
     def check_faiss_count(self, faiss_ids_count: int) -> None:

@@ -15,8 +15,9 @@ Editable installs
 
 Compile failures
     ``FOLDMATCH_REQUIRE_NATIVE=1`` (CI, Docker, cibuildwheel) makes a missing or failing C compiler fatal. Without it
-    the hook warns and the build falls back to a pure-Python wheel (``py3-none-any``): BLOSUM62 works, and
-    ``--scoring esm-codes`` refuses with the reinstall command (pip caches that wheel, hence ``--no-cache-dir``).
+    the hook warns and the build falls back to a pure-Python wheel (``py3-none-any``): the Stage 2 of a search
+    (``--scoring blosum62`` and ``esm-codes``) refuses with the reinstall command (pip caches that wheel, hence
+    ``--no-cache-dir``); everything else works.
 
 Every library embeds the sha256 of the kernel source it was compiled from (``fmsw_source_sha256()``), which the
 loader compares with the installed source. The compile step itself is ``foldmatch._native.build.compile_library``,
@@ -165,9 +166,10 @@ class FoldMatchNativeBuildHook(BuildHookInterface):
         if required:
             raise RuntimeError(f"FoldMatch native kernel build failed and {REQUIRE_NATIVE_ENV}=1: {reason}")
         self.app.display_warning(
-            f"FoldMatch native kernel not built ({reason}). Building a pure-Python package: BLOSUM62 search works, "
-            f"but --scoring esm-codes will refuse to run. Install a C compiler and reinstall with `{reinstall}`; "
-            f"set {REQUIRE_NATIVE_ENV}=1 to make this an error.")
+            f"FoldMatch native kernel not built ({reason}). Building a pure-Python package: the Stage 2 of a search "
+            f"(sequence identity, under --scoring blosum62 and esm-codes) will refuse to run; everything else works. "
+            f"Install a C compiler and reinstall with `{reinstall}`; set {REQUIRE_NATIVE_ENV}=1 to make this an "
+            f"error.")
 
     def _cleanup(self) -> None:
         if self._tmp is not None:
