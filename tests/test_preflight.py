@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import pytest
 import torch
 
 import foldmatch
@@ -337,6 +338,7 @@ class PreflightTest(unittest.TestCase):
         finally:
             conn.close()
 
+    @pytest.mark.usefixtures("fmsw_libs")    # the empty store with --max-evalue inf runs Stage 2
     def test_stage2_store_problems_are_refused_before_esm3(self):
         from foldmatch.cli.search import query_database_from_fasta
         cases = [  # (store problem, query options, expected message)

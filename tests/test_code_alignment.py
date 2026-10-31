@@ -1590,6 +1590,7 @@ class OutputRenderingTest(unittest.TestCase):
             self.assertEqual(_row(_metrics(bit_score=bits), ["bits"]), [want], bits)
         self.assertEqual(_row(_metrics(), ["bits"]), [""])
 
+    @pytest.mark.usefixtures("fmsw_libs")
     def test_blosum62_bits_keep_mmseqs2_rounding(self):
         """BLOSUM62 (an integer score) keeps int(bits + 0.5), negative bit scores included, so its output is
         byte-identical to before P6 (principle 5)."""
@@ -1632,6 +1633,7 @@ class OutputRenderingTest(unittest.TestCase):
                               ["raw", "rawadj", "q90", "ecal"]), ["0.500", "0.000", "0.000", "0"])
         self.assertEqual(_row(_metrics(score_adj=-2.25), ["rawadj"]), ["-2.250"])
 
+    @pytest.mark.usefixtures("fmsw_libs")
     def test_blosum62_metrics_keep_their_columns_and_leave_the_new_ones_empty(self):
         m = _metrics(score=37, bit_score=19.78, evalue=1.5e-3)
         self.assertEqual(_row(m, ["raw", "bits", "evalue", "rawrev", "q90", "rawadj", "ecal"]),

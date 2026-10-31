@@ -10,10 +10,19 @@ import numpy as np
 
 from foldmatch.types.api_types import SignificanceMode
 
-from . import karlin_altschul
+from . import karlin_altschul, swint
 from .output import DEFAULT_OUTPUT_FIELDS
 
 logger = logging.getLogger(__name__)
+
+# Stage 2 of a BLOSUM62 search aligns every Stage-1 candidate with a local
+# Smith-Waterman (affine gaps, a gap of length L costs open + (L-1)*extend) on
+# the native integer kernel fmswi_align (:mod:`swint`; model in fmsw.h). Its
+# output is that of biotite 1.7.1's align_optimal(local=True, max_number=1):
+# the same score, end cell and path, hence the same columns. There is no other
+# engine: a missing or stale library raises swkern.KernelError with the
+# rebuild command, as for esm-codes. biotite still supplies the BLOSUM62
+# matrix and the 'sampled' significance estimate, and is the tests' oracle.
 
 # Significance (p-/E-values, bit scores) comes in two flavors, selected by
 # ``significance_mode``:
@@ -161,9 +170,13 @@ _MMSEQS_BLOSUM62_BACKGROUND = (
 _COMP_BIAS_WINDOW = 40
 
 # Per-process globals populated by the multiprocessing initializer so the
-# (immutable, picklable-but-large) substitution matrix is built once per worker.
-_MATRIX = None
-_GAP: Tuple[int, int] = (-11, -1)
+# kernel and the substitution matrix are loaded once per worker.
+# The integer kernel (swint.IntKernel) and biotite's BLOSUM62 as an int32
+# 24x24 table in swint.ALPHABET order (the rows of every query profile).
+_INT_KERNEL: Optional["swint.IntKernel"] = None
+_INT_MATRIX: Optional[np.ndarray] = None
+# Positive gap costs (open, extend), as the kernel takes them.
+_GAP_COSTS: Tuple[int, int] = (11, 1)
 # Karlin-Altschul E-value estimator (biotite) and the subject-DB residue total,
 # also per-process. _ESTIMATOR is None unless significance_mode='sampled'.
 _ESTIMATOR = None
@@ -181,6 +194,15 @@ _OUTPUT_NEEDS: "_FieldNeeds" = _FieldNeeds(False, False, False, False, False)
 # Compositional bias correction scale, or None when the correction is off; set
 # per-process by the pool initializer.
 _COMP_BIAS_SCALE: Optional[float] = None
+# A pool worker whose initializer failed keeps the error here and every task it
+# gets raises it: an initializer that raised would make multiprocessing.Pool
+# start a new worker for ever, and Stage 2 would hang instead of failing.
+_INIT_ERROR: Optional[BaseException] = None
+# Cell-based dispatch (as the esm-codes Stage 2): tasks of contiguous candidates
+# of at most max(floor, total / (TASKS_PER_WORKER * workers)) DP cells, queued
+# longest first.
+_TASK_CELLS_FLOOR = 1 << 20
+_TASKS_PER_WORKER = 4
 # MMseqs2's (integer BLOSUM62, background) pair for the correction, built lazily.
 _MMSEQS_SCORING: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
@@ -256,19 +278,14 @@ def sanitize_sequence(sequence: str) -> str:
     return "".join(c if c in _BIOTITE_ALPHABET else "X" for c in sequence.strip().upper())
 
 
-def _to_protein(sequence: str):
-    """Build a biotite ProteinSequence from a sequence string.
+def _sanitized_bytes(sequence: str) -> bytes:
+    """``sanitize_sequence(sequence)`` as ASCII bytes (a byte-table fast path for ASCII text).
 
-    Returns ``(protein, clean_str, length)``; ``(None, "", 0)`` for an empty
-    sequence. The sanitized ``clean_str`` is what is actually aligned, so the
-    ``qseq``/``tseq``/``qaln``/``taln`` columns and the position indices are all
-    derived from it (keeping ``qaln`` a gapped substring of ``qseq``).
+    The sanitized text is what is actually aligned, so the ``qseq``/``tseq``/``qaln``/``taln`` columns and the
+    position indices are all derived from it (keeping ``qaln`` a gapped substring of ``qseq``).
     """
-    import biotite.sequence as seq
-    clean = sanitize_sequence(sequence)
-    if not clean:
-        return None, "", 0
-    return seq.ProteinSequence(clean), clean, len(clean)
+    clean = swint.sanitize_bytes(sequence)
+    return clean if clean is not None else sanitize_sequence(sequence).encode("ascii")
 
 
 def _mmseqs_blosum62() -> Tuple[np.ndarray, np.ndarray]:
@@ -340,101 +357,6 @@ def local_composition_bias(sequence: str, scale: float = 1.0) -> np.ndarray:
     return np.trunc(np.where(corrected < 0.0, corrected - 0.5, corrected + 0.5)).astype(np.int64)
 
 
-def _positional_query(query_protein, bias: np.ndarray):
-    """Score a query position-specifically: BLOSUM62 row of each residue plus its bias.
-
-    biotite has no per-position scoring hook, so the query becomes a sequence
-    over its own positions with an ``L x |protein alphabet|`` substitution
-    matrix. With zero bias this reproduces the plain BLOSUM62 alignment exactly
-    (score and trace).
-    """
-    import biotite.sequence as seq
-    import biotite.sequence.align as align
-    n = len(query_protein)
-    alphabet = seq.Alphabet(list(range(n)))
-    positional = seq.GeneralSequence(alphabet, list(range(n)))
-    scores = _MATRIX.score_matrix()[query_protein.code] + bias[:, None]
-    matrix = align.SubstitutionMatrix(alphabet, _MATRIX.get_alphabet2(), scores.astype(np.int32))
-    return positional, matrix
-
-
-def _count_runs(mask: np.ndarray) -> int:
-    """Number of maximal runs of ``True`` in a 1-D boolean mask (gap-open count)."""
-    if mask.size == 0:
-        return 0
-    return int(mask[0]) + int(np.count_nonzero(mask[1:] & ~mask[:-1]))
-
-
-def _run_length_encode(ops: str) -> str:
-    """Collapse a per-column op string (e.g. 'MMMDDMM') to CIGAR ('3M2D2M')."""
-    if not ops:
-        return ""
-    out: List[str] = []
-    prev = ops[0]
-    count = 1
-    for ch in ops[1:]:
-        if ch == prev:
-            count += 1
-        else:
-            out.append(f"{count}{prev}")
-            prev = ch
-            count = 1
-    out.append(f"{count}{prev}")
-    return "".join(out)
-
-
-def _derive_alignment_extras(trace, query_str: str, subject_str: str, needs: "_FieldNeeds"):
-    """Compute the mmseqs column values that need the alignment trace.
-
-    Returns ``(n_ident, mismatch, gap_open, q_start, q_end, t_start, t_end,
-    cigar, q_aln, t_aln)``; ``n_ident`` is also what the identity columns are
-    computed from. The trace must be non-empty; column ``(-1, -1)`` never
-    occurs (biotite emits no double-gap columns), so the three masks partition
-    the columns exactly.
-    """
-    q_idx = trace[:, 0]
-    s_idx = trace[:, 1]
-    q_gap = q_idx == -1
-    s_gap = s_idx == -1
-    both = ~q_gap & ~s_gap
-
-    q_arr = np.frombuffer(query_str.encode("ascii"), dtype=np.uint8)
-    s_arr = np.frombuffer(subject_str.encode("ascii"), dtype=np.uint8)
-
-    # 1-indexed bounds over each side's non-gap columns (min/max, so a terminal
-    # gap column — should one ever occur — cannot skew the reported extent).
-    q_res = q_idx[~q_gap]
-    s_res = s_idx[~s_gap]
-    q_start = int(q_res.min()) + 1
-    q_end = int(q_res.max()) + 1
-    t_start = int(s_res.min()) + 1
-    t_end = int(s_res.max()) + 1
-
-    # Identity/mismatch only over columns aligned on both sides.
-    matches = q_arr[q_idx[both]] == s_arr[s_idx[both]]
-    n_ident = int(np.count_nonzero(matches))
-    aligned_pairs = int(both.sum())
-    mismatch = aligned_pairs - n_ident
-
-    # A gap-open event is one maximal run of gaps; count query- and target-side
-    # runs independently (no column is a gap on both sides).
-    gap_open = _count_runs(q_gap) + _count_runs(s_gap)
-
-    cigar = q_aln = t_aln = None
-    if needs.cigar:
-        ops = np.empty(trace.shape[0], dtype="U1")
-        ops[both] = "M"
-        ops[q_gap] = "D"   # deletion: gap in query
-        ops[s_gap] = "I"   # insertion: gap in target
-        cigar = _run_length_encode("".join(ops.tolist()))
-    if needs.qaln:
-        q_aln = "".join(query_str[i] if i != -1 else "-" for i in q_idx)
-    if needs.taln:
-        t_aln = "".join(subject_str[i] if i != -1 else "-" for i in s_idx)
-
-    return n_ident, mismatch, gap_open, q_start, q_end, t_start, t_end, cigar, q_aln, t_aln
-
-
 def _robinson_frequency_vector(alphabet) -> np.ndarray:
     """Robinson background frequencies as a vector aligned to ``alphabet`` order."""
     freq = np.array(
@@ -503,15 +425,25 @@ def _bit_score(score: int, lam: float, k: float) -> float:
 
 def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Optional[float],
                  db_residues: Optional[int], alp_params=None, needs: Optional["_FieldNeeds"] = None,
-                 comp_bias_scale: Optional[float] = None):
-    global _MATRIX, _GAP, _ESTIMATOR, _DB_RESIDUES, _LAMBDA, _K, _ALP, _OUTPUT_NEEDS, _COMP_BIAS_SCALE
+                 comp_bias_scale: Optional[float] = None, isa: Optional[str] = None):
+    """Set what every task needs, once per process: the kernel of ``isa`` (the
+    one the parent loaded; ``None`` dispatches), the matrix, the gap costs, the
+    significance parameters and the output needs. The serial path calls it
+    in-process, where an error is raised at once; see :func:`_pool_worker_init`."""
+    global _INT_KERNEL, _INT_MATRIX, _GAP_COSTS, _ESTIMATOR, _DB_RESIDUES, _LAMBDA, _K, _ALP, _OUTPUT_NEEDS
+    global _COMP_BIAS_SCALE, _INIT_ERROR
     import biotite.sequence.align as align
+    _INIT_ERROR = None
     _OUTPUT_NEEDS = needs if needs is not None else _FieldNeeds(False, False, False, False, False)
-    _MATRIX = align.SubstitutionMatrix.std_protein_matrix()  # BLOSUM62
-    # Gap penalties are passed through unmodified: biotite charges a length-L gap
-    # as open + (L-1)*extend, which is exactly MMseqs2's convention, so 11/1 here
-    # is the scoring system its hardcoded lambda/K were shipped with.
-    _GAP = (-abs(gap_open), -abs(gap_extend))
+    _INT_KERNEL = swint.load(isa)
+    matrix = align.SubstitutionMatrix.std_protein_matrix()  # BLOSUM62
+    if "".join(matrix.get_alphabet1().get_symbols()) != swint.ALPHABET:
+        raise RuntimeError("biotite's protein alphabet differs from the kernel's code order (swint.ALPHABET)")
+    _INT_MATRIX = np.ascontiguousarray(matrix.score_matrix(), dtype=np.int32)
+    # The kernel charges a length-L gap as open + (L-1)*extend, biotite's and
+    # MMseqs2's convention, so 11/1 here is the scoring system the hardcoded
+    # lambda/K were shipped with. The sign of a cost is ignored, as it always was.
+    _GAP_COSTS = (abs(gap_open), abs(gap_extend))
     _ALP = alp_params
     if alp_params is not None:
         _ESTIMATOR = None
@@ -523,163 +455,202 @@ def _worker_init(gap_open: int, gap_extend: int, lam: Optional[float], k: Option
     _COMP_BIAS_SCALE = comp_bias_scale
 
 
-def _align(query_protein, query_str: str, query_len: int,
-           subject_protein, subject_str: str, subject_len: int,
-           scoring=None) -> AlignmentMetrics:
-    """Local alignment of one pair. ``scoring`` is ``(positional_query, matrix)``
-    from :func:`_positional_query` when the compositional bias correction is on."""
-    import biotite.sequence.align as align
-    if scoring is None:
-        aln = align.align_optimal(
-            query_protein, subject_protein, _MATRIX,
-            gap_penalty=_GAP, local=True, max_number=1,
-        )[0]
-    else:
-        positional, matrix = scoring
-        aln = align.align_optimal(
-            positional, subject_protein, matrix,
-            gap_penalty=_GAP, local=True, max_number=1,
-        )[0]
-        # Identity is measured on residues, not positions: re-attach the real query.
-        aln = align.Alignment([query_protein, subject_protein], aln.trace, aln.score)
-    score = int(aln.score)
-    # Compute the bit score here so both return paths carry it. None when
-    # significance is off; otherwise on whatever scale the active mode implies.
-    bit_score = _bit_score(score, _LAMBDA, _K) if _LAMBDA is not None else None
-    needs = _OUTPUT_NEEDS
-    q_seq = query_str if needs.qseq else None
-    t_seq = subject_str if needs.tseq else None
-    trace = aln.trace
-    aln_len = int(trace.shape[0])
-    if aln_len == 0:
-        return AlignmentMetrics(
-            0.0, 0.0, 0.0, 0.0, 0, score, bit_score=bit_score,
-            query_len=query_len, subject_len=subject_len,
-            cigar=("" if needs.cigar else None),
-            q_aln=("" if needs.qaln else None),
-            t_aln=("" if needs.taln else None),
-            q_seq=q_seq, t_seq=t_seq,
-        )
-    q_aligned = int((trace[:, 0] != -1).sum())
-    s_aligned = int((trace[:, 1] != -1).sum())
-    (n_ident, mismatch, gap_open, q_start, q_end, t_start, t_end,
-     cigar, q_aln, t_aln) = _derive_alignment_extras(trace, query_str, subject_str, needs)
-    # Identity from the vectorised column tally rather than biotite's
-    # get_sequence_identity, which loops over every column in Python. n_ident
-    # counts exactly the columns it counts as matches (both residues present and
-    # equal; the sanitized strings map 1:1 onto the protein codes), and both
-    # divide Python ints, so the values are the same floats: 'all' divides by the
-    # alignment length, 'shortest' by the shorter full sequence.
-    identity_aln = n_ident / aln_len
-    identity_shorter = n_ident / min(query_len, subject_len)
-
-    pvalue = evalue = None
-    if _ALP is not None:
-        # Calibrated: ALP constants + ALP's finite-size-corrected area.
-        # Pairwise p-value: search space = the two sequences (n = subject length).
-        # MMseqs2 itself emits no p-value; this is the ALP p-value of the
-        # pairwise E, kept for continuity with the 'sampled' mode.
-        pvalue = karlin_altschul.pvalue_from_evalue(
-            karlin_altschul.evalue(score, query_len, subject_len, _ALP)
-        )
-        # Database E-value: this is the MMseqs2-comparable quantity — search
-        # space = the whole target DB as one concatenated sequence, exactly as
-        # MMseqs2 does (no per-sequence term, no multiply by sequence count).
-        if _DB_RESIDUES:
-            evalue = karlin_altschul.evalue(score, query_len, _DB_RESIDUES, _ALP)
-    elif _ESTIMATOR is not None:
-        # Sampled/relative-only: biotite's raw K*m*n*exp(-lambda*S), no edge correction.
-        pvalue = _pvalue_from_evalue(
-            _evalue_from_log(_ESTIMATOR.log_evalue(score, query_len, subject_len))
-        )
-        if _DB_RESIDUES:
-            evalue = _evalue_from_log(
-                _ESTIMATOR.log_evalue(score, query_len, _DB_RESIDUES)
-            )
-
-    return AlignmentMetrics(
-        identity_aln=identity_aln,
-        identity_shorter=identity_shorter,
-        query_coverage=q_aligned / query_len if query_len else 0.0,
-        subject_coverage=s_aligned / subject_len if subject_len else 0.0,
-        aln_len=aln_len,
-        score=score,
-        bit_score=bit_score,
-        pvalue=pvalue,
-        evalue=evalue,
-        query_len=query_len,
-        subject_len=subject_len,
-        n_ident=n_ident,
-        mismatch=mismatch,
-        gap_open=gap_open,
-        q_start=q_start,
-        q_end=q_end,
-        t_start=t_start,
-        t_end=t_end,
-        cigar=cigar,
-        q_aln=q_aln,
-        t_aln=t_aln,
-        q_seq=q_seq,
-        t_seq=t_seq,
-    )
+def _pool_worker_init(*init_args):
+    """The pool's initializer: :func:`_worker_init` with its error kept for the
+    tasks, which raise it (as the esm-codes Stage 2 does), so a worker that
+    cannot load the kernel fails Stage 2 instead of hanging it."""
+    global _INIT_ERROR
+    try:
+        _worker_init(*init_args)
+    except BaseException as e:  # noqa: BLE001  (re-raised by every task of this worker)
+        _INIT_ERROR = e
 
 
 def _align_query(task):
     """Align one query against a chunk of its candidate subjects. Runs in a worker.
 
     The chunk may be all of a query's candidates or a slice of them (see
-    :func:`_chunk_candidate_tasks`); either way the query protein is built once
-    for the chunk and a partial hit list is returned, keyed by ``query_id`` so
-    the caller can regroup a query that was split across several chunks.
+    :func:`_chunk_candidate_tasks`); either way the query profile is built once
+    for the chunk, ONE ``fmswi_align`` call aligns all its candidates, and a
+    partial hit list is returned, keyed by ``query_id`` so the caller can
+    regroup a query that was split across several chunks.
     """
+    if _INIT_ERROR is not None:
+        raise _INIT_ERROR
     query_id, query_seq, candidates = task
-    query_protein, query_clean, query_len = _to_protein(query_seq)
-    if query_protein is None:
+    qbytes = _sanitized_bytes(query_seq)
+    if not qbytes:
         return query_id, []
-    scoring = None
+    query_clean = qbytes.decode("ascii")
+    query_len = len(qbytes)
+    qcodes = swint.codes_of(qbytes)
+    bias = None
     if _COMP_BIAS_SCALE is not None:
         # Built from the raw sequence so MMseqs2's letter folding (e.g. J->L)
         # applies; sanitize_sequence maps characters 1:1, so positions line up.
-        scoring = _positional_query(query_protein, local_composition_bias(query_seq, _COMP_BIAS_SCALE))
-    hits: List[Hit] = []
+        bias = local_composition_bias(query_seq, _COMP_BIAS_SCALE)
+    qprof = swint.query_profile(qcodes, _INT_MATRIX, bias)
+    ids: List[str] = []
+    embs: List[float] = []
+    cleans: List[bytes] = []
     for subject_id, subject_seq, emb_score in candidates:
-        subject_protein, subject_clean, subject_len = _to_protein(subject_seq)
-        if subject_protein is None:
+        clean = _sanitized_bytes(subject_seq)
+        if not clean:
             continue
-        metrics = _align(
-            query_protein, query_clean, query_len,
-            subject_protein, subject_clean, subject_len,
-            scoring=scoring,
+        ids.append(subject_id)
+        embs.append(emb_score)
+        cleans.append(clean)
+    if not cleans:
+        return query_id, []
+    lens = np.fromiter((len(c) for c in cleans), dtype=np.int32, count=len(cleans))
+    offs = np.zeros(len(cleans), dtype=np.int64)
+    if len(cleans) > 1:
+        np.cumsum(lens[:-1], out=offs[1:])
+    needs = _OUTPUT_NEEDS
+    want_ops = needs.cigar or needs.qaln or needs.taln
+    res = swint.align_batch(qcodes, qprof, swint.codes_of(b"".join(cleans)), offs, lens,
+                            _GAP_COSTS[0], _GAP_COSTS[1], ops=want_ops, kernel=_INT_KERNEL)
+    rows = res.out.tolist()
+    q_seq = query_clean if needs.qseq else None
+    lam, kk, alp, est, db_res = _LAMBDA, _K, _ALP, _ESTIMATOR, _DB_RESIDUES
+    # Bit scores and database E-values depend only on the score within a task
+    # (one query), so each is computed once per distinct score.
+    bits_of: Dict[int, Optional[float]] = {}
+    evalue_of: Dict[int, Optional[float]] = {}
+    hits: List[Hit] = []
+    for idx, (subject_id, emb_score, clean, row) in enumerate(zip(ids, embs, cleans, rows)):
+        (score, q_start, q_end, t_start, t_end, aln_len, n_ident, gap_open, n_qgap, n_tgap, _wide) = row
+        subject_len = len(clean)
+        subject_str = clean.decode("ascii") if (needs.tseq or needs.taln or needs.qaln) else None
+        t_seq = subject_str if needs.tseq else None
+        # The bit score is computed here so both return paths carry it. None when
+        # significance is off; otherwise on whatever scale the active mode implies.
+        if score in bits_of:
+            bit_score = bits_of[score]
+        else:
+            bit_score = bits_of[score] = _bit_score(score, lam, kk) if lam is not None else None
+        if aln_len == 0:
+            metrics = AlignmentMetrics(
+                0.0, 0.0, 0.0, 0.0, 0, score, bit_score=bit_score,
+                query_len=query_len, subject_len=subject_len,
+                cigar=("" if needs.cigar else None),
+                q_aln=("" if needs.qaln else None),
+                t_aln=("" if needs.taln else None),
+                q_seq=q_seq, t_seq=t_seq,
+            )
+            hits.append(Hit(subject_id=subject_id, emb_score=emb_score, metrics=metrics))
+            continue
+        cigar = q_aln = t_aln = None
+        if want_ops:
+            ops = res.ops[res.ops_off[idx]:res.ops_off[idx + 1]]
+            if needs.cigar:
+                cigar = swint.run_length_encode(ops)
+            if needs.qaln or needs.taln:
+                qa, ta = swint.gapped_strings(ops, query_clean, subject_str, q_start, t_start)
+                q_aln = qa if needs.qaln else None
+                t_aln = ta if needs.taln else None
+        pvalue = evalue = None
+        if alp is not None:
+            # Calibrated: ALP constants + ALP's finite-size-corrected area.
+            # Pairwise p-value: search space = the two sequences (n = subject length).
+            # MMseqs2 itself emits no p-value; this is the ALP p-value of the
+            # pairwise E, kept for continuity with the 'sampled' mode.
+            pvalue = karlin_altschul.pvalue_from_evalue(
+                karlin_altschul.evalue(score, query_len, subject_len, alp)
+            )
+            # Database E-value: this is the MMseqs2-comparable quantity — search
+            # space = the whole target DB as one concatenated sequence, exactly as
+            # MMseqs2 does (no per-sequence term, no multiply by sequence count).
+            if db_res:
+                if score in evalue_of:
+                    evalue = evalue_of[score]
+                else:
+                    evalue = evalue_of[score] = karlin_altschul.evalue(score, query_len, db_res, alp)
+        elif est is not None:
+            # Sampled/relative-only: biotite's raw K*m*n*exp(-lambda*S), no edge correction.
+            pvalue = _pvalue_from_evalue(_evalue_from_log(est.log_evalue(score, query_len, subject_len)))
+            if db_res:
+                evalue = _evalue_from_log(est.log_evalue(score, query_len, db_res))
+        # Identity is n_ident (aligned pairs with equal residues) over the
+        # alignment length ('all') or the shorter full sequence ('shortest'), as
+        # biotite's get_sequence_identity counts it; both divide Python ints.
+        metrics = AlignmentMetrics(
+            identity_aln=n_ident / aln_len,
+            identity_shorter=n_ident / min(query_len, subject_len),
+            query_coverage=(aln_len - n_qgap) / query_len,
+            subject_coverage=(aln_len - n_tgap) / subject_len,
+            aln_len=aln_len,
+            score=score,
+            bit_score=bit_score,
+            pvalue=pvalue,
+            evalue=evalue,
+            query_len=query_len,
+            subject_len=subject_len,
+            n_ident=n_ident,
+            mismatch=aln_len - n_qgap - n_tgap - n_ident,
+            gap_open=gap_open,
+            q_start=q_start,
+            q_end=q_end,
+            t_start=t_start,
+            t_end=t_end,
+            cigar=cigar,
+            q_aln=q_aln,
+            t_aln=t_aln,
+            q_seq=q_seq,
+            t_seq=t_seq,
         )
         hits.append(Hit(subject_id=subject_id, emb_score=emb_score, metrics=metrics))
     return query_id, hits
 
 
-def _chunk_candidate_tasks(tasks, worker_budget: int, tasks_per_worker: int = 4):
-    """Split per-query tasks into per-(query, candidate-chunk) tasks for the pool.
+def _align_indexed(item):
+    """Pool entry point: ``(index, task) -> (index, _align_query(task))``."""
+    index, task = item
+    return index, _align_query(task)
+
+
+def _chunk_candidate_tasks(tasks, worker_budget: int, tasks_per_worker: int = _TASKS_PER_WORKER,
+                           floor_cells: Optional[int] = None):
+    """Split per-query tasks into contiguous candidate slices of about equal DP cells.
 
     Parallelizing over whole queries pins a single query with many candidates to
     one worker (every other core idle); splitting a query's candidate list into
-    chunks lets the pool spread those alignments across all workers. Chunk size
-    is chosen so there are roughly ``tasks_per_worker * worker_budget`` chunks in
-    total — enough to keep every worker fed and to smooth out the load imbalance
-    from variable-length (quadratic-cost) alignments — while still batching
-    several candidates per chunk to amortize the per-chunk query rebuild and the
-    task's pickling overhead.
+    slices lets the pool spread those alignments across all workers. The slice
+    budget is ``max(floor_cells, ceil(total_cells / (tasks_per_worker *
+    worker_budget)))`` (``floor_cells`` defaults to :data:`_TASK_CELLS_FLOOR`,
+    enough cells to amortize a task's pickling and its kernel call), with
+    ``cells = len(query) * len(subject)`` on the unsanitised strings (an
+    estimate for scheduling only); a candidate that alone exceeds the budget is
+    its own slice. Returns ``(chunks, cells)`` in query-then-candidate order, so
+    the caller can queue them longest first and still regroup the results in
+    this order.
 
     Queries with no candidates are dropped here (they emit no work); the caller
     re-seeds them so they still report an empty hit list.
     """
-    total_pairs = sum(len(candidates) for _, _, candidates in tasks)
-    if total_pairs == 0:
-        return list(tasks)
-    target_chunks = tasks_per_worker * max(1, worker_budget)
-    chunk_size = max(1, math.ceil(total_pairs / target_chunks))
-    chunked = []
+    if floor_cells is None:
+        floor_cells = _TASK_CELLS_FLOOR
+    per_task = []
+    total = 0
     for query_id, query_seq, candidates in tasks:
-        for start in range(0, len(candidates), chunk_size):
-            chunked.append((query_id, query_seq, candidates[start:start + chunk_size]))
-    return chunked
+        n = len(query_seq)
+        cells = [n * len(seq) for _, seq, _ in candidates]
+        per_task.append(cells)
+        total += sum(cells)
+    budget = max(int(floor_cells), -(-total // (max(1, tasks_per_worker) * max(1, worker_budget))))
+    chunks, chunk_cells = [], []
+    for (query_id, query_seq, candidates), cells in zip(tasks, per_task):
+        start, acc = 0, 0
+        for k, c in enumerate(cells):
+            if k > start and acc + c > budget:
+                chunks.append((query_id, query_seq, candidates[start:k]))
+                chunk_cells.append(acc)
+                start, acc = k, 0
+            acc += c
+        if start < len(candidates):
+            chunks.append((query_id, query_seq, candidates[start:]))
+            chunk_cells.append(acc)
+    return chunks, chunk_cells
 
 
 def check_evalue_search_space(max_evalue: Optional[float], subject_db_size: Optional[int]) -> Optional[float]:
@@ -713,6 +684,82 @@ def check_evalue_search_space(max_evalue: Optional[float], subject_db_size: Opti
             f"rank hits without E-value filtering."
         )
     return max_evalue
+
+
+def whole_number(value) -> Optional[int]:
+    """``value`` as an int when it is a whole number: an int or a numpy integer
+    (a bool is not one), or a float with a whole value (11.0, which biotite's
+    aligner took as 11); else ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return int(value)
+    return None
+
+
+def check_gap_costs(
+        gap_open: int,
+        gap_extend: int,
+        significance_mode: SignificanceMode = SignificanceMode.default,
+        significance: bool = False,
+        max_evalue: Optional[float] = None,
+) -> Tuple[int, int]:
+    """The gap costs of a BLOSUM62 Stage 2 as ``(open, extend)``, checked.
+
+    The costs are the absolute values of the arguments (the sign is ignored, as
+    it always was), which must be whole numbers (:func:`whole_number`: 11.0 is
+    11, as biotite took it), else a ``TypeError``. Raises a ``ValueError``
+    that names the cause unless
+
+    * ``open`` is between 1 and :data:`swint.MAX_GAP` and ``extend`` between 0
+      and :data:`swint.MAX_GAP`: what the Smith-Waterman kernel accepts (its
+      end-cell rule needs a gap to cost at least 1 to open; ``MAX_GAP`` is its
+      ``FMSWI_MAX_GAP``);
+    * with ``significance_mode='default'``, when significance is computed
+      (``significance``: a significance column is requested; or a finite
+      ``max_evalue``, which forces it), the costs are 11/1, the only ones with
+      calibrated statistics (:func:`karlin_altschul.params_for`).
+
+    ``None`` and non-finite ``max_evalue`` mean no E-value filter, as in
+    :func:`check_evalue_search_space`. Cheap, so callers can run it before any
+    expensive work (the CLI does, before ESM3); :func:`align_candidates` runs
+    it before it reads a sequence.
+    """
+    costs = []
+    for name, value, low in (("gap_open", gap_open, 1), ("gap_extend", gap_extend, 0)):
+        whole = whole_number(value)
+        if whole is None:
+            raise TypeError(f"{name} must be a whole number, got {value!r}.")
+        if abs(whole) < low:
+            raise ValueError(
+                f"{name} must be between {low} and {swint.MAX_GAP} (its sign is ignored), got {value}: a gap of "
+                f"length L costs gap_open + (L - 1) * gap_extend, and the kernel's end-cell rule needs a gap to "
+                f"cost at least 1 to open."
+            )
+        if abs(whole) > swint.MAX_GAP:
+            raise ValueError(
+                f"{name} must be between {low} and {swint.MAX_GAP} (its sign is ignored), got {value}: "
+                f"{swint.MAX_GAP} is the most the Smith-Waterman kernel takes (FMSWI_MAX_GAP)."
+            )
+        costs.append(abs(whole))
+    costs = tuple(costs)
+    filtering = max_evalue is not None and math.isfinite(max_evalue)
+    if SignificanceMode(significance_mode) is SignificanceMode.default and (significance or filtering):
+        try:
+            karlin_altschul.params_for(*costs)
+        except ValueError as exc:
+            # Without an E-value threshold, these gap penalties would have
+            # been fine whenever no significance column was requested — say
+            # how to get that behaviour back.
+            if not filtering:
+                raise
+            raise ValueError(
+                f"{exc} E-value filtering (max_evalue={max_evalue:g}) requires "
+                f"significance; disable it to use these gap penalties."
+            ) from None
+    return costs
 
 
 def align_candidates(
@@ -759,7 +806,11 @@ def align_candidates(
             (or one deliberately skipping the significance pass) must pass
             ``max_evalue=None``. These three thresholds default to the same
             values as the ``fm-search query`` options that expose them.
-        gap_open / gap_extend: positive BLOSUM62 gap penalties (negated internally).
+        gap_open / gap_extend: BLOSUM62 gap costs, whole numbers (11.0 is
+            11); a gap of length L costs ``gap_open + (L - 1) * gap_extend``.
+            The sign is ignored; ``gap_open`` must be at least 1 and
+            ``gap_extend`` at least 0, both at most :data:`swint.MAX_GAP`
+            (:func:`check_gap_costs`, run before any sequence is read).
         comp_bias_corr: correct the Smith-Waterman scores for locally biased
             amino-acid composition, as MMseqs2's ``--comp-bias-corr`` does (see
             :func:`local_composition_bias`). Off by default (plain BLOSUM62);
@@ -787,7 +838,7 @@ def align_candidates(
             ``'default'`` uses calibrated Karlin-Altschul
             constants with a finite-size-corrected search space, giving exact,
             reproducible values; it supports only ``gap_open=11, gap_extend=1``
-            and raises otherwise. ``'sampled'`` restores the previous behavior —
+            and raises otherwise (up front, when significance is computed). ``'sampled'`` restores the previous behavior —
             lambda/K estimated by sampling, whose absolute values are unreliable
             (they do not converge with sample size) though the ranking is sound;
             use it for gap penalties ``'default'`` cannot serve. Neither mode is
@@ -808,6 +859,10 @@ def align_candidates(
         embedding score desc; with ``compute_significance=False`` the raw
         alignment score is used directly. Queries with no surviving hit map to
         ``[]``.
+
+    The alignments run on the native kernel (:mod:`swint`), loaded before any
+    sequence is read: :class:`~foldmatch.search.swkern.KernelError` (with the
+    rebuild command) when it cannot be used. There is no fallback.
     """
     start_time = time.perf_counter()
     # An E-value threshold only means something once the significance pass has
@@ -834,6 +889,12 @@ def align_candidates(
             f"Unknown significance_mode {significance_mode!r}; expected one of: "
             f"{', '.join(m.value for m in SignificanceMode)}."
         ) from None
+    # The gap costs the kernel takes (and, under 'default' significance, 11/1),
+    # checked before any sequence is read or any worker starts.
+    gap_open, gap_extend = check_gap_costs(gap_open, gap_extend, significance_mode, compute_significance, max_evalue)
+    # The kernel, as for esm-codes: a missing or stale library raises KernelError
+    # here, with the rebuild command; the workers load the same ISA.
+    kernel = swint.load()
 
     # Gather every candidate subject sequence in a single random-access read.
     all_subject_ids = {
@@ -864,18 +925,8 @@ def align_candidates(
     lam = k = alp_params = None
     if compute_significance and tasks:
         if significance_mode is SignificanceMode.default:
-            try:
-                alp_params = karlin_altschul.params_for(gap_open, gap_extend)
-            except ValueError as exc:
-                # Without an E-value threshold, these gap penalties would have
-                # been fine whenever no significance column was requested — say
-                # how to get that behaviour back.
-                if max_evalue is None:
-                    raise
-                raise ValueError(
-                    f"{exc} E-value filtering (max_evalue={max_evalue:g}) requires "
-                    f"significance; disable it to use these gap penalties."
-                ) from None
+            # 11/1, checked by check_gap_costs above.
+            alp_params = karlin_altschul.params_for(gap_open, gap_extend)
             logger.info(
                 f"Using calibrated significance (BLOSUM62 {gap_open}/{gap_extend}: "
                 f"lambda={alp_params.lam:.8f}, K={alp_params.k:.9f})"
@@ -897,14 +948,15 @@ def align_candidates(
 
     if comp_bias_scale is not None and tasks:
         logger.info(f"Applying compositional bias correction (scale {comp_bias_scale:g})")
-    init_args = (gap_open, gap_extend, lam, k, subject_db_size, alp_params, needs, comp_bias_scale)
+    init_args = (gap_open, gap_extend, lam, k, subject_db_size, alp_params, needs, comp_bias_scale, kernel.isa)
     if not serial and tasks:
         # Parallelize over (query, subject) *pairs* rather than whole queries by
-        # chunking each query's candidate list, so even a single query with many
-        # candidates uses the whole node instead of one core. Size the pool by
-        # the number of chunks (capped, as before, at the worker budget).
+        # cutting each query's candidate list into slices of about equal DP
+        # cells, so even a single query with many candidates uses the whole node
+        # instead of one core. Size the pool by the number of slices (capped, as
+        # before, at the worker budget).
         worker_budget = _available_cpus() if num_workers is None else num_workers
-        pair_tasks = _chunk_candidate_tasks(tasks, worker_budget)
+        pair_tasks, chunk_cells = _chunk_candidate_tasks(tasks, worker_budget)
         n_workers = _resolve_num_workers(num_workers, len(pair_tasks))
     else:
         pair_tasks = tasks
@@ -914,18 +966,25 @@ def align_candidates(
         total_pairs = sum(len(candidates) for _, _, candidates in tasks)
         logger.info(
             f"Aligning {total_pairs} (query, subject) pairs from {len(tasks)} "
-            f"queries in {len(pair_tasks)} chunks across {n_workers} CPU workers"
+            f"queries in {len(pair_tasks)} chunks across {n_workers} CPU workers "
+            f"(kernel {kernel.isa})"
         )
         import multiprocessing as mp
         with mp.get_context(_pool_start_method()).Pool(
             processes=n_workers,
-            initializer=_worker_init,
+            initializer=_pool_worker_init,
             initargs=init_args,
         ) as pool:
-            # chunksize=1: each candidate-chunk is its own dispatch unit (we've
-            # already sized the chunks) so variable-length alignments stay
-            # balanced; pool.map preserves task order.
-            raw = pool.map(_align_query, pair_tasks, chunksize=1)
+            # chunksize=1: each slice is its own dispatch unit (we've already
+            # sized them), queued longest first so the largest ones do not end
+            # the run alone. The results are put back by task index, so the
+            # per-query hit lists below are built in input order and the stable
+            # sort sees the same input whatever the completion order.
+            order = sorted(range(len(pair_tasks)), key=lambda i: -chunk_cells[i])
+            raw = [None] * len(pair_tasks)
+            for index, result in pool.imap_unordered(
+                    _align_indexed, [(i, pair_tasks[i]) for i in order], chunksize=1):
+                raw[index] = result
     else:
         _worker_init(*init_args)
         raw = [_align_query(task) for task in pair_tasks]

@@ -48,8 +48,8 @@ Fidelity notes (deliberate, do not "fix"):
 
 * **Gap convention.** MMseqs2's Smith-Waterman charges a length-L gap as
   ``open + (L-1)*extend`` (a length-1 gap costs 11 at nominal 11/1), which is
-  exactly biotite's convention — so biotite's native ``(-11, -1)`` feeds these
-  constants directly with no adjustment. ALP itself *documents* its penalty as
+  exactly the convention of biotite and of the Stage-2 kernel that reproduces
+  it — so their nominal 11/1 feeds these constants directly with no adjustment. ALP itself *documents* its penalty as
   ``open + L*extend`` and MMseqs2 passes 11/1 through unconverted, so the
   hardcoded lambda/K are calibrated to a gap model one extension unit away from
   what the aligner scores. Reproducing MMseqs2 means inheriting that offset.

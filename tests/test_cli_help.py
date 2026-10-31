@@ -1,6 +1,7 @@
 """CLI help text that states what the code does (G10)."""
 import unittest
 
+import pytest
 import typer
 
 from foldmatch.cli.search import app
@@ -30,6 +31,7 @@ class MinCoverageHelpTest(unittest.TestCase):
         self.assertIn("min(qcov, tcov) >= min_coverage", doc)
         self.assertNotIn("*and*", doc)
 
+    @pytest.mark.usefixtures("fmsw_libs")
     def test_filter_drops_a_hit_with_one_side_below(self):
         """The behaviour the help describes: min(qcov, tcov) >= --min-coverage."""
         from foldmatch.search import alignment
