@@ -630,32 +630,18 @@ While the major version is `0`, breaking changes are released in a minor bump.
   with its first copy's coordinates, now stops the first two commands and the
   library (`Error while creating ESMProtein from structure chain ...`), as it
   already stopped the query (none of the 1,341 assemblies with copies
-  checked, in 1,083 entries, has one). The number and order of the chains are
-  unchanged, and in mmCIF and BinaryCIF files laid out as the PDB archive's
-  are (each ligand with an asym ID of its own, each chain's records in one
-  block, with residue numbers that never decrease), the first copy of each
-  chain is read as before, bit for bit; any other mmCIF or BinaryCIF file
-  (one whose asym IDs are author chains, ligands included, as biotite writes
-  from a PDB structure, say) changes as a PDB file does, below, with its
-  `asym_id_list` for the REMARK 350 list. `inference assembly-embedding` and
+  checked, in 1,083 entries, has one). In mmCIF and BinaryCIF files laid out
+  as the PDB archive's are (each ligand with an asym ID of its own, each
+  chain's records in one block, with residue numbers that never decrease),
+  the number and order of the chains are unchanged, and the first copy of
+  each chain is read as before, bit for bit. In PDB files, which name chains
+  by their author IDs, and in any other mmCIF or BinaryCIF file (one whose
+  asym IDs are author chains, ligands included, as biotite writes from a PDB
+  structure, say), one ID can cover several pieces of a chain: how such a
+  chain is now read is in the next entry. `inference assembly-embedding` and
   `inference complete-embedding`, which repeat a chain's stored residue
   embeddings for each of its copies, and the chain-level commands are
-  unaffected. PDB files name chains by their author IDs, and one ID can cover
-  several pieces of a chain; in them the residues embedded change too. A
-  chain whose residue numbers decrease is cut where they do, and each piece,
-  read before as the first one, is now read as itself. Where records of
-  another chain of the same REMARK 350 list (`APPLY THE FOLLOWING TO CHAINS`)
-  lie between a chain's records in the file, the chain is now cut there too:
-  a chain whose ATOM records are in separate blocks, read before whole for
-  each block, is read block by block, and amino-acid HETATM groups with the
-  chain's ID listed after other chains (free amino-acid ligands) are no
-  longer added to the chain; two or more of them with consecutive numbers
-  make a chain of their own once they reach `--min-res-n` (`--min-res` for
-  `fm-search`), which was embedded as the whole chain with them and is now
-  embedded as them alone. A chain is cut nowhere else: its blocks and
-  amino-acid HETATM groups with no other chain of the list between them (in a
-  list of that chain alone, say) stay together, as before and as the query
-  reads them. ESM3 embeds each chain on its own, and a copy differs from the
+  unaffected. ESM3 embeds each chain on its own, and a copy differs from the
   chain it copies only by a rigid motion and by the rounding of its
   coordinates to 0.001 Å (after the motion, each atom within 0.0015 Å of its
   first copy's, on 3,720 copies in 346 assemblies of 241 entries), so its
@@ -665,10 +651,101 @@ While the major version is `0`, breaking changes are released in a minor bump.
   cosine of at least 0.99987 to the old ones (at least 0.99999999 for 8 of
   them), no value moving by more than 0.31% of the vector's norm. Rebuilding
   assembly databases, or recomputing assembly embeddings, for the copies is
-  therefore optional. **Rebuild assembly databases, and recompute assembly
-  embeddings, made from PDB files, or from mmCIF and BinaryCIF files not laid
-  out as the archive's, with such chains**, whose residues change (34 chains
-  changed residues in PDB versions of 10 such entries).
+  therefore optional (for chains that one ID splits, see the next entry).
+- **Chain and assembly embeddings of chains that one chain ID splits.** In
+  PDB files, which name chains by their author IDs and numbers, and in mmCIF
+  and BinaryCIF files not laid out as the archive's, one chain ID can cover
+  several pieces of a chain: where its residue numbers decrease (a tag
+  numbered 998-999 before residue 1, an insert numbered from 1001) and where
+  records of other chains lie between its records (its free amino-acid
+  ligands, HETATM groups listed after every chain, say). `fm-search build
+  structures --granularity chain`, `fm-embedding from-structures residue` and
+  `fm-embedding from-structures chain`, with the library's
+  `chain_complete_inference`, `esm_inference` and `structure_inference` given
+  structures (`foldmatch.inference`), listed such a chain once for each piece
+  long enough and embedded, each time, the first piece of the atoms with its
+  ID, in which blocks that only other chains separate run together, with the
+  chain's free amino-acid ligands listed later: a database could hold the
+  chain's id more than once, and only one piece of the chain, or all of it
+  with its free amino acids appended. `inference residue-embedding`,
+  `inference structure-embedding` and `inference complete-embedding`, with
+  `esm_inference` and `structure_inference` given chains, embedded that first
+  piece too; `fm-search query structure --granularity chain`
+  (`FoldMatch.residue_embedding_by_chain`), with or without `--chain-id`,
+  embedded every piece of at least `--min-res` amino acids and kept the last
+  one, the others embedded for nothing; `fm-search query structure
+  --granularity assembly` (`residue_embedding_by_assembly`), and since the
+  fix above the assembly builds, embedded the pieces of each copy apart;
+  `FoldMatch.residue_embedding` and `structure_embedding` embedded the pieces
+  apart; and the datasets of stored residue embeddings (`inference
+  assembly-embedding` and `inference complete-embedding`, and the library's
+  `chain_inference` given structures, `assembly_inferece` and
+  `ResidueAssemblyEmbeddingFromParquet`) took the chain's stored file once
+  for each piece. Every path now reads a protein chain the same way: the
+  pieces with its ID (in an assembly, of one copy), their amino-acid atoms
+  joined in file order into one protein, embedded in one pass, leaving out
+  the pieces whose amino acids are all HETATM records when it has amino acids
+  in ATOM records (a chain made only of HETATM amino acids, a peptide of
+  modified residues, say, keeps them all; HETATM groups within a piece of the
+  chain, right after its records with rising numbers, stay in it, as before).
+  It is a chain if its polymer amino-acid residues, counted piece by piece as
+  before, reach `--min-res-n` (`--min-res` for `fm-search`) together, so a
+  chain whose pieces are each shorter is now kept. Each chain is listed once
+  (in an assembly, once per copy): the database and the query embed the same
+  residues, each chain once (with `--chain-id`, that chain once), and the
+  datasets of stored residue embeddings take each chain's file once, as the
+  build writes it. A chain ID with no protein chain (water, or a lone free
+  amino acid with an asym ID of its own) is refused by the `inference`
+  commands above with an `OSError` that names the structure (the input's
+  first column), the chain and the file (`No protein chain found for ...`); a
+  lone amino acid was embedded before as a protein of one residue. In an
+  assembly of a PDB file, each copy of a chain is a chain of its own: biotite
+  numbers the copies made by each REMARK 350 list from 0, so FoldMatch now
+  numbers them itself as biotite builds them, and the two copies of a chain
+  in two lists no longer run together where its numbering rises from its last
+  residue to its first (a tag numbered 998-999 before residue 1, say). In
+  mmCIF and BinaryCIF files laid out as the archive's, every protein chain is
+  one piece: the chains listed and their residues are unchanged, bit for bit,
+  for every build; the query's threshold now counts polymer amino-acid
+  residues, as the build does, instead of every amino acid, which changes
+  only chains near `--min-res` and, at `--min-res` 0 or 1, free amino acids
+  with an asym ID of their own, no longer embedded as chains.
+  `FoldMatch.residue_embedding` and `structure_embedding` now read each chain
+  as the other paths do: HETATM residues within a chain (selenomethionine,
+  say), which ESM's PDB reader left out, are read, as X; a chain ID of two
+  characters is accepted; each chain is embedded in one pass, with BOS and
+  EOS rows at its ends only; and when no chain qualifies they raise `No
+  protein chain ... found in the structure`, and
+  `residue_embedding_by_assembly` returns an empty dict, as
+  `residue_embedding_by_chain` does (so `fm-search query structure
+  --granularity assembly` refuses the assembly with its own message), instead
+  of torch's error. In any file, archive mmCIF included, the results of
+  `residue_embedding` and `structure_embedding` for chains with HETATM
+  residues therefore change, and now agree with the database: recompute them.
+  `get_structure_from_src` and `StructureProvider.get_structure`
+  (`foldmatch.utils`) no longer take a `chain_id`: a selection by chain ID
+  joins the pieces that other chains separate; their `assembly_id`, which
+  took its place, is now keyword-only, so that an old positional call fails
+  too. In the database and the query, a chain that one ID does not split is
+  embedded as before (on 420 archive entries, every build and the query at
+  `--min-res` 10 gave the same chains and residues, bit for bit). On PDB
+  files written from 206 of them, every path now reads each of the 546 chains
+  that one ID splits once, as its archive mmCIF chain, bit for bit (before,
+  the database had 13 of them right and listed 23 more than once at
+  `--min-res` 10, 49 at 0, and the query kept the last piece of 26 at 10, and
+  a wrong piece of every one at 0), and in 180 of their 206 assemblies each
+  copy as in the mmCIF assembly, residue for residue (164 before; in the 26
+  others, a chain keeps the free amino acids that the assembly leaves right
+  after it, as before, while its stored file, which `inference
+  assembly-embedding` and `inference complete-embedding` give each copy, now
+  lacks them). With ESM3, the database vector of such a chain now equals the
+  mmCIF chain's, bit for bit, and scores 1.0000 against the query vector of
+  the same chain (13 chains of 8 entries; before, 0.19 to 0.83 for 9 chains
+  cut where their numbering drops, and 0.999 for 2 with free amino acids
+  appended). **Rebuild chain and assembly databases, and recompute chain,
+  assembly and residue embeddings, made from PDB files, or from mmCIF and
+  BinaryCIF files not laid out as the archive's, with chains that one ID
+  splits**; a database built from them may hold a chain's id more than once.
 - **Chain and assembly embeddings saved as CSV.** `fm-embedding` and
   `inference` write a chain or assembly embedding to CSV (their default
   `--output-format`) as one column, one value per line. `fm-search build

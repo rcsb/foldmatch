@@ -14,7 +14,7 @@ class StructureProvider:
         src_name,
         src_structure,
         structure_format="mmcif",
-        chain_id=None,
+        *,
         assembly_id=None
     ):
         key = (src_name, structure_format, assembly_id)
@@ -26,7 +26,4 @@ class StructureProvider:
                 assembly_id=assembly_id
             ))
             self.__cached = cached
-        structure = cached[1]
-        if chain_id is not None:
-            return structure[structure.chain_id == chain_id]
-        return structure
+        return cached[1]

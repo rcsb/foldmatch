@@ -1,7 +1,6 @@
 import argparse
 
 import torch
-from biotite.structure import chain_iter
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESMProtein, SamplingConfig
 from esm.utils.constants.models import ESM3_OPEN_SMALL
@@ -12,7 +11,7 @@ import pandas as pd
 from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
 from foldmatch.types.api_types import StructureFormat, StructureLocation, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
-from foldmatch.utils.structure_parser import rename_atom_attr,filter_residues
+from foldmatch.utils.structure_parser import rename_atom_attr, filter_residues, protein_chain_iter
 from foldmatch.utils.structure_provider import StructureProvider
 
 
@@ -66,25 +65,25 @@ class EsmProtFromChain(Dataset):
         structure = self.__structure_provider.get_structure(
             src_name=src_name,
             src_structure=stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
-            structure_format=self.structure_format,
-            chain_id=chain_id
+            structure_format=self.structure_format
         )
-        for atom_ch in chain_iter(structure):
-            if len(atom_ch) == 0:
-                raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
-            try:
-                atom_ch = filter_residues(atom_ch)
-                atom_ch = rename_atom_attr(atom_ch)
-                protein_chain = ProteinChain.from_atomarray(atom_ch)
-                protein_chain = ESMProtein.from_protein_chain(protein_chain)
-            except Exception as e:
-                raise IOError(f"Error while creating ESMProtein from structure chain {src_name}.{chain_id}: {e}")
+        # The protein chain with that chain ID, its pieces joined: found in the whole structure, because the atoms with
+        # that chain ID alone no longer tell where its pieces end
+        atom_ch = next(protein_chain_iter(structure, chain_id=chain_id), None)
+        if atom_ch is None:
+            raise IOError(f"No protein chain found for {src_name}.{chain_id} in structure {src_structure}.")
+        try:
+            atom_ch = filter_residues(atom_ch)
+            atom_ch = rename_atom_attr(atom_ch)
+            protein_chain = ProteinChain.from_atomarray(atom_ch)
+            protein_chain = ESMProtein.from_protein_chain(protein_chain)
+        except Exception as e:
+            raise IOError(f"Error while creating ESMProtein from structure chain {src_name}.{chain_id}: {e}")
 
-            if len(protein_chain) == 0:
-                raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
+        if len(protein_chain) == 0:
+            raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
 
-            return protein_chain, item_name
-        raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
+        return protein_chain, item_name
 
 
 if __name__ == '__main__':

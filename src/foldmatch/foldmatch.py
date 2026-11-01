@@ -1,5 +1,5 @@
 import torch
-from biotite.structure import get_residues, chain_iter, filter_amino_acids
+from biotite.structure import get_residues, filter_amino_acids
 from esm.sdk.api import ESMProtein
 from esm.utils.structure.protein_chain import ProteinChain
 
@@ -7,7 +7,8 @@ from foldmatch.types.api_types import StreamSrc, StructureFormat
 from foldmatch.utils.esm.loaders import per_residue_embedding
 from foldmatch.utils.model import get_aggregator_model, get_residue_model
 from foldmatch.utils.sequence import normalize_sequence
-from foldmatch.utils.structure_parser import get_structure_from_src, filter_residues, rename_atom_attr
+from foldmatch.utils.structure_parser import get_structure_from_src, filter_residues, rename_atom_attr, \
+    protein_chain_iter
 
 
 class FoldMatch:
@@ -59,19 +60,18 @@ class FoldMatch:
             assembly_id: str = None
     ):
         self.__check_residue_embedding()
-        structure = get_structure_from_src(src_structure, structure_format, chain_id, assembly_id)
+        structure = get_structure_from_src(src_structure, structure_format, assembly_id=assembly_id)
 
-        if self.max_res is not None and _protein_length(structure) > self.max_res:
+        if self.max_res is not None and _protein_length(
+                structure if chain_id is None else structure[structure.chain_id == chain_id]) > self.max_res:
             raise ValueError(f"Protein too long for embedding (max {self.max_res} residues)")
 
-        embedding_ch = []
-        for atom_ch in chain_iter(structure):
-            atom_res = atom_ch[filter_amino_acids(atom_ch)]
-            if len(atom_res) == 0 or len(get_residues(atom_res)[0]) < self.min_res:
-                continue
-            protein_chain = ProteinChain.from_atomarray(atom_ch)
-            protein = ESMProtein.from_protein_chain(protein_chain)
-            embedding_ch.append(per_residue_embedding(self.__residue_embedding, protein))
+        # The protein chains of the whole structure, or those with chain_id (in an assembly, one per copy)
+        embedding_ch = [self.__chain_embedding(atom_ch)
+                        for atom_ch in protein_chain_iter(structure, self.min_res, chain_id)]
+        if not embedding_ch:
+            chain = "protein chain" if chain_id is None else f"protein chain {chain_id}"
+            raise ValueError(f"No {chain} of at least {self.min_res} residues found in the structure")
         return torch.cat(
             embedding_ch,
             dim=0
@@ -89,20 +89,9 @@ class FoldMatch:
         if self.max_res is not None and _protein_length(structure) > self.max_res:
             raise ValueError(f"Protein too long for embedding (max {self.max_res} residues)")
 
-        embedding_by_chain = {}
-        for atom_ch in chain_iter(structure):
-            atom_ch = filter_residues(atom_ch)
-            if len(atom_ch) == 0 or len(get_residues(atom_ch)[0]) < self.min_res:
-                continue
-            chain_id_value = atom_ch.chain_id[0]
-            # Skip chains that don't match the requested chain_id (if specified)
-            if chain_id is not None and chain_id_value != chain_id:
-                continue
-            atom_ch = rename_atom_attr(atom_ch)
-            protein_chain = ProteinChain.from_atomarray(atom_ch)
-            protein = ESMProtein.from_protein_chain(protein_chain)
-            embedding_by_chain[chain_id_value] = per_residue_embedding(self.__residue_embedding, protein)
-        return embedding_by_chain
+        # Each protein chain once, or the one with chain_id
+        return {atom_ch.chain_id[0]: self.__chain_embedding(atom_ch)
+                for atom_ch in protein_chain_iter(structure, self.min_res, chain_id)}
 
     def residue_embedding_by_assembly(
             self,
@@ -117,15 +106,10 @@ class FoldMatch:
         if self.max_res is not None and _protein_length(structure) > self.max_res:
             raise ValueError(f"Protein too long for embedding (max {self.max_res} residues)")
 
-        embedding_ch = []
-        for atom_ch in chain_iter(structure):
-            atom_ch = filter_residues(atom_ch)
-            if len(atom_ch) == 0 or len(get_residues(atom_ch)[0]) < self.min_res:
-                continue
-            atom_ch = rename_atom_attr(atom_ch)
-            protein_chain = ProteinChain.from_atomarray(atom_ch)
-            protein = ESMProtein.from_protein_chain(protein_chain)
-            embedding_ch.append(per_residue_embedding(self.__residue_embedding, protein))
+        # Each protein chain of the assembly, one per copy; none, an empty dict (as residue_embedding_by_chain gives)
+        embedding_ch = [self.__chain_embedding(atom_ch) for atom_ch in protein_chain_iter(structure, self.min_res)]
+        if not embedding_ch:
+            return {}
         assembly_id_value = assembly_id if assembly_id is not None else "0"
         return {assembly_id_value: torch.cat(embedding_ch, dim=0)}
 
@@ -156,6 +140,14 @@ class FoldMatch:
     ):
         self.__check_aggregator_embedding()
         return self.__aggregator_embedding(residue_embedding)
+
+    def __chain_embedding(self, atom_ch):
+        # One protein chain, read as the build reads it (EsmProtFromStructure, EsmAssemblyFromStructure)
+        atom_ch = filter_residues(atom_ch)
+        atom_ch = rename_atom_attr(atom_ch)
+        protein_chain = ProteinChain.from_atomarray(atom_ch)
+        protein = ESMProtein.from_protein_chain(protein_chain)
+        return per_residue_embedding(self.__residue_embedding, protein)
 
     def __check_residue_embedding(self):
         if self.__residue_embedding is None:

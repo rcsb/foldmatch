@@ -107,9 +107,9 @@ def _asymmetric_unit(path: Path, structure_format: StructureFormat = StructureFo
         src_stream=[("1acb", str(path), "1acb")], src_location=SrcLocation.stream, structure_format=structure_format)}
 
 
-def _copy(protein, operator: int, residues: slice = slice(None)) -> tuple:
-    """A copy as the assembly should hold it: residues of an asymmetric-unit chain, moved by one of _OPERATORS."""
-    return protein.sequence[residues], protein.coordinates[residues], operator
+def _copy(protein, operator: int) -> tuple:
+    """A copy as the assembly should hold it: an asymmetric-unit chain, moved by one of _OPERATORS."""
+    return protein.sequence, protein.coordinates, operator
 
 
 def _chains(structure) -> list:
@@ -137,12 +137,25 @@ class StructureProviderTest(unittest.TestCase):
         provider = StructureProvider()
         with mock.patch.object(structure_provider, "get_structure_from_src", wraps=get_structure_from_src) as read:
             provider.get_structure("1acb", str(self.cif), assembly_id="1")
-            chain = provider.get_structure("1acb", str(self.cif), chain_id="B", assembly_id="1")
+            again = provider.get_structure("1acb", str(self.cif), assembly_id="1")
             self.assertEqual(read.call_count, 1)
-            self.assertEqual(_chains(chain), ["B"])
+            self.assertEqual(_chains(again), _ALL)
             provider.get_structure("1acb", str(self.cif), assembly_id="2")
             provider.get_structure("1acb", str(self.cif), assembly_id="1")
             self.assertEqual(read.call_count, 3)
+
+    def test_chain_id_is_gone(self):
+        """chain_id, which selected a chain's atoms, is gone: a call that passes it fails, by name or by position
+        (assembly_id, which took its place, is keyword-only, so a chain ID cannot land in it)."""
+        provider = StructureProvider()
+        for call in (lambda: get_structure_from_src(str(self.cif), "mmcif", chain_id="B"),
+                     lambda: provider.get_structure("1acb", str(self.cif), "mmcif", chain_id="B")):
+            with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'chain_id'"):
+                call()
+        with self.assertRaisesRegex(TypeError, "takes from 1 to 2 positional arguments but 3 were given"):
+            get_structure_from_src(str(self.cif), "mmcif", "B")
+        with self.assertRaisesRegex(TypeError, "takes from 3 to 4 positional arguments but 5 were given"):
+            provider.get_structure("1acb", str(self.cif), "mmcif", "B")
 
     def test_a_stream_is_read_from_its_start(self):
         """A downloaded file is a stream: its assemblies are listed, then each assembly is read from it (and the
@@ -291,19 +304,17 @@ class AssemblyCopiesTest(unittest.TestCase):
 
     def test_pdb_format(self):
         """The assembly in PDB format, read with StructureFormat.pdb; and with E's numbering decreasing, which cuts E
-        in two pieces with one chain ID: each piece is read as itself too (before, both got the first piece)."""
+        in two pieces with one chain ID: each copy of E is read whole, its pieces joined, as in the plain file (P9.A3;
+        before, each piece was read as itself, and before P9.A2 both got the first piece)."""
         pdb = _two_copies_pdb(self.tmp)
         chains = _asymmetric_unit(pdb, StructureFormat.pdb)
         e, i = chains["E"], chains["I"]
         renumbered = self.tmp / "renumbered"
         renumbered.mkdir()
-        first, second = slice(0, 144), slice(144, None)
-        for path, copies in (
-                (pdb, [_copy(e, 0), _copy(i, 0), _copy(e, 1), _copy(i, 1)]),
-                (_two_copies_pdb(renumbered, renumber=True), [_copy(e, 0, first), _copy(e, 0, second), _copy(i, 0),
-                                                              _copy(e, 1, first), _copy(e, 1, second), _copy(i, 1)])):
+        for path in (pdb, _two_copies_pdb(renumbered, renumber=True)):
             with self.subTest(file=str(path.relative_to(self.tmp))):
-                self.assert_copies(self.proteins(str(path), StructureFormat.pdb), copies)
+                self.assert_copies(self.proteins(str(path), StructureFormat.pdb),
+                                   [_copy(e, 0), _copy(i, 0), _copy(e, 1), _copy(i, 1)])
 
     def test_stored_embeddings_of_each_copy(self):
         """The stored-embedding datasets (inference assembly-embedding, complete-embedding) repeat each chain's stored
