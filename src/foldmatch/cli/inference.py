@@ -30,7 +30,7 @@ def residue_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Chain Id (asym_i for cif files) | Output Embedding Name.'
+            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Chain Id (label_asym_id in mmCIF and BinaryCIF files, the author chain ID in PDB files) | Embedding Name. The residue embedding of each row is stored under its Embedding Name, <Structure Name>.<Chain Id> when the 4th column is missing or empty.'
         )],
         output_folder: Annotated[Path, typer.Option(
             exists=True,
@@ -48,9 +48,6 @@ def residue_embedding(
         structure_format: Annotated[StructureFormat, typer.Option(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
-        min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
-        )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
         )] = 1,
@@ -81,7 +78,6 @@ def residue_embedding(
         src_location=SrcLocation.file,
         src_from=SrcProteinFrom.chain,
         structure_format=structure_format,
-        min_res_n=min_res_n,
         batch_size=batch_size,
         num_workers=num_workers,
         num_nodes=num_nodes,
@@ -105,7 +101,7 @@ def structure_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Chain Id (asym_i for cif files) | Output Embedding Name.'
+            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Chain Id (label_asym_id in mmCIF and BinaryCIF files, the author chain ID in PDB files) | Embedding Name. The chain embedding of each row is stored under its Embedding Name, <Structure Name>.<Chain Id> when the 4th column is missing or empty.'
         )],
         output_folder: Annotated[Path, typer.Option(
             exists=True,
@@ -120,9 +116,6 @@ def structure_embedding(
         structure_format: Annotated[StructureFormat, typer.Option(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
-        min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
-        )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
         )] = 1,
@@ -153,7 +146,6 @@ def structure_embedding(
         src_location=SrcLocation.file,
         src_from=SrcProteinFrom.chain,
         structure_format=structure_format,
-        min_res_n=min_res_n,
         batch_size=batch_size,
         num_workers=num_workers,
         num_nodes=num_nodes,
@@ -176,7 +168,7 @@ def chain_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Chain Id (asym_i for cif files) | Output Embedding Name.'
+            help='CSV file of 4 columns, no header, as for residue-embedding: Structure Name | Structure File Path or URL (not read) | Chain Id | Embedding Name, <Structure Name>.<Chain Id> when the 4th column is missing or empty. The residue embedding <Embedding Name>.<res-embedding-format> is read from res-embedding-location, and the chain embedding is stored under the Embedding Name.'
         )],
         output_folder: Annotated[Path, typer.Option(
             exists=True,
@@ -204,9 +196,6 @@ def chain_embedding(
         res_embedding_format: Annotated[ResEmbeddingFormat, typer.Option(
             help='Format of the residue level embedding files. Options: pt (torch tensor files) or csv.'
         )] = ResEmbeddingFormat.pt,
-        min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
-        )] = 0,
         batch_size: Annotated[int, typer.Option(
             help='Number of samples processed together in one iteration.'
         )] = 1,
@@ -229,17 +218,18 @@ def chain_embedding(
             help='Number of nodes to use for inference of embeddings.'
         )] = LogLevel.info
 ):
+    from foldmatch.dataset.utils import read_chain_list
     from foldmatch.inference.chain_inference import predict
-    from foldmatch.utils.data import adapt_csv_to_embedding_chain_stream
     set_log_level(log_level)
 
+    # The residue embedding of each row is the file of its embedding name, as residue-embedding writes it
     predict(
-        src_stream=adapt_csv_to_embedding_chain_stream(src_file, res_embedding_location, res_embedding_format=res_embedding_format),
+        src_stream=[(os.path.join(res_embedding_location, f"{name}.{res_embedding_format.value}"), name)
+                    for name in read_chain_list(src_file).item_name],
         res_embedding_location=res_embedding_location,
         src_location=SrcLocation.stream,
         src_from=SrcTensorFrom.file,
         structure_format=structure_format,
-        min_res_n=min_res_n,
         batch_size=batch_size,
         num_workers=num_workers,
         num_nodes=num_nodes,
@@ -353,7 +343,7 @@ def complete_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Chain Id (asym_i for cif files) | Output Embedding Name.'
+            help='CSV file of 4 columns, no header, as for residue-embedding: Structure Name | Structure File Path or URL | Chain Id (label_asym_id in mmCIF and BinaryCIF files, the author chain ID in PDB files) | Embedding Name, which must be <Structure Name>.<Chain Id> or left out: the assembly step reads the residue embeddings under that name.'
         )],
         src_assembly_file: Annotated[Path, typer.Option(
             exists=True,
@@ -396,7 +386,7 @@ def complete_embedding(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
         min_res_n: Annotated[int, typer.Option(
-            help='When using all chains in a structure, consider only chains with at least <min_res_n> residues.'
+            help='Consider only assembly chains with at least <min_res_n> residues.'
         )] = 0,
         max_res_n: Annotated[int, typer.Option(
             help='Stop adding assembly chains when number of residues is greater than <max_res_n> residues.'
@@ -435,13 +425,13 @@ def complete_embedding(
             help='Number of nodes to use for inference of embeddings.'
         )] = LogLevel.info
 ):
-
+    # Before any model is built: the assembly step reads the residue embeddings as <structure name>.<chain ID>
+    _refuse_other_embedding_names(src_chain_file)
     residue_embedding(
         src_file=src_chain_file,
         output_folder=output_res_path,
         output_format=OutFormat.pt,
         structure_format=structure_format,
-        min_res_n=min_res_n,
         batch_size=batch_size_res,
         num_workers=num_workers_res,
         num_nodes=num_nodes,
@@ -457,7 +447,6 @@ def complete_embedding(
         output_name=output_chain_name,
         res_embedding_location=output_res_path,
         structure_format=structure_format,
-        min_res_n=min_res_n,
         batch_size=batch_size_chain,
         num_workers=num_workers_chain,
         num_nodes=num_nodes,
@@ -483,6 +472,29 @@ def complete_embedding(
         strategy=strategy,
         log_level=log_level
     )
+
+
+def _refuse_other_embedding_names(src_chain_file: Path):
+    """complete-embedding's assembly step reads each chain's residue embedding as <structure name>.<chain ID>, as
+    assembly-embedding does: a chain list row with another embedding name is refused (RefusalError), before anything is
+    computed (such a list failed, or ran on the residue embeddings found under <structure name>.<chain ID>: the row's
+    own, for whitespace at a line's start, an earlier run's, or another row's, as when two rows swap names)."""
+    from foldmatch.dataset.utils import read_chain_list
+    from foldmatch.errors import RefusalError
+    chains = read_chain_list(src_chain_file)
+    other = chains[chains.item_name != chains.stream_name + "." + chains.chain_id]
+    if len(other) > 0:
+        # Each field quoted, so that whitespace shows
+        listed = "; ".join(f"{row.stream_name!r} chain {row.chain_id!r} named {row.item_name!r}"
+                           for row in other.head(5).itertuples())
+        more = f"; and {len(other) - 5} more rows" if len(other) > 5 else ""
+        raise RefusalError(
+            f"{src_chain_file}: {len(other)} row(s) with an embedding name other than <structure name>.<chain ID>: "
+            f"{listed}{more}. The assembly step of complete-embedding reads each chain's residue embedding as "
+            f"<structure name>.<chain ID>, as assembly-embedding does: name those rows so, or leave their 4th "
+            f"column out."
+        )
+
 
 @app.command(
     name="download-models",

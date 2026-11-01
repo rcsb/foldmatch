@@ -656,6 +656,76 @@ While the major version is `0`, breaking changes are released in a minor bump.
       i = table.column_names.index("embedding")
       pq.write_table(table.set_column(i, "embedding", nested), dst)
   ```
+- **BREAKING — `--min-res-n` only where it selects chains.** `inference
+  residue-embedding`, `inference structure-embedding` and `inference
+  chain-embedding` took `--min-res-n`, whose help said that it keeps the
+  chains of a structure with at least that many residues, but each row of
+  their chain list names one chain, embedded as listed, so it did nothing.
+  They no longer take it: a command line that passes it stops with `No such
+  option` (exit status 2); leave it out. `inference complete-embedding`
+  keeps it, with the help of `inference assembly-embedding` ("Consider only
+  assembly chains with at least <min_res_n> residues."), and passes it to
+  its assembly step only, where it selects the chains of each assembly. In
+  the library, `esm_inference.predict` and `structure_inference.predict`
+  given chains (`src_from=SrcProteinFrom.chain`, their default), and
+  `chain_inference.predict` given residue embedding files (`src_from` file,
+  its default) or Parquet, or an `inference_set`, now refuse a `min_res_n`
+  other than 0 (`RefusalError`) before anything is read: `min_res_n` selects
+  the protein chains of structures read whole (`src_from` structure). Leave
+  it at 0 in these calls, or list only the chains to embed. Their signatures
+  are unchanged.
+- **BREAKING — one chain list, one name per row.** The chain lists of
+  `inference residue-embedding`, `structure-embedding`, `chain-embedding` and
+  `complete-embedding` (`--src-file`, `--src-chain-file`), and the file or
+  stream of the library's `EsmProtFromChain`, are read one way: CSV without a
+  header (a quoted field read as CSV reads it), of structure name, structure
+  file or URL, chain ID and embedding name. The embedding name now defaults
+  to `<structure name>.<chain ID>` when the 4th column is missing or empty:
+  for such a row, `residue-embedding` stopped with torch's `invalid file
+  name: .../.pt` (with `--output-format csv`, it wrote a hidden `.csv` that
+  the next such row replaced; with `parquet` or `json`, an empty id), and
+  `structure-embedding` wrote an empty id. In the stream of
+  `EsmProtFromChain`, a row of fewer than four elements, which pandas refused
+  unless another row had four (its missing elements then read as `nan`), is
+  now read like a short line of a file, and a `None` name, read as `nan`,
+  gets the default too. `chain-embedding` read the residue embedding
+  `<structure name>.<chain ID>` from `--res-embedding-location` and wrote the
+  chain embedding under that name, whatever the 4th column said, so it could
+  not find what `residue-embedding` wrote under another name, and it skipped
+  lines of one or two fields without a word. It now reads `<embedding
+  name>.<res-embedding-format>`, writes under the embedding name and does not
+  read the structure file column; a line of one or two fields gets an empty
+  chain ID; and a missing residue file is reported with its path and the
+  row's embedding name. Its old list reader,
+  `adapt_csv_to_embedding_chain_stream` in `foldmatch.utils.data`, is
+  removed. Lists that name each row `<structure name>.<chain ID>`, and the
+  `NAME,,CHAIN` lists of residue files above, give the same files as before,
+  except that: (1) a space, a tab or other whitespace at a line's start or
+  end is part of a field (`chain-embedding` stripped each line; `x,,A ` now
+  names `x.A `; and `complete-embedding`, which gave ` x,x.cif,A,x.A` the
+  files of `x,x.cif,A,x.A`, refuses it, as its structure name is ` x`: remove
+  the whitespace); (2) a quoted field, or a byte-order mark at the start of
+  the file, is read as CSV (`chain-embedding` kept the quotes or the mark in
+  the names, and stopped on the missing file; the new reading works); (3) a
+  row of more than 4 fields is refused (`RefusalError`, naming the file or
+  the stream and the row) by the four commands, before any model is loaded,
+  and by `EsmProtFromChain`: `chain-embedding` ignored the fields after the
+  3rd, and `residue-embedding`, `structure-embedding` and `EsmProtFromChain`
+  misread them, or stopped on a bare pandas error; remove the extra fields (a
+  comma after the embedding name makes a 5th); (4) a list whose file name
+  ends in `.gz`, `.bz2`, `.zip`, `.xz`, `.zst` or `.tar` (letter case
+  ignored) is read as compressed, as `residue-embedding` and
+  `structure-embedding` read it (`chain-embedding` read it as plain text):
+  rename a plain-text list so named. Any other pandas `ParserError` (an
+  unclosed quote, say) is refused as in (3), with pandas' message.
+  `complete-embedding`, whose assembly step reads residue embeddings as
+  `<structure name>.<chain ID>`, as `inference assembly-embedding` does, now
+  refuses a chain list with other embedding names before any model is loaded,
+  naming up to 5 rows (it failed, or ran on the residue embeddings found
+  under `<structure name>.<chain ID>`: the row's own, as in (1), an earlier
+  run's, or another row's, as when two rows swap names): name them
+  `<structure name>.<chain ID>`, or leave their 4th column out. The help of
+  `--src-file` and `--src-chain-file` describes the columns and the names.
 
 ### Fixed
 
@@ -809,6 +879,26 @@ While the major version is `0`, breaking changes are released in a minor bump.
   assembly and residue embeddings, made from PDB files, or from mmCIF and
   BinaryCIF files not laid out as the archive's, with chains that one ID
   splits**; a database built from them may hold a chain's id more than once.
+- **`max_res` counts the residues of the chains a call embeds, as `min_res`
+  counts them.** `FoldMatch.residue_embedding_by_chain` and
+  `residue_embedding_by_assembly` (`fm-search query structure --max-res`,
+  `--granularity chain` and `assembly`) counted every amino-acid residue of
+  the structure or assembly, with its free amino acids, its chains under
+  `min_res` and the pieces that a chain leaves out, even with `--chain-id`,
+  so a chain within the limit was refused in a structure above it;
+  `residue_embedding` and `structure_embedding` counted the same, or the
+  atoms with the chain ID, their free amino acids included. Each now counts
+  the protein chains it is about to embed, as `min_res` counts them (polymer
+  amino-acid residues, piece by piece, summed over the pieces kept), all of
+  them together: those with `chain_id` (in an assembly, one per copy), else
+  every protein chain of the structure or assembly. Over `max_res`, the call
+  raises `ValueError` before any ESM3 pass, with the count, the limit and
+  what was counted. With no chain to embed, it gives what it gives without
+  `max_res` (`residue_embedding` and `structure_embedding` their
+  `ValueError`, the other two `{}`, and `fm-search query structure` its error
+  that no chain qualifies), where the old count could refuse it as too long.
+  Structures and chains refused before may now be embedded. The `--max-res`
+  help says what is counted.
 - **Chain and assembly embeddings saved as CSV.** `fm-embedding` and
   `inference` write a chain or assembly embedding to CSV (their default
   `--output-format`) as one column, one value per line. `fm-search build

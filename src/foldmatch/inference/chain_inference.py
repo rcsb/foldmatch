@@ -8,6 +8,7 @@ from lightning import Trainer
 from foldmatch.dataset.residue_embedding_from_parquet import ResidueEmbeddingFromParquet
 from foldmatch.dataset.residue_embedding_from_structure import ResidueEmbeddingFromStructure
 from foldmatch.dataset.residue_embedding_from_tensor_file import ResidueEmbeddingFromTensorFile
+from foldmatch.inference.utils import refuse_min_res_n
 from foldmatch.modules.chain_module import ChainModule
 from foldmatch.types.api_types import Accelerator, Devices, Strategy, FileOrStreamTuple, SrcLocation, \
     SrcTensorFrom, StructureFormat, OutFormat, ResEmbeddingFormat
@@ -39,6 +40,9 @@ def predict(
 ):
     logger = logging.getLogger(__name__)
 
+    if inference_set is not None or src_from != SrcTensorFrom.structure:
+        refuse_min_res_n(min_res_n, "the chains of an inference_set or of residue embedding files or Parquet "
+                                    "(src_from file or parquet)")
     if inference_set is None:
         if src_from == SrcTensorFrom.parquet:
             inference_set = ResidueEmbeddingFromParquet(

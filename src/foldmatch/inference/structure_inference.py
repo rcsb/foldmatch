@@ -7,6 +7,7 @@ from lightning import Trainer
 
 from foldmatch.dataset.esm_prot_from_structure import EsmProtFromStructure
 from foldmatch.dataset.esm_prot_from_chain import EsmProtFromChain
+from foldmatch.inference.utils import refuse_min_res_n
 from foldmatch.modules.chain_complete_module import ChainCompleteModule
 from foldmatch.types.api_types import StructureFormat, Accelerator, Devices, Strategy, \
     SrcProteinFrom, FileOrStreamTuple, SrcLocation
@@ -33,6 +34,8 @@ def predict(
 ):
     logger = logging.getLogger(__name__)
 
+    if src_from == SrcProteinFrom.chain:
+        refuse_min_res_n(min_res_n, "the chains of a chain list (src_from chain)")
     inference_set = EsmProtFromChain(
         src_stream=src_stream,
         src_location=src_location,

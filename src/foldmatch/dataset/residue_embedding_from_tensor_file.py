@@ -43,4 +43,9 @@ class ResidueEmbeddingFromTensorFile(Dataset):
     def __getitem__(self, idx):
         embedding_src = self.data.iloc[idx][ResidueEmbeddingFromTensorFile.FILE_ATTR]
         item_name = self.data.iloc[idx][ResidueEmbeddingFromTensorFile.ITEM_NAME_ATTR]
-        return load_residue_embedding(embedding_src, res_embedding_format=self.res_embedding_format), item_name
+        try:
+            embedding = load_residue_embedding(embedding_src, res_embedding_format=self.res_embedding_format)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"No residue embedding file {embedding_src} for {item_name}: compute it first, or "
+                                    f"check the folder and the format of the residue embeddings.") from e
+        return embedding, item_name

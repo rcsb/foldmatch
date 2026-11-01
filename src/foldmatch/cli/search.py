@@ -933,7 +933,10 @@ def query_database_from_structure(
             help='Minimum residue length for chains.'
         )] = 10,
         max_res: Annotated[Optional[int], typer.Option(
-            help='Maximum residue length for structures (None for no limit).'
+            help='Maximum number of residues to embed (None for no limit), counted as --min-res counts them: with '
+                 '"granularity=chain", those of the chain given by --chain-id, else of every protein chain of the '
+                 'structure, together; with "granularity=assembly", those of every protein chain of the assembly '
+                 '(or asymmetric unit). Chains under --min-res are not counted. A longer query is refused.'
         )] = None,
         accelerator: Annotated[Accelerator, typer.Option(
             help='Device used for inference.'

@@ -47,6 +47,12 @@ def protein_chain_iter(structure, min_res_n=0, chain_id=None):
     pieces whose amino acids are all HETATM records if it has amino acids in ATOM records; it counts if they hold
     polymer amino-acid residues, at least min_res_n of them. With chain_id, the protein chains of that chain ID alone,
     reading only its pieces."""
+    return (atom_ch for atom_ch, _ in protein_chains_with_sizes(structure, min_res_n, chain_id))
+
+
+def protein_chains_with_sizes(structure, min_res_n=0, chain_id=None):
+    """protein_chain_iter's protein chains, each with its size: (AtomArray, the number of polymer amino-acid residues
+    that min_res_n is tested against, counted piece by piece and summed over the pieces kept)."""
     starts = get_chain_starts(structure, add_exclusive_stop=True)
     if chain_id is not None:
         # The atoms with that chain ID, cut where its pieces end (a selection alone would join pieces that other
@@ -99,7 +105,7 @@ def get_backbone_atoms(atom_ch):
 
 
 def __protein_chains(structure, starts, min_res_n):
-    # The protein chains of the structure whose chain_iter pieces start at starts (with an exclusive stop)
+    # The protein chains, and their sizes, of the structure whose chain_iter pieces start at starts (exclusive stop)
     aa = filter_amino_acids(structure)
     # The amino-acid atoms, and those of ATOM records, of every piece at once: the thousands of water and ligand pieces
     # of a large structure cost no Python loop
@@ -125,7 +131,8 @@ def __protein_chains(structure, starts, min_res_n):
             piece = piece[filter_polymer(piece)]
             n_pol += get_residue_count(piece[filter_amino_acids(piece)])
         if n_pol > 0 and n_pol >= min_res_n:
-            yield structure[np.concatenate([starts[k] + np.flatnonzero(aa[starts[k]:starts[k + 1]]) for k in kept])]
+            atoms = np.concatenate([starts[k] + np.flatnonzero(aa[starts[k]:starts[k + 1]]) for k in kept])
+            yield structure[atoms], n_pol
 
 
 class _IndexedPDBFile(PDBFile):

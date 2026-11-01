@@ -298,11 +298,13 @@ Supported `--format-output` fields:
 
 Lower-level entry point exposing individual inference passes (`residue-embedding`, `structure-embedding`, `chain-embedding`, `assembly-embedding`, `complete-embedding`). Mostly useful for advanced workflows that compose inference stages explicitly. Run `inference --help` for the command list.
 
+The chain lists of `residue-embedding`, `structure-embedding`, `chain-embedding` and `complete-embedding` (`--src-file`, `--src-chain-file`) are CSV files without a header, one row per chain: structure name, structure file path or URL, chain ID, embedding name. A row of more than 4 fields is refused. The embedding name names the row's output, and is `<structure name>.<chain ID>` when the 4th column is missing or empty. `chain-embedding` reads the residue embedding `<embedding name>.<format>` (`--res-embedding-format`) from `--res-embedding-location`, without reading the structure file; `assembly-embedding` reads the residue embeddings of an assembly's chains as `<structure name>.<chain ID>.<format>`, so `complete-embedding` takes only chain lists whose embedding names are `<structure name>.<chain ID>` or left out. `--min-res-n` selects the chains of each assembly in `assembly-embedding` and `complete-embedding`.
+
 ---
 
 ## Python API
 
-The `RcsbStructureEmbedding` class provides methods for computing embeddings programmatically.
+The `FoldMatch` class provides methods for computing embeddings programmatically.
 
 ### Basic Usage
 
@@ -318,6 +320,8 @@ model.load_models()  # Auto-detects CUDA
 # import torch
 # model.load_models(device=torch.device("cuda:0"))
 ```
+
+A protein chain is embedded only if it has at least `min_res` residues (default 10), counted as polymer amino-acid residues: free amino acids are not counted. With `max_res` (default `None`, no limit), a structure method raises `ValueError`, before any ESM3 pass, when the protein chains it is about to embed have more than `max_res` residues together, counted the same way: the chains with `chain_id` (in an assembly, one per copy), else every protein chain of the structure or assembly. `sequence_embedding` raises `ValueError` when the sequence is shorter than `min_res` or longer than `max_res`.
 
 ### Methods
 
@@ -359,10 +363,10 @@ Compute per-residue embeddings for a structure.
 **Parameters:**
 - `src_structure`: File path, URL, or file-like object
 - `structure_format`: `'mmcif'`, `'binarycif'`, or `'pdb'`
-- `chain_id`: Specific chain ID (optional, uses all chains if None)
+- `chain_id`: Chain ID (optional): the protein chains with this ID (in an assembly, one per copy); every protein chain if None
 - `assembly_id`: Assembly ID for biological assembly (optional)
 
-**Returns:** `torch.Tensor` of shape `[num_residues, embedding_dim]`
+**Returns:** `torch.Tensor` of shape `[L + 2, 1536]` for one chain of `L` residues: one row per residue, between ESM3's BOS and EOS rows. Several chains give their tensors one after another, each with its BOS and EOS rows. Raises `ValueError` when no protein chain qualifies, or when `max_res` is exceeded.
 
 ```python
 # Single chain
@@ -392,7 +396,7 @@ assembly_residues = model.residue_embedding(
 
 Compute per-residue embeddings separately for each chain.
 
-**Returns:** `dict[str, torch.Tensor]` mapping chain IDs to embeddings
+**Returns:** `dict[str, torch.Tensor]` mapping each chain ID to its embeddings, of shape `[L + 2, 1536]`; `{}` when no chain qualifies
 
 ```python
 chain_embeddings = model.residue_embedding_by_chain(
@@ -414,7 +418,7 @@ chain_a = model.residue_embedding_by_chain(
 
 Compute residue embeddings for an assembly.
 
-**Returns:** `dict[str, torch.Tensor]` mapping assembly ID to concatenated embeddings
+**Returns:** `dict[str, torch.Tensor]` mapping the assembly ID (`'0'` for the asymmetric unit when `assembly_id` is None) to the tensors of its protein chains (one per copy) one after another, each with its BOS and EOS rows; `{}` when no chain qualifies
 
 ```python
 assembly_emb = model.residue_embedding_by_assembly(
@@ -434,7 +438,7 @@ Compute residue embeddings from amino acid sequence (no structural information).
 **Parameters:**
 - `sequence`: Amino acid sequence string (plain or FASTA format)
 
-**Returns:** `torch.Tensor` of shape `[sequence_length, embedding_dim]`
+**Returns:** `torch.Tensor` of shape `[L + 2, 1536]` for a sequence of `L` residues (ESM3's BOS and EOS rows included)
 
 ```python
 # Plain sequence
@@ -454,7 +458,7 @@ seq_emb = model.sequence_embedding(fasta)
 Aggregate residue embeddings into a single structure-level vector.
 
 **Parameters:**
-- `residue_embedding`: `torch.Tensor` from residue embedding methods
+- `residue_embedding`: `torch.Tensor` from any of the residue embedding methods (for `residue_embedding_by_chain` and `residue_embedding_by_assembly`, a value of their dict)
 
 **Returns:** `torch.Tensor` of shape `[1536]`
 
