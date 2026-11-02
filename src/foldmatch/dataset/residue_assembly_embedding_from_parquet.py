@@ -7,7 +7,7 @@ import pandas as pd
 
 from torch.utils.data import Dataset
 
-from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
+from foldmatch.dataset.utils import get_structure_location, read_assembly_list, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import residue_embeddings_from_parquet, stringio_from_url
 from foldmatch.utils.structure_parser import get_protein_chains
@@ -47,17 +47,8 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
         self._embeddings = dict(zip(ids, embeddings))
 
     def __load_stream(self, src_stream):
-        self.data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueAssemblyEmbeddingFromParquet.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueAssemblyEmbeddingFromParquet.COLUMNS
-        )
+        # The assembly list, whose columns are COLUMNS: a row of more than 4 fields is refused
+        self.data = read_assembly_list(src_stream, self.src_location)
         self.data = self.data.sort_values(by=self.data.columns[0])
         refuse_shared_names(self.data, ResidueAssemblyEmbeddingFromParquet.STREAM_NAME_ATTR,
                             ResidueAssemblyEmbeddingFromParquet.STREAM_ATTR)

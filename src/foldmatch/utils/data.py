@@ -163,6 +163,7 @@ def __stringio_from_url(url):
 def concatenate_tensors(file_list, max_residues, dim=0, res_embedding_format=ResEmbeddingFormat.pt):
     """
     Concatenates a list of tensors stored in individual files along a specified dimension.
+    A file that cannot be loaded is skipped with a warning, by design; a ValueError is raised only when none loads.
 
     Args:
         file_list (list of str): List of file paths to tensor files.
@@ -181,6 +182,8 @@ def concatenate_tensors(file_list, max_residues, dim=0, res_embedding_format=Res
             total_residues += tensor.shape[0]
             tensors.append(tensor)
         except Exception as e:
+            # A warning and not an error, by design: an assembly whose chains include some for which ESM3 could not be
+            # computed is still embedded from the chains that were. Only when no file loads is it an error (below).
             import logging
             logging.getLogger(__name__).warning(f"Error loading tensor from {file}: {e}")
             continue

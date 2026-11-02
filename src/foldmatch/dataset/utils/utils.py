@@ -11,7 +11,11 @@ from foldmatch.types.api_types import SrcLocation, StructureLocation
 CHAIN_LIST_COLUMNS = ['stream_name', 'stream', 'chain_id', 'item_name']
 #: The fields of a chain list row, as read_chain_list's refusals name them.
 _CHAIN_LIST_FIELDS = "structure name, structure file or URL, chain ID, embedding name"
-_AT_MOST_4_FIELDS = f"A chain list row holds at most 4 fields ({_CHAIN_LIST_FIELDS})"
+#: The columns of an assembly list (read_assembly_list): structure name | structure file or URL | assembly ID |
+#: embedding name.
+ASSEMBLY_LIST_COLUMNS = ['stream_name', 'stream', 'assembly_id', 'item_name']
+#: The fields of an assembly list row, as read_assembly_list's refusals name them.
+_ASSEMBLY_LIST_FIELDS = "structure name, structure file or URL, assembly ID, embedding name"
 _REMOVE_THE_EXTRA_FIELDS = "remove the extra fields (a comma after the embedding name makes a 5th)"
 
 
@@ -42,52 +46,77 @@ def read_chain_list(src_stream, src_location: SrcLocation = SrcLocation.file) ->
     names no file. Nothing else is refused: a blank chain ID (biotite reads one as '') is a chain ID.
     """
     if src_location == SrcLocation.stream:
-        rows = [tuple(row) for row in src_stream]
-        longer = [k for k, row in enumerate(rows, start=1) if len(row) > len(CHAIN_LIST_COLUMNS)]
-        if longer:
-            listed = ", ".join(str(k) for k in longer[:5]) + (f" and {len(longer) - 5} more" if len(longer) > 5 else "")
-            raise RefusalError(f"The chain list stream: {len(longer)} row(s) of more than 4 elements (row(s) {listed}, "
-                               f"counted from 1). {_AT_MOST_4_FIELDS}: remove the extra elements.")
-        data = pd.DataFrame(
-            [row + ("",) * (len(CHAIN_LIST_COLUMNS) - len(row)) for row in rows],
-            dtype=str,
-            columns=CHAIN_LIST_COLUMNS
-        )
-    else:
-        source = _chain_list_source(src_stream)
-        try:
-            data = pd.read_csv(
-                src_stream,
-                header=None,
-                index_col=None,
-                keep_default_na=False,
-                dtype=str,
-                names=CHAIN_LIST_COLUMNS
-            )
-        except pd.errors.ParserError as e:
-            message = " ".join(str(e).split())
-            if re.search(r"Expected \d+ fields", message):
-                raise RefusalError(f"{source}: a row has more than 4 fields (pandas: {message}). {_AT_MOST_4_FIELDS}: "
-                                   f"{_REMOVE_THE_EXTRA_FIELDS}.") from e
-            raise RefusalError(f"{source}: pandas could not read it as CSV ({message}). A chain list is CSV without a "
-                               f"header, of at most 4 fields per row ({_CHAIN_LIST_FIELDS}): correct it where pandas' "
-                               f"message points.") from e
-        # pandas reads the leading fields of a first row of more than 4 as the index, one level each
-        if not isinstance(data.index, pd.RangeIndex):
-            raise RefusalError(f"{source}: its first row has {len(CHAIN_LIST_COLUMNS) + data.index.nlevels} fields. "
-                               f"{_AT_MOST_4_FIELDS}: {_REMOVE_THE_EXTRA_FIELDS}.")
+        # A short row read as a short line
+        src_stream = [tuple(row) + ("",) * (len(CHAIN_LIST_COLUMNS) - len(row)) for row in src_stream]
+    data = _read_list(src_stream, src_location, CHAIN_LIST_COLUMNS, "chain list", _CHAIN_LIST_FIELDS,
+                      keep_default_na=False)
     unnamed = data['item_name'].isna() | (data['item_name'] == "")
     data.loc[unnamed, 'item_name'] = data['stream_name'][unnamed] + "." + data['chain_id'][unnamed]
     return data
 
 
-def _chain_list_source(src_stream) -> str:
-    """A chain list file as read_chain_list's refusals name it: its path, or the name of an open file; a text buffer is
-    "The chain list"."""
+def read_assembly_list(src_stream, src_location: SrcLocation = SrcLocation.file) -> pd.DataFrame:
+    """The rows of an assembly list, in input order, one per assembly (ASSEMBLY_LIST_COLUMNS): the assembly lists of
+    inference assembly-embedding and complete-embedding, and of ResidueAssemblyEmbeddingFromTensorFile and
+    ResidueAssemblyEmbeddingFromParquet.
+
+    A file is CSV without a header, read with pandas as strings, pandas' default NA values kept (a missing or empty
+    field, or NA, is NaN); a stream is a list of tuples, read by pandas as such. A row of more than 4 fields is
+    refused as read_chain_list refuses one (RefusalError, naming the file or the stream and the row), and so is a file
+    on which pandas raises any other ParserError (quoted).
+    """
+    return _read_list(src_stream, src_location, ASSEMBLY_LIST_COLUMNS, "assembly list", _ASSEMBLY_LIST_FIELDS)
+
+
+def _read_list(src_stream, src_location: SrcLocation, columns: list, name: str, fields: str,
+               keep_default_na: bool = True) -> pd.DataFrame:
+    """The rows of a list of these columns (a chain or an assembly list: its name and its fields as the refusals say
+    them), as pandas reads them: a file as CSV without a header, as strings; a stream as a list of rows. A row of more
+    fields than columns is refused (RefusalError), and so is a file on which pandas raises any other ParserError: pandas
+    reads the leading fields of a first row of more fields as the index, which shifts the columns of every row, and
+    stops at a later one with a ParserError that names no file."""
+    a_list = f"{'An' if name[0] in 'aeiou' else 'A'} {name}"
+    rule = f"{a_list} row holds at most {len(columns)} fields ({fields})"
+    if src_location == SrcLocation.stream:
+        rows = list(src_stream)
+        longer = [k for k, row in enumerate(rows, start=1) if len(row) > len(columns)]
+        if longer:
+            listed = ", ".join(str(k) for k in longer[:5]) + (f" and {len(longer) - 5} more" if len(longer) > 5 else "")
+            raise RefusalError(f"The {name} stream: {len(longer)} row(s) of more than {len(columns)} elements (row(s) "
+                               f"{listed}, counted from 1). {rule}: remove the extra elements.")
+        return pd.DataFrame(rows, dtype=str, columns=columns)
+    source = _list_source(src_stream, name)
+    try:
+        data = pd.read_csv(
+            src_stream,
+            header=None,
+            index_col=None,
+            keep_default_na=keep_default_na,
+            dtype=str,
+            names=columns
+        )
+    except pd.errors.ParserError as e:
+        message = " ".join(str(e).split())
+        if re.search(r"Expected \d+ fields", message):
+            raise RefusalError(f"{source}: a row has more than {len(columns)} fields (pandas: {message}). {rule}: "
+                               f"{_REMOVE_THE_EXTRA_FIELDS}.") from e
+        raise RefusalError(f"{source}: pandas could not read it as CSV ({message}). {a_list} is CSV without a header, "
+                           f"of at most {len(columns)} fields per row ({fields}): correct it where pandas' message "
+                           f"points.") from e
+    # pandas reads the leading fields of a first row of more than len(columns) as the index, one level each
+    if not isinstance(data.index, pd.RangeIndex):
+        raise RefusalError(f"{source}: its first row has {len(columns) + data.index.nlevels} fields. {rule}: "
+                           f"{_REMOVE_THE_EXTRA_FIELDS}.")
+    return data
+
+
+def _list_source(src_stream, name: str) -> str:
+    """A list file as _read_list's refusals name it: its path, or the name of an open file; a text buffer is "The chain
+    list" or "The assembly list"."""
     if isinstance(src_stream, (str, os.PathLike)):
         return os.fspath(src_stream)
-    name = getattr(src_stream, "name", None)
-    return name if isinstance(name, str) else "The chain list"
+    file_name = getattr(src_stream, "name", None)
+    return file_name if isinstance(file_name, str) else f"The {name}"
 
 
 def refuse_shared_names(data: pd.DataFrame, name_column: str, source_column: str):

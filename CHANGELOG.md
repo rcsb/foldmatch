@@ -711,8 +711,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   the stream and the row) by the four commands, before any model is loaded,
   and by `EsmProtFromChain`: `chain-embedding` ignored the fields after the
   3rd, and `residue-embedding`, `structure-embedding` and `EsmProtFromChain`
-  misread them, or stopped on a bare pandas error; remove the extra fields (a
-  comma after the embedding name makes a 5th); (4) a list whose file name
+  misread them, or stopped on a bare pandas error (but read right a list
+  whose every row started with an index column, as pandas'
+  `to_csv(header=False)` writes it); remove the extra fields (a comma after
+  the embedding name makes a 5th; write such a list with
+  `to_csv(header=False, index=False)`); (4) a list whose file name
   ends in `.gz`, `.bz2`, `.zip`, `.xz`, `.zst` or `.tar` (letter case
   ignored) is read as compressed, as `residue-embedding` and
   `structure-embedding` read it (`chain-embedding` read it as plain text):
@@ -726,6 +729,38 @@ While the major version is `0`, breaking changes are released in a minor bump.
   run's, or another row's, as when two rows swap names): name them
   `<structure name>.<chain ID>`, or leave their 4th column out. The help of
   `--src-file` and `--src-chain-file` describes the columns and the names.
+- **BREAKING — an assembly list row of more than 4 fields is refused.** The
+  assembly lists of `inference assembly-embedding` (`--src-file`) and
+  `inference complete-embedding` (`--src-assembly-file`), and the file or
+  stream of the library's `ResidueAssemblyEmbeddingFromTensorFile` and
+  `ResidueAssemblyEmbeddingFromParquet`, hold 4 fields per row: structure
+  name, structure file or URL, assembly ID and embedding name. A row of more
+  is now refused (`RefusalError`, naming the file or the stream and the row),
+  by both commands before any model is loaded (by `complete-embedding`, for
+  an assembly list in a regular file), as a chain list row of more than 4
+  fields is (above): remove the extra fields (a comma after the embedding
+  name makes a 5th). Before, pandas read the leading fields of a first such
+  row as the index, which shifted the columns of every row: a trailing comma
+  or a 5th field ended in a misleading error, such as `Structure file source
+  is neither a recognized URL nor file: '1'` (the assembly ID read as the
+  file) or the refusal of a structure name given to two files. A list whose
+  every row started with one or more extra fields, such as the index column
+  that pandas' `to_csv` writes unless `index=False`, worked (pandas took them
+  as the index, so the columns lined up) and is now refused: write it without
+  them (`to_csv(header=False, index=False)`). A longer later row stopped with
+  a bare pandas `ParserError` that named no file, and a stream row of 5
+  elements with pandas' `ValueError`. Any other pandas `ParserError` (an
+  unclosed quote, say) is refused the same way, with pandas' message. Lists
+  of at most 4 fields per row are read as before. `complete-embedding` now
+  reads an assembly list in a regular file before its residue step, so such a
+  list, or one that gives one structure name to two files, is refused before
+  the ESM3 step instead of after its chain step, which had written the
+  residue and chain embeddings. A list given as a pipe (a named pipe, or
+  `<(...)` on macOS), or on macOS as `/dev/stdin` or `/dev/fd/N` (even of a
+  regular file), which can be read once only, or at any other path under
+  `/dev` (a file in `/dev/shm`, say), is read by the assembly step alone, as
+  before, and a longer row is refused there, after the chain step. The help
+  of `--src-file` and `--src-assembly-file` describes the columns.
 
 ### Fixed
 

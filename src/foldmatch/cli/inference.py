@@ -253,7 +253,7 @@ def assembly_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Assembly Id | Output embedding name.'
+            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Assembly Id | Embedding Name.'
         )],
         res_embedding_location: Annotated[Path, typer.Option(
             exists=True,
@@ -350,7 +350,7 @@ def complete_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file 4 columns: Structure Name | Structure File Path or URL (switch structure-location) | Assembly Id | Output embedding name.'
+            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Assembly Id | Embedding Name.'
         )],
         output_res_path: Annotated[Path, typer.Option(
             exists=True,
@@ -425,8 +425,16 @@ def complete_embedding(
             help='Number of nodes to use for inference of embeddings.'
         )] = LogLevel.info
 ):
+    from foldmatch.dataset.utils import read_assembly_list, refuse_shared_names
     # Before any model is built: the assembly step reads the residue embeddings as <structure name>.<chain ID>
     _refuse_other_embedding_names(src_chain_file)
+    # The assembly list, read as the assembly step reads it: a row of more than 4 fields, or a structure name given to
+    # two files, is refused here, before the residue step, rather than after the chain step. A regular file not under
+    # /dev only: a pipe (a named pipe, or <(...) on macOS), or /dev/stdin, /dev/fd/N (on macOS, open shares the
+    # descriptor's offset, even on a regular file), can be read once, so the assembly step alone reads it, and refuses
+    # such a list there
+    if os.path.isfile(src_assembly_file) and not os.fspath(src_assembly_file).startswith("/dev/"):
+        refuse_shared_names(read_assembly_list(src_assembly_file), "stream_name", "stream")
     residue_embedding(
         src_file=src_chain_file,
         output_folder=output_res_path,

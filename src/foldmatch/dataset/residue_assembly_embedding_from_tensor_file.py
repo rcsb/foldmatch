@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
-from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
+from foldmatch.dataset.utils import get_structure_location, read_assembly_list, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url, concatenate_tensors
@@ -45,17 +45,8 @@ class ResidueAssemblyEmbeddingFromTensorFile(Dataset):
         self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
 
     def __load_stream(self, src_stream):
-        self.data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueAssemblyEmbeddingFromTensorFile.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueAssemblyEmbeddingFromTensorFile.COLUMNS
-        )
+        # The assembly list, whose columns are COLUMNS: a row of more than 4 fields is refused
+        self.data = read_assembly_list(src_stream, self.src_location)
         self.data = self.data.sort_values(by=self.data.columns[0])
         refuse_shared_names(self.data, ResidueAssemblyEmbeddingFromTensorFile.STREAM_NAME_ATTR,
                             ResidueAssemblyEmbeddingFromTensorFile.STREAM_ATTR)

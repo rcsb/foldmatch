@@ -300,6 +300,8 @@ Lower-level entry point exposing individual inference passes (`residue-embedding
 
 The chain lists of `residue-embedding`, `structure-embedding`, `chain-embedding` and `complete-embedding` (`--src-file`, `--src-chain-file`) are CSV files without a header, one row per chain: structure name, structure file path or URL, chain ID, embedding name. A row of more than 4 fields is refused. The embedding name names the row's output, and is `<structure name>.<chain ID>` when the 4th column is missing or empty. `chain-embedding` reads the residue embedding `<embedding name>.<format>` (`--res-embedding-format`) from `--res-embedding-location`, without reading the structure file; `assembly-embedding` reads the residue embeddings of an assembly's chains as `<structure name>.<chain ID>.<format>`, so `complete-embedding` takes only chain lists whose embedding names are `<structure name>.<chain ID>` or left out. `--min-res-n` selects the chains of each assembly in `assembly-embedding` and `complete-embedding`.
 
+The assembly lists of `assembly-embedding` and `complete-embedding` (`--src-file`, `--src-assembly-file`) are CSV files without a header, one row per assembly: structure name, structure file path or URL, assembly ID, embedding name; a row of more than 4 fields is refused.
+
 ---
 
 ## Python API
