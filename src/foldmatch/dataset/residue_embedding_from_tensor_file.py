@@ -1,6 +1,7 @@
 import pandas as pd
 from torch.utils.data import Dataset
 
+from foldmatch.dataset.utils import read_residue_file_list
 from foldmatch.types.api_types import SrcLocation, ResEmbeddingFormat, FileOrStreamTuple
 from foldmatch.utils.data import load_residue_embedding
 
@@ -25,16 +26,8 @@ class ResidueEmbeddingFromTensorFile(Dataset):
         self.__load_stream(src_stream)
 
     def __load_stream(self, src_stream):
-        self.data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueEmbeddingFromTensorFile.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            names=ResidueEmbeddingFromTensorFile.COLUMNS
-        )
+        # The residue file list, whose columns are COLUMNS, as strings: a row of more than 2 fields is refused
+        self.data = read_residue_file_list(src_stream, self.src_location)
         self.data = self.data.sort_values(by=self.data.columns[0])
 
     def __len__(self):

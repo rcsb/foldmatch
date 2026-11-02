@@ -16,7 +16,14 @@ _CHAIN_LIST_FIELDS = "structure name, structure file or URL, chain ID, embedding
 ASSEMBLY_LIST_COLUMNS = ['stream_name', 'stream', 'assembly_id', 'item_name']
 #: The fields of an assembly list row, as read_assembly_list's refusals name them.
 _ASSEMBLY_LIST_FIELDS = "structure name, structure file or URL, assembly ID, embedding name"
-_REMOVE_THE_EXTRA_FIELDS = "remove the extra fields (a comma after the embedding name makes a 5th)"
+#: The columns of a structure list (read_structure_list): structure name | structure file or URL | embedding name.
+STRUCTURE_LIST_COLUMNS = ['stream_name', 'stream', 'item_name']
+#: The fields of a structure list row, as read_structure_list's refusals name them.
+_STRUCTURE_LIST_FIELDS = "structure name, structure file or URL, embedding name"
+#: The columns of a residue file list (read_residue_file_list): residue embedding file | embedding name.
+RESIDUE_FILE_LIST_COLUMNS = ['file', 'item_name']
+#: The fields of a residue file list row, as read_residue_file_list's refusals name them.
+_RESIDUE_FILE_LIST_FIELDS = "residue embedding file, embedding name"
 
 
 def get_structure_location(s: str) -> str:
@@ -68,15 +75,46 @@ def read_assembly_list(src_stream, src_location: SrcLocation = SrcLocation.file)
     return _read_list(src_stream, src_location, ASSEMBLY_LIST_COLUMNS, "assembly list", _ASSEMBLY_LIST_FIELDS)
 
 
+def read_structure_list(src_stream, src_location: SrcLocation = SrcLocation.file,
+                        keep_default_na: bool = True) -> pd.DataFrame:
+    """The rows of a structure list, in input order, one per structure (STRUCTURE_LIST_COLUMNS): the file or stream of
+    EsmProtFromStructure, EsmAssemblyFromStructure, ResidueEmbeddingFromStructure and
+    ResidueAssemblyDatasetFromStructure.
+
+    A file is CSV without a header, read with pandas as strings: with pandas' default NA values (a missing or empty
+    field, or NA, is NaN), or with keep_default_na=False (a missing or empty field is '', and NA is NA); a stream is a
+    list of tuples, read by pandas as such. A row of more than 3 fields is refused as read_chain_list refuses one
+    (RefusalError, naming the file or the stream and the row), and so is a file on which pandas raises any other
+    ParserError (quoted).
+    """
+    return _read_list(src_stream, src_location, STRUCTURE_LIST_COLUMNS, "structure list", _STRUCTURE_LIST_FIELDS,
+                      keep_default_na=keep_default_na)
+
+
+def read_residue_file_list(src_stream, src_location: SrcLocation = SrcLocation.file) -> pd.DataFrame:
+    """The rows of a residue file list, in input order, one per residue embedding file (RESIDUE_FILE_LIST_COLUMNS): the
+    file or stream of ResidueEmbeddingFromTensorFile.
+
+    A file is CSV without a header, read with pandas as strings, so that a numeric-looking name keeps its spelling
+    (007, 1.50), pandas' default NA values kept (a missing or empty field, or NA, is NaN); a stream is a list of tuples,
+    read by pandas as such. A row of more than 2 fields is refused as read_chain_list refuses one (RefusalError, naming
+    the file or the stream and the row), and so is a file on which pandas raises any other ParserError (quoted).
+    """
+    return _read_list(src_stream, src_location, RESIDUE_FILE_LIST_COLUMNS, "residue file list",
+                      _RESIDUE_FILE_LIST_FIELDS)
+
+
 def _read_list(src_stream, src_location: SrcLocation, columns: list, name: str, fields: str,
                keep_default_na: bool = True) -> pd.DataFrame:
-    """The rows of a list of these columns (a chain or an assembly list: its name and its fields as the refusals say
-    them), as pandas reads them: a file as CSV without a header, as strings; a stream as a list of rows. A row of more
-    fields than columns is refused (RefusalError), and so is a file on which pandas raises any other ParserError: pandas
-    reads the leading fields of a first row of more fields as the index, which shifts the columns of every row, and
-    stops at a later one with a ParserError that names no file."""
+    """The rows of a list of these columns (its name and its fields as the refusals say them; the embedding name its
+    last column), as pandas reads them: a file as CSV without a header, as strings; a stream as a list of rows. A row of
+    more fields than columns is refused (RefusalError), and so is a file on which pandas raises any other ParserError:
+    pandas reads the leading fields of a first row of more fields as the index, which shifts the columns of every row,
+    and stops at a later one with a ParserError that names no file."""
     a_list = f"{'An' if name[0] in 'aeiou' else 'A'} {name}"
     rule = f"{a_list} row holds at most {len(columns)} fields ({fields})"
+    next_field = "3rd" if len(columns) == 2 else f"{len(columns) + 1}th"
+    remove_the_extra_fields = f"remove the extra fields (a comma after the embedding name makes a {next_field})"
     if src_location == SrcLocation.stream:
         rows = list(src_stream)
         longer = [k for k, row in enumerate(rows, start=1) if len(row) > len(columns)]
@@ -99,20 +137,22 @@ def _read_list(src_stream, src_location: SrcLocation, columns: list, name: str, 
         message = " ".join(str(e).split())
         if re.search(r"Expected \d+ fields", message):
             raise RefusalError(f"{source}: a row has more than {len(columns)} fields (pandas: {message}). {rule}: "
-                               f"{_REMOVE_THE_EXTRA_FIELDS}.") from e
+                               f"{remove_the_extra_fields}.") from e
         raise RefusalError(f"{source}: pandas could not read it as CSV ({message}). {a_list} is CSV without a header, "
                            f"of at most {len(columns)} fields per row ({fields}): correct it where pandas' message "
                            f"points.") from e
-    # pandas reads the leading fields of a first row of more than len(columns) as the index, one level each
+    # pandas reads the leading fields of a first row of more than len(columns) as the index, one level each. Read as
+    # strings, they are never a RangeIndex; read without dtype=str, pandas 3 makes one of an index column of evenly
+    # spaced integers (0, 1, 2).
     if not isinstance(data.index, pd.RangeIndex):
         raise RefusalError(f"{source}: its first row has {len(columns) + data.index.nlevels} fields. {rule}: "
-                           f"{_REMOVE_THE_EXTRA_FIELDS}.")
+                           f"{remove_the_extra_fields}.")
     return data
 
 
 def _list_source(src_stream, name: str) -> str:
-    """A list file as _read_list's refusals name it: its path, or the name of an open file; a text buffer is "The chain
-    list" or "The assembly list"."""
+    """A list file as _read_list's refusals name it: its path, or the name of an open file; a text buffer is "The
+    <name>" ("The chain list", say)."""
     if isinstance(src_stream, (str, os.PathLike)):
         return os.fspath(src_stream)
     file_name = getattr(src_stream, "name", None)

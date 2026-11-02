@@ -761,6 +761,49 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `/dev` (a file in `/dev/shm`, say), is read by the assembly step alone, as
   before, and a longer row is refused there, after the chain step. The help
   of `--src-file` and `--src-assembly-file` describes the columns.
+- **BREAKING — a structure list or residue file list row of too many fields
+  is refused.** A structure list holds 3 fields per row (structure name,
+  structure file or URL, embedding name): it is the file or stream of the
+  library's `EsmProtFromStructure`, `EsmAssemblyFromStructure`,
+  `ResidueEmbeddingFromStructure` and
+  `ResidueAssemblyDatasetFromStructure`. A residue file list holds 2 (residue
+  embedding file, embedding name): it is the file or stream of
+  `ResidueEmbeddingFromTensorFile`. These lists are given in a file through
+  the library only, to `predict` of `esm_inference`, `structure_inference`,
+  `chain_inference`, `assembly_inferece`, `chain_complete_inference` and
+  `assembly_complete_inference`. The commands that use these readers
+  (`fm-embedding from-structures`, `fm-search build structures`,
+  `inference chain-embedding` and `complete-embedding`) give them streams
+  they build themselves, of the right length, and are unaffected. A row of
+  more fields is now refused (`RefusalError`, naming the file or the stream
+  and the row), before any model is loaded, as a chain or assembly list row
+  is (above): remove the extra fields (a comma after the embedding name makes
+  a 4th in a structure list, a 3rd in a residue file list). Before, pandas
+  read the leading fields of a first such row as the index, which shifted the
+  columns of every row (after a trailing comma, the embedding name was read
+  as the file). A list whose every row started with one or more extra fields,
+  such as the index column that pandas' `to_csv` writes unless `index=False`,
+  worked (pandas took them as the index, so the columns lined up) and is now
+  refused: write it without them (`to_csv(header=False, index=False)`). A
+  longer later row stopped with a bare pandas `ParserError` that named no
+  file, and a longer stream row with pandas' `ValueError`. Any other pandas
+  `ParserError` (an unclosed quote, say) is refused the same way, with
+  pandas' message. A residue file list in a file is now read as strings, as
+  its stream and every other list are: otherwise pandas 3 reads an index
+  column `0, 1, 2` like no index at all, and the refusal would miss it. So
+  the names of a list whose names all look like numbers, or all like booleans
+  (any of them may be empty), which pandas read as such, keep their spelling:
+  `007` and `1.50` give `007.csv` and `1.50.csv` (or `.pt`) where they gave
+  `7.0.csv` and `1.5.csv`, `TRUE` gives `TRUE.csv` where it gave `True.csv`,
+  and `1` next to an empty name gives `1.csv` where it gave `1.0.csv`; `1`
+  and `2` give `1.csv` and `2.csv`, as before. A space around a number, which
+  pandas dropped, now stays in the name (`a.pt, 1` gives ` 1.csv`). In JSON
+  output their ids are strings (`"007"`, `"1"`, `"TRUE"`) where they were
+  numbers or booleans (`7.0`, `1`, `true`), and Parquet output, which stopped
+  on them with pyarrow's `ArrowTypeError` and wrote nothing, now holds them
+  as written. An empty name or `NA` stays NaN, as before: `nan.csv`, `null`
+  in JSON, and that `ArrowTypeError` in Parquet. Lists of at most that many
+  fields per row are otherwise read as before.
 
 ### Fixed
 

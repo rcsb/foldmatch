@@ -1,11 +1,10 @@
 import sys
 from pathlib import Path
 
-import pandas as pd
 from tqdm import tqdm
 
 from foldmatch.dataset.residue_assembly_embedding_from_tensor_file import ResidueAssemblyEmbeddingFromTensorFile
-from foldmatch.dataset.utils import get_structure_location, refuse_shared_names
+from foldmatch.dataset.utils import get_structure_location, read_structure_list, refuse_shared_names
 from foldmatch.types.api_types import SrcLocation, StructureLocation, StructureFormat, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
@@ -49,17 +48,8 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
 
     def __get_assemblies(self, src_stream):
         assemblies = []
-        data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueAssemblyDatasetFromStructure.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueAssemblyDatasetFromStructure.COLUMNS
-        )
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused
+        data = read_structure_list(src_stream, self.src_location)
         data = data.sort_values(by=data.columns[0])
         refuse_shared_names(data, ResidueAssemblyDatasetFromStructure.STREAM_NAME_ATTR,
                             ResidueAssemblyDatasetFromStructure.STREAM_ATTR)
