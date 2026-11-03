@@ -919,6 +919,24 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Fixed
 
+- **`ivf_pq` searches of several queries at once could silently return wrong
+  hits.** With `faiss-cpu` 1.14.2 to 1.15.1, a FAISS call with 2 or more queries
+  on an `ivf_pq` database of `--ivf-nlist` 10000 or more searched only the first
+  `nlist // T` coarse cells for the queries in a slice of fewer than T queries,
+  where T is the number of FAISS threads and `nlist >= 1024 * T`
+  (facebookresearch/faiss#5824). With the default `--ivf-nlist` 16384 that means
+  2 to 16 threads and fewer than T\*T queries per FAISS call: `query sequences`
+  makes one call per query shard (one shard per rank), and `query db` one per
+  4096 queries, so its last call is usually short. No error was raised.
+  FoldMatch now sets FAISS's `parallel_mode` 3 on these databases, which gives
+  the correct result at every thread count, and no rebuild is needed. Results in
+  that range should be run again. A single-query call, an `nlist` under 10000 or
+  under 1024 times the thread count (so 17 or more threads at the default
+  16384), and `flat` or `hnsw` databases were not affected. The defect is likely
+  solved in the next FAISS release: the upstream fix
+  (facebookresearch/faiss#5824) was merged on 2026-10-31, but it is not in
+  1.15.1, the latest release and FoldMatch's pin. When the `faiss-cpu` pin moves
+  to a release that has it, this workaround is to be re-examined.
 - **Assembly embeddings of entries with more than one assembly.** Structures
   were cached under the entry name alone, so assemblies of an entry read one
   after another all got the first one's chains. `fm-search build structures

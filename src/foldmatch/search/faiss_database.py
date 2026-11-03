@@ -40,6 +40,23 @@ def _index_add_batched(index, embedding_array: np.ndarray, batch_size: int = 100
         index.add(np.ascontiguousarray(embedding_array[start:end]))
 
 
+def _quantize_outside_parallel_regions(index) -> None:
+    """Make ``index.search`` of an IVF index run its coarse quantizer outside OpenMP parallel regions (FAISS parallel_mode 3).
+
+    FAISS 1.14.2 to 1.15.1 lose half or more of the coarse centroids otherwise, with no error. In parallel_mode 0 (the
+    default) ``IndexIVF::search`` calls the quantizer inside a parallel loop over the queries. With T threads, nlist >=
+    max(10000, 1024 * T), and fewer than T queries in a thread's slice, the flat quantizer splits its centroids into T
+    segments, one per thread, but the nested region has only one thread: only the first nlist // T centroids are
+    searched (facebookresearch/faiss#5824). parallel_mode 3 calls the quantizer once for the whole batch, outside the
+    region, and then splits the same per-query scan over the threads. It is not stored in the index file.
+
+    The defect is likely solved in the next FAISS release: the upstream fix (facebookresearch/faiss#5824) was merged on
+    2026-10-31, but it is not in 1.15.1, the latest release and FoldMatch's pin. Re-examine this workaround when the
+    faiss-cpu pin moves to a release that has it.
+    """
+    faiss.extract_index_ivf(index).parallel_mode = 3
+
+
 class FaissEmbeddingDatabase:
     """FAISS-based database for structure chain embeddings."""
 
@@ -228,6 +245,7 @@ class FaissEmbeddingDatabase:
         if config.nprobe is None:
             config.nprobe = max(1, config.nlist // 64)
         ivf_index.nprobe = config.nprobe
+        _quantize_outside_parallel_regions(self.index)
 
         # Phase E: persist the populated index. This is the canonical FAISS
         # save order — write_index serializes both the trained header AND the
@@ -282,6 +300,7 @@ class FaissEmbeddingDatabase:
             if self.index_config is not None and self.index_config.nprobe is not None:
                 ivf_index = faiss.extract_index_ivf(self.index)
                 ivf_index.nprobe = self.index_config.nprobe
+            _quantize_outside_parallel_regions(self.index)
         else:
             self.index = faiss.read_index(str(index_file))
 
