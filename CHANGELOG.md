@@ -1099,6 +1099,20 @@ While the major version is `0`, breaking changes are released in a minor bump.
   sequence was aligned, even on one rank (the one case in which a 1-rank
   run's output changes).
 
+- **The help of `inference` and `fm-search`.** Only help text changes.
+  `--log-level` read "Number of nodes to use for inference of embeddings." in
+  every `inference` embedding command and in `fm-search stats`, `cluster`,
+  `build structures`, `query structure` and `query db`. `inference
+  structure-embedding` named a pandas DataFrame file, an option `out-df-name`
+  that does not exist and a JSON file; it writes
+  `<output-name>-<rank>.parquet`. `inference residue-embedding`,
+  `chain-embedding`, `assembly-embedding` and `complete-embedding` named one
+  output format, whatever `--output-format` said (`complete-embedding` a
+  single JSON file, where its default is one CSV file per chain or assembly);
+  they now name the default and say what each format writes. `chain-embedding`
+  and `assembly-embedding` also name the CSV residue embeddings they read
+  (`--res-embedding-format`).
+
 ## [0.8.0] - 2026-07-21
 
 This release reworks how `fm-search` reports results and makes its alignment

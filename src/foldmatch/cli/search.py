@@ -308,7 +308,7 @@ def build_database_from_structures(
             help=_CLEANUP_EMBEDDINGS_HELP
         )] = False,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     """Build an embedding database from structure files."""
@@ -954,7 +954,7 @@ def query_database_from_structure(
             help=_FORMAT_MODE_HELP
         )] = FormatMode.headless_tsv,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     """Search database for similar structures."""
@@ -1398,7 +1398,7 @@ def query_database_from_database(
             help=_FORMAT_MODE_HELP
         )] = FormatMode.headless_tsv,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     """Search subject database using all entries from query database."""
@@ -1490,7 +1490,7 @@ def show_statistics(
             help='Path to the FAISS database (directory + prefix, e.g., ./db/my_db).'
         )],
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     """Display database statistics."""
@@ -1550,7 +1550,7 @@ def cluster_database(
             help=_FORMAT_MODE_HELP
         )] = FormatMode.headless_tsv,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     """Cluster database embeddings using Leiden algorithm."""

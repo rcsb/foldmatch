@@ -22,7 +22,7 @@ app = typer.Typer(
 
 @app.command(
     name="residue-embedding",
-    help="Calculate residue level embeddings of protein structures using ESM3. Predictions are stored as torch tensor files."
+    help="Calculate residue level embeddings of protein structures using ESM3. Predictions are stored in the format of output-format, torch tensor files by default."
 )
 def residue_embedding(
         src_file: Annotated[Path, typer.Option(
@@ -37,7 +37,7 @@ def residue_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store predictions. Embeddings are stored as torch tensor files.'
+            help='Output path to store predictions, in the format of output-format: one file per chain for csv and pt, one file per process for parquet and json.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per chain, with one list of D values per residue.'
@@ -67,7 +67,7 @@ def residue_embedding(
             help='Lightning strategy to control distribution of inference.'
         )] = Strategy.auto,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     from foldmatch.inference.esm_inference import predict
@@ -93,7 +93,7 @@ def residue_embedding(
 
 @app.command(
     name="structure-embedding",
-    help="Calculate single-chain protein embeddings from structural files. Predictions are stored in a single pandas DataFrame file."
+    help="Calculate single-chain protein embeddings from structural files. Predictions are stored as Parquet, one file per process: <output-name>-<rank>.parquet."
 )
 def structure_embedding(
         src_file: Annotated[Path, typer.Option(
@@ -108,10 +108,10 @@ def structure_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store predictions. Embeddings are stored as a single DataFrame file (see out-df-name).'
+            help='Output path to store predictions: the Parquet file <output-name>-<rank>.parquet of each process.'
         )],
         output_name: Annotated[str, typer.Option(
-            help='File name for storing embeddings as a single JSON file.'
+            help='File name for storing embeddings: <output-name>-<rank>.parquet.'
         )] = 'inference',
         structure_format: Annotated[StructureFormat, typer.Option(
             help='Structure file format.'
@@ -135,7 +135,7 @@ def structure_embedding(
             help='Lightning strategy to control distribution of inference.'
         )] = Strategy.auto,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     from foldmatch.inference.structure_inference import predict
@@ -160,7 +160,7 @@ def structure_embedding(
 
 @app.command(
     name="chain-embedding",
-    help="Calculate single-chain protein embeddings from residue level embeddings stored as torch tensor files. Predictions are stored as csv files."
+    help="Calculate single-chain protein embeddings from residue level embeddings stored as torch tensor or csv files (res-embedding-format). Predictions are stored in the format of output-format, csv files by default."
 )
 def chain_embedding(
         src_file: Annotated[Path, typer.Option(
@@ -175,7 +175,7 @@ def chain_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store predictions. Embeddings are stored as csv files.'
+            help='Output path to store predictions, in the format of output-format: one file per chain for csv and pt, one file per process for parquet and json.'
         )],
         res_embedding_location: Annotated[Path, typer.Option(
             exists=True,
@@ -215,7 +215,7 @@ def chain_embedding(
             help='Lightning strategy to control distribution of inference.'
         )] = Strategy.auto,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     from foldmatch.dataset.utils import read_chain_list
@@ -245,7 +245,7 @@ def chain_embedding(
 
 @app.command(
     name="assembly-embedding",
-    help="Calculate assembly embeddings from residue level embeddings stored as torch tensor files. Predictions are stored as csv files."
+    help="Calculate assembly embeddings from residue level embeddings stored as torch tensor or csv files (res-embedding-format). Predictions are stored in the format of output-format, csv files by default."
 )
 def assembly_embedding(
         src_file: Annotated[Path, typer.Option(
@@ -267,7 +267,7 @@ def assembly_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store predictions. Embeddings are stored as csv files.'
+            help='Output path to store predictions, in the format of output-format: one file per assembly for csv and pt, one file per process for parquet and json.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json.'
@@ -306,7 +306,7 @@ def assembly_embedding(
             help='Lightning strategy to control distribution of inference.'
         )] = Strategy.auto,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     from foldmatch.inference.assembly_inferece import predict
@@ -335,7 +335,7 @@ def assembly_embedding(
 
 @app.command(
     name="complete-embedding",
-    help="Calculate chain and assembly embeddings from structural files. Predictions are stored as csv files."
+    help="Calculate chain and assembly embeddings from structural files. Residue embeddings are stored as torch tensor files, chain and assembly embeddings in the format of output-format, csv files by default."
 )
 def complete_embedding(
         src_chain_file: Annotated[Path, typer.Option(
@@ -364,14 +364,14 @@ def complete_embedding(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store chain embeddings. Embeddings are stored as a single JSON file (see output_chain_name).'
+            help='Output path to store chain embeddings, in the format of output-format: one file per chain for csv and pt, one file per process for parquet and json (see output-chain-name).'
         )],
         output_assembly_path: Annotated[Path, typer.Option(
             exists=True,
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output path to store assembly embeddings. Embeddings are stored as a single JSON file (see output_assembly_name).'
+            help='Output path to store assembly embeddings, in the format of output-format: one file per assembly for csv and pt, one file per process for parquet and json (see output-assembly-name).'
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json.'
@@ -422,7 +422,7 @@ def complete_embedding(
             help='Lightning strategy to control distribution of inference.'
         )] = Strategy.auto,
         log_level: Annotated[LogLevel, typer.Option(
-            help='Number of nodes to use for inference of embeddings.'
+            help='Logging level.'
         )] = LogLevel.info
 ):
     from foldmatch.dataset.utils import read_assembly_list, refuse_shared_names

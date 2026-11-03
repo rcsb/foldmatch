@@ -1,9 +1,11 @@
 """CLI help text that states what the code does (G10)."""
 import unittest
 
+import click
 import pytest
 import typer
 
+from foldmatch.cli import embedding, inference
 from foldmatch.cli.search import app
 
 
@@ -52,6 +54,81 @@ class MinCoverageHelpTest(unittest.TestCase):
         self.assertGreaterEqual(metrics.query_coverage, 0.99)
         self.assertLess(metrics.subject_coverage, 0.8)
         self.assertEqual(alignment.align_candidates(min_coverage=0.8, **kwargs)["q"], [])
+
+
+def _commands(command, path=()):
+    """Every command under a click command, by path."""
+    if isinstance(command, click.Group):
+        for name, sub in command.commands.items():
+            yield from _commands(sub, (*path, name))
+    else:
+        yield path, command
+
+
+def _inference_help(name):
+    """The help of an inference command and of each of its options, by parameter name."""
+    command = typer.main.get_command(inference.app).commands[name]
+    return command.help, {p.name: p.help for p in command.params}
+
+
+class LogLevelHelpTest(unittest.TestCase):
+
+    def test_every_log_level_help_is_about_logging(self):
+        """--log-level read "Number of nodes to use for inference of embeddings." in 10 commands."""
+        seen = 0
+        for typer_app in (app, inference.app, embedding.app):
+            for path, command in _commands(typer.main.get_command(typer_app)):
+                for param in command.params:
+                    if param.name == "log_level":
+                        seen += 1
+                        with self.subTest(command=" ".join(path)):
+                            self.assertRegex(param.help, r"^Logging (verbosity )?level\.$")
+        self.assertGreaterEqual(seen, 24)
+
+    def test_no_other_option_reads_like_the_old_text(self):
+        for typer_app in (app, inference.app, embedding.app):
+            for path, command in _commands(typer.main.get_command(typer_app)):
+                for param in command.params:
+                    with self.subTest(command=" ".join(path), param=param.name):
+                        self.assertNotIn("inference of embeddings", getattr(param, "help", None) or "")
+
+
+class InferenceOutputHelpTest(unittest.TestCase):
+    """The help of the inference commands says what they write (test_inference_outputs.py runs them)."""
+
+    def test_structure_embedding_says_parquet(self):
+        """It said a pandas DataFrame file, an option out-df-name that does not exist, and a JSON file."""
+        text, options = _inference_help("structure-embedding")
+        for help_text in (text, options["output_folder"], options["output_name"]):
+            self.assertIn("<output-name>-<rank>.parquet", help_text)
+        for help_text in (text, options["output_folder"], options["output_name"]):
+            for stale in ("DataFrame", "out-df-name", "JSON"):
+                self.assertNotIn(stale, help_text)
+
+    def test_the_output_format_commands_say_so(self):
+        """Each said one format, the default or none of them, whatever --output-format; complete-embedding a single
+        JSON file."""
+        for name, default, folders in (("residue-embedding", "torch tensor files by default",
+                                        {"output_folder": "chain"}),
+                                       ("chain-embedding", "csv files by default", {"output_folder": "chain"}),
+                                       ("assembly-embedding", "csv files by default", {"output_folder": "assembly"}),
+                                       ("complete-embedding", "csv files by default",
+                                        {"output_chain_path": "chain", "output_assembly_path": "assembly"})):
+            with self.subTest(command=name):
+                text, options = _inference_help(name)
+                self.assertIn("in the format of output-format", text)
+                self.assertIn(default, text)
+                for folder, item in folders.items():
+                    self.assertIn("in the format of output-format", options[folder])
+                    self.assertIn(f"one file per {item} for csv and pt", options[folder])
+                    self.assertIn("one file per process for parquet and json", options[folder])
+                    self.assertNotIn("single JSON file", options[folder])
+
+    def test_the_residue_file_formats_are_named(self):
+        """chain-embedding and assembly-embedding also read csv residue embeddings."""
+        for name in ("chain-embedding", "assembly-embedding"):
+            with self.subTest(command=name):
+                self.assertIn("stored as torch tensor or csv files (res-embedding-format)", _inference_help(name)[0])
 
 
 if __name__ == "__main__":
