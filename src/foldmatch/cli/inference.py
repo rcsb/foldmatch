@@ -190,9 +190,6 @@ def chain_embedding(
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
         )] = 'inference',
-        structure_format: Annotated[StructureFormat, typer.Option(
-            help='Structure file format.'
-        )] = StructureFormat.mmcif,
         res_embedding_format: Annotated[ResEmbeddingFormat, typer.Option(
             help='Format of the residue level embedding files. Options: pt (torch tensor files) or csv.'
         )] = ResEmbeddingFormat.pt,
@@ -229,7 +226,6 @@ def chain_embedding(
         res_embedding_location=res_embedding_location,
         src_location=SrcLocation.stream,
         src_from=SrcTensorFrom.file,
-        structure_format=structure_format,
         batch_size=batch_size,
         num_workers=num_workers,
         num_nodes=num_nodes,
@@ -381,7 +377,7 @@ def complete_embedding(
         )] = 'chain-inference',
         output_assembly_name: Annotated[str, typer.Option(
             help='File name for storing assembly embeddings. Used when output-format is parquet or json.'
-        )] = 'chain-inference',
+        )] = 'assembly-inference',
         structure_format: Annotated[StructureFormat, typer.Option(
             help='Structure file format.'
         )] = StructureFormat.mmcif,
@@ -454,7 +450,6 @@ def complete_embedding(
         output_format=output_format,
         output_name=output_chain_name,
         res_embedding_location=output_res_path,
-        structure_format=structure_format,
         batch_size=batch_size_chain,
         num_workers=num_workers_chain,
         num_nodes=num_nodes,

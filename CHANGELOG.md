@@ -805,6 +805,23 @@ While the major version is `0`, breaking changes are released in a minor bump.
   in JSON, and that `ArrowTypeError` in Parquet. Lists of at most that many
   fields per row are otherwise read as before.
 
+- **BREAKING — `inference chain-embedding` takes no `--structure-format`.** It
+  reads residue embeddings and no structure file, so the option did nothing. A
+  command line that passes it now stops with `No such option` (exit status 2);
+  leave it out. `inference complete-embedding` keeps the option, for its
+  residue and assembly steps, which read structures. In Python,
+  `foldmatch.cli.inference.chain_embedding` no longer takes `structure_format`
+  (`TypeError`); `chain_inference.predict` keeps it, for `src_from` structure.
+- **BREAKING — `inference complete-embedding` names its assembly file
+  `assembly-inference` by default.** `--output-assembly-name` defaulted to
+  `chain-inference`, the default of `--output-chain-name`, so that with
+  `--output-format parquet` or `json` and one folder for
+  `--output-chain-path` and `--output-assembly-path`, the assembly file
+  replaced the chain file. Both are now kept. In any folder, the default
+  assembly file is now `assembly-inference-<rank>.parquet` or `.json.gz`: read
+  it under that name, or pass `--output-assembly-name chain-inference` to keep
+  the old one. Output in `csv` or `pt` does not use the name.
+
 ### Fixed
 
 - **Assembly embeddings of entries with more than one assembly.** Structures

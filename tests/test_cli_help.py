@@ -130,6 +130,12 @@ class InferenceOutputHelpTest(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertIn("stored as torch tensor or csv files (res-embedding-format)", _inference_help(name)[0])
 
+    def test_chain_embedding_does_not_list_structure_format(self):
+        self.assertNotIn("structure_format", _inference_help("chain-embedding")[1])
+        for name in ("residue-embedding", "structure-embedding", "assembly-embedding", "complete-embedding"):
+            with self.subTest(command=name):
+                self.assertIn("structure_format", _inference_help(name)[1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,10 @@
-"""P9.H: what the inference commands write, as their help says. ESM3 and the aggregator are never loaded: the commands run with stub models, as in
+"""P9.H: what the inference commands write, as their help says, and what --structure-format and the default names of
+complete-embedding do. ESM3 and the aggregator are never loaded: the commands run with stub models, as in
 test_inference_follow_ups.py."""
 import gzip
 import json
 import logging
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +15,9 @@ import torch
 from typer.testing import CliRunner
 
 from foldmatch.cli import inference
+# Imported before any test patches chain_inference.predict, which assembly_inferece binds at its import
+from foldmatch.inference import assembly_inferece, chain_inference, esm_inference
+from foldmatch.types.api_types import StructureFormat
 
 _CIF = Path(__file__).parent / "resources" / "pdb" / "1acb.cif"
 _CPU = ("--accelerator", "cpu", "--devices", "1")
@@ -40,6 +45,12 @@ def _invoke(*args):
     finally:
         root.handlers[:] = handlers
         root.setLevel(level)
+
+
+def _flat(output: str) -> str:
+    """The output on one line, typer's error panel borders dropped, and its colours (on with GITHUB_ACTIONS, FORCE_COLOR
+    or PY_COLORS set)."""
+    return " ".join(re.sub(r"\x1b\[[0-9;]*m", "", output).translate({ord(c): " " for c in "│╭╮╰╯─"}).split())
 
 
 def _ids(path: Path) -> list:
@@ -149,3 +160,81 @@ class OutputFilesTest(_StubModels):
                 self.assert_files(res, _CHAINS, "pt", "inference")
                 self.assert_files(chain, _CHAINS, output_format, "c")
                 self.assert_files(assembly, _ASSEMBLIES, output_format, "a")
+
+
+class StructureFormatTest(_Lists):
+    """chain-embedding reads residue embeddings and no structure, so it takes no --structure-format."""
+
+    def test_chain_embedding_refuses_it(self):
+        """Typer's usage error (exit status 2), before anything runs (before, it was taken and did nothing)."""
+        with mock.patch.object(chain_inference, "predict") as chain:
+            out = self.folder()
+            result = _invoke("chain-embedding", "--src-file", self.chains, "--res-embedding-location", out,
+                             "--output-folder", out, "--structure-format", "pdb")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("No such option: --structure-format", _flat(result.output))
+        chain.assert_not_called()
+
+    def test_complete_embedding_keeps_it_for_the_steps_that_read_structures(self):
+        """complete-embedding passes it to its residue and assembly steps, which read structures; its chain step does
+        not get it."""
+        out = self.folder()
+        with mock.patch.object(esm_inference, "predict") as residue, \
+                mock.patch.object(chain_inference, "predict") as chain, \
+                mock.patch.object(assembly_inferece, "predict") as assembly:
+            self.run_ok("complete-embedding", "--src-chain-file", self.chains, "--src-assembly-file", self.assemblies,
+                        "--output-res-path", out, "--output-chain-path", out, "--output-assembly-path", out,
+                        "--structure-format", "pdb")
+        for step in (residue, chain, assembly):
+            step.assert_called_once()
+        self.assertEqual(residue.call_args.kwargs["structure_format"], StructureFormat.pdb)
+        self.assertEqual(assembly.call_args.kwargs["structure_format"], StructureFormat.pdb)
+        self.assertNotIn("structure_format", chain.call_args.kwargs)
+
+    def test_chain_embedding_does_not_read_the_structure_file(self):
+        """The list's structure files are not read: a list naming no file gives the chain embeddings of a list naming
+        the real one, as the option's removal assumes."""
+        with mock.patch("foldmatch.inference.chain_inference.get_aggregator_model", return_value=_aggregate):
+            residues = self.folder()
+            for name in _CHAINS:
+                torch.save(torch.arange(6.0).reshape(3, 2) + ord(name[-1]), residues / f"{name}.pt")
+            nowhere = self.tmp / "nowhere.csv"
+            nowhere.write_text("1acb,/no/such/file.bcif,A,1acb.A\n1acb,,B,1acb.B\n")
+            real, other = self.folder(), self.folder()
+            self.run_ok("chain-embedding", "--src-file", self.chains, "--res-embedding-location", residues,
+                        "--output-folder", real)
+            self.run_ok("chain-embedding", "--src-file", nowhere, "--res-embedding-location", residues,
+                        "--output-folder", other)
+        for name in _CHAINS:
+            self.assertEqual((real / f"{name}.csv").read_bytes(), (other / f"{name}.csv").read_bytes())
+
+
+class CompleteEmbeddingNamesTest(_StubModels):
+    """The default file names of complete-embedding's chain and assembly files differ: --output-assembly-name was
+    chain-inference, the default of --output-chain-name, so that in one folder the assembly file replaced the chain
+    file."""
+
+    def run_complete(self, output_format: str, *names) -> Path:
+        out = self.folder()
+        self.run_ok("complete-embedding", "--src-chain-file", self.chains, "--src-assembly-file", self.assemblies,
+                    "--output-res-path", self.folder(), "--output-chain-path", out, "--output-assembly-path", out,
+                    "--output-format", output_format, *names)
+        return out
+
+    def test_one_folder_keeps_both_files(self):
+        for output_format, postfix in (("parquet", "parquet"), ("json", "json.gz")):
+            with self.subTest(output_format=output_format):
+                out = self.run_complete(output_format)
+                self.assertEqual(sorted(f.name for f in out.iterdir()),
+                                 [f"assembly-inference-0.{postfix}", f"chain-inference-0.{postfix}"])
+                self.assertCountEqual(_ids(out / f"chain-inference-0.{postfix}"), _CHAINS)
+                self.assertCountEqual(_ids(out / f"assembly-inference-0.{postfix}"), _ASSEMBLIES)
+
+    def test_the_names_given_are_used(self):
+        out = self.run_complete("parquet", "--output-chain-name", "c", "--output-assembly-name", "a")
+        self.assertEqual(sorted(f.name for f in out.iterdir()), ["a-0.parquet", "c-0.parquet"])
+
+    def test_the_help_shows_the_default(self):
+        result = CliRunner().invoke(inference.app, ["complete-embedding", "--help"], env={"COLUMNS": "400"})
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertRegex(_flat(result.output), r"--output-assembly-name TEXT .*\[default: assembly-inference\]")
