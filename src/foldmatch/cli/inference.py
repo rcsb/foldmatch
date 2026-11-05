@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,11 @@ from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTE
 from foldmatch.types.api_types import StructureFormat, Accelerator, SrcLocation, SrcProteinFrom, \
     SrcAssemblyFrom, SrcTensorFrom, OutFormat, Strategy, LogLevel, ResEmbeddingFormat
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+#: The help of an assembly list option.
+_ASSEMBLY_LIST_HELP = ('CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Assembly Id | '
+                       'Embedding Name, <Structure Name>-<Assembly Id> when the 4th column is missing or empty. Each '
+                       'row needs its own Embedding Name.')
 
 app = typer.Typer(
     add_completion=False,
@@ -215,14 +221,21 @@ def chain_embedding(
             help='Logging level.'
         )] = LogLevel.info
 ):
-    from foldmatch.dataset.utils import read_chain_list
+    from foldmatch.dataset.utils import CHAIN_LIST_DEFAULT_NAME, read_chain_list, refuse_repeated_names, row_labels
     from foldmatch.inference.chain_inference import predict
+    from foldmatch.utils.output_files import check_outputs
     set_log_level(log_level)
 
+    # Before any model: one name per row, one file per name, and no output over its residue embedding or the list
+    chains = read_chain_list(src_file)
+    refuse_repeated_names(chains, str(src_file), CHAIN_LIST_DEFAULT_NAME)
+    _refuse_chains_over_residues(output_folder, output_format, res_embedding_location, res_embedding_format)
+    check_outputs(output_folder, output_format, output_name, names=list(chains.item_name), labels=row_labels(chains),
+                  source=str(src_file), inputs=[("the chain list", src_file)], stem_what="--output-name")
     # The residue embedding of each row is the file of its embedding name, as residue-embedding writes it
     predict(
         src_stream=[(os.path.join(res_embedding_location, f"{name}.{res_embedding_format.value}"), name)
-                    for name in read_chain_list(src_file).item_name],
+                    for name in chains.item_name],
         res_embedding_location=res_embedding_location,
         src_location=SrcLocation.stream,
         src_from=SrcTensorFrom.file,
@@ -249,7 +262,7 @@ def assembly_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Assembly Id | Embedding Name.'
+            help=_ASSEMBLY_LIST_HELP
         )],
         res_embedding_location: Annotated[Path, typer.Option(
             exists=True,
@@ -346,7 +359,7 @@ def complete_embedding(
             file_okay=True,
             dir_okay=False,
             resolve_path=True,
-            help='CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | Assembly Id | Embedding Name.'
+            help=_ASSEMBLY_LIST_HELP
         )],
         output_res_path: Annotated[Path, typer.Option(
             exists=True,
@@ -425,12 +438,17 @@ def complete_embedding(
     # Before any model is built: the assembly step reads the residue embeddings as <structure name>.<chain ID>
     _refuse_other_embedding_names(src_chain_file)
     # The assembly list, read as the assembly step reads it: a row of more than 4 fields, or a structure name given to
-    # two files, is refused here, before the residue step, rather than after the chain step. A regular file not under
-    # /dev only: a pipe (a named pipe, or <(...) on macOS), or /dev/stdin, /dev/fd/N (on macOS, open shares the
-    # descriptor's offset, even on a regular file), can be read once, so the assembly step alone reads it, and refuses
-    # such a list there
-    if os.path.isfile(src_assembly_file) and not os.fspath(src_assembly_file).startswith("/dev/"):
-        refuse_shared_names(read_assembly_list(src_assembly_file), "stream_name", "stream")
+    # two files, is refused here, before the residue step, rather than after the chain step. A list that can be read
+    # once (a pipe, a named pipe or <(...) on macOS; /dev/stdin or /dev/fd/N, whose open shares the descriptor's offset
+    # on macOS, even on a regular file; any path under /dev) is read once, here, and its text given to the assembly
+    # step, so that it is checked as a list in a regular file is
+    src_assembly_list = _read_once(src_assembly_file)
+    assemblies = read_assembly_list(src_assembly_list)
+    refuse_shared_names(assemblies, "stream_name", "stream")
+    # One name per row, one file per name, no step's file over another's or over an input, before any model
+    _refuse_conflicting_steps(src_chain_file, _read_once(src_assembly_list), assemblies, output_format=output_format,
+                              folders=(output_res_path, output_chain_path, output_assembly_path),
+                              names=(output_chain_name, output_assembly_name))
     residue_embedding(
         src_file=src_chain_file,
         output_folder=output_res_path,
@@ -459,7 +477,7 @@ def complete_embedding(
         log_level=log_level
     )
     assembly_embedding(
-        src_file=src_assembly_file,
+        src_file=_read_once(src_assembly_list),
         output_folder=output_assembly_path,
         output_format=output_format,
         output_name=output_assembly_name,
@@ -475,6 +493,121 @@ def complete_embedding(
         strategy=strategy,
         log_level=log_level
     )
+
+
+class _ListText(io.StringIO):
+    """The text of a list that can be read once, read into memory, under the name of the path it was read from (the
+    name that refusals give it, and by which it is an input of the run when it is a file)."""
+
+    def __init__(self, text: str, name: str):
+        super().__init__(text)
+        self.name = name
+
+
+def _read_once(src_file):
+    """A list path as it can be read more than once: a regular file not under /dev as it is; any other path (a pipe,
+    /dev/stdin, /dev/fd/N, a path under /dev) read once, into a _ListText; a _ListText, a new one of its text."""
+    if isinstance(src_file, _ListText):
+        return _ListText(src_file.getvalue(), src_file.name)
+    if os.path.isfile(src_file) and not os.fspath(src_file).startswith("/dev/"):
+        return src_file
+    # As pandas reads a list file: UTF-8, line ends kept
+    with open(src_file, encoding="utf-8", newline="") as f:
+        return _ListText(f.read(), os.fspath(src_file))
+
+
+def _refuse_chains_over_residues(output_folder: Path, output_format: OutFormat, res_embedding_location: Path,
+                                 res_embedding_format: ResEmbeddingFormat):
+    """chain-embedding writes <embedding name>.<output-format> and reads <embedding name>.<res-embedding-format>: in
+    one folder and one format, each chain embedding would replace the residue embedding it is computed from, which is
+    refused (RefusalError), naming both options (P9.N D2)."""
+    from foldmatch.errors import RefusalError
+    from foldmatch.utils.output_files import same_folder
+    if output_format.value == res_embedding_format.value and same_folder(output_folder, res_embedding_location):
+        other = "csv" if output_format.value == "pt" else "pt"
+        raise RefusalError(
+            f"--output-folder and --res-embedding-location are one folder ({output_folder}), and --output-format is "
+            f"--res-embedding-format ({output_format.value}): each chain embedding <embedding name>."
+            f"{output_format.value} would replace the residue embedding it is computed from. Give another "
+            f"--output-folder, or --output-format {other}, parquet or json."
+        )
+
+
+def _refuse_conflicting_steps(src_chain_file: Path, src_assembly_file, assemblies, *, output_format: OutFormat,
+                              folders: tuple, names: tuple):
+    """complete-embedding's checks of its three steps' files, before its residue step (P9.N): each step's as the step
+    itself checks them (one name per row, one file per name, an assembly not named <structure name>.<...> beside the
+    residue embeddings in their format), no output of any step over an input of the run (both lists and the structure
+    files of both), and no file written by two steps in one folder (residue <res>/<chain name>.pt, chain
+    <chain>/<chain name>.<format> or <chain>/<chain name>-*, assembly <assembly>/<assembly name>.<format> or
+    <assembly>/<assembly name>-*). ``src_assembly_file`` is the assembly list's path, or its text (_ListText) when it
+    can be read once, and ``assemblies`` its frame."""
+    from foldmatch.dataset.utils import ASSEMBLY_LIST_DEFAULT_NAME, CHAIN_LIST_DEFAULT_NAME, list_source, \
+        read_chain_list, refuse_repeated_names, row_labels
+    from foldmatch.errors import RefusalError
+    from foldmatch.inference.utils import list_inputs
+    from foldmatch.utils.output_files import check_outputs, file_id, probe_folding, refuse_assemblies_over_residues, \
+        same_folder, shown
+    res_path, chain_path, assembly_path = folders
+    chain_name, assembly_name = names
+    foldings = {}
+
+    def folding(folder):
+        key = file_id(folder)
+        if key not in foldings:
+            foldings[key] = probe_folding(folder)
+        return foldings[key]
+
+    def of_list(frame, src, list_name):
+        # The inputs of one list, its structure files named with the list, as both lists' are checked together
+        return [(described if described == f"the {list_name}" else f"{described} of the {list_name}", path)
+                for described, path in list_inputs(frame, src, SrcLocation.file, list_name=list_name)]
+
+    chains = read_chain_list(src_chain_file)
+    refuse_repeated_names(chains, str(src_chain_file), CHAIN_LIST_DEFAULT_NAME)
+    chain_names, chain_rows = list(chains.item_name), row_labels(chains)
+    assembly_source = list_source(src_assembly_file, SrcLocation.file, "assembly list")
+    refuse_repeated_names(assemblies, assembly_source, ASSEMBLY_LIST_DEFAULT_NAME)
+    assembly_names, assembly_rows = list(assemblies.item_name), row_labels(assemblies)
+    # Every input of the run, which no step's output may replace: a list read by one step can be written over by
+    # another's output before it is read (the assembly list by the residue or chain step), or after (the chain list)
+    inputs = of_list(chains, src_chain_file, "chain list") + of_list(assemblies, src_assembly_file, "assembly list")
+    # Chains that differ only as the folder does not tell apart (A and a of one structure): complete-embedding names
+    # them <structure name>.<chain ID>, and its residue step writes pt files, so only another folder keeps them apart
+    named = "complete-embedding names each chain <structure name>.<chain ID>"
+    steps = [
+        ("--output-res-path", "residue", res_path, check_outputs(
+            res_path, OutFormat.pt, None, names=chain_names, labels=chain_rows, source=str(src_chain_file),
+            inputs=inputs, folding=folding(res_path),
+            folded_advice=f"give --output-res-path a folder of a file system that tells {{apart}} apart ({named}, "
+                          f"and its residue step writes pt files)")),
+        ("--output-chain-path", "chain", chain_path, check_outputs(
+            chain_path, output_format, chain_name, names=chain_names, labels=chain_rows, source=str(src_chain_file),
+            inputs=inputs, folding=folding(chain_path), stem_what="--output-chain-name",
+            folded_advice=f"give --output-chain-path a folder of a file system that tells {{apart}} apart, or use "
+                          f"--output-format parquet or json ({named})")),
+        ("--output-assembly-path", "assembly", assembly_path, check_outputs(
+            assembly_path, output_format, assembly_name, names=assembly_names, labels=assembly_rows,
+            source=assembly_source, folding=folding(assembly_path), stem_what="--output-assembly-name",
+            inputs=inputs)),
+    ]
+    refuse_assemblies_over_residues(assembly_names, assemblies.stream_name, out_folder=assembly_path,
+                                    out_format=output_format, res_folder=res_path, res_format=OutFormat.pt,
+                                    source=assembly_source, labels=assembly_rows)
+    for k, (option, step, folder, outputs) in enumerate(steps):
+        for other_option, other_step, other_folder, other_outputs in steps[k + 1:]:
+            if not same_folder(folder, other_folder):
+                continue
+            shared = outputs.shared_with(other_outputs)
+            if shared:
+                hint = ("an --output-format other than pt (residue embeddings are pt files)" if step == "residue"
+                        else "other names (--output-chain-name and --output-assembly-name for parquet and json, "
+                             "the lists' embedding names for csv and pt)")
+                raise RefusalError(
+                    f"{option} and {other_option} are one folder ({folder}), in which complete-embedding's {step} and "
+                    f"{other_step} embeddings would share {len(shared)} file(s): {shown(shared)}. Each step would "
+                    f"replace the other's files: give the steps different folders, or {hint}."
+                )
 
 
 def _refuse_other_embedding_names(src_chain_file: Path):

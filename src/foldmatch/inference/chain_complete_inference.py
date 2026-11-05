@@ -11,7 +11,8 @@ from lightning import Trainer
 
 from foldmatch.dataset.esm_prot_from_fasta import EsmProtFromFasta
 from foldmatch.dataset.esm_prot_from_structure import EsmProtFromStructure
-from foldmatch.inference.utils import is_distributed
+from foldmatch.dataset.utils import list_source, row_labels
+from foldmatch.inference.utils import is_distributed, list_inputs
 from foldmatch.modules.chain_complete_module import ChainCompleteModule
 from foldmatch.search import scoring_system as _ss
 from foldmatch.search.residue_shards import QUERY_ENCODING, check_residue_output
@@ -20,6 +21,7 @@ from foldmatch.types.api_types import StructureFormat, Accelerator, Devices, Str
 from foldmatch.utils.data import identity_collate
 from foldmatch.utils.dist import launch_rank, srun_step_id
 from foldmatch.utils.model import get_residue_model, get_aggregator_model
+from foldmatch.utils.output_files import check_outputs
 from foldmatch.utils.sequence import FastaPreflight, preflight_fasta
 from foldmatch.writer.batch_writer import ParquetBatchWriter, JsonStorage, TensorBatchWriter, CsvBatchWriter
 
@@ -63,6 +65,12 @@ def predict(
     residue_output = check_residue_output(residue_output)
     residue_head = None
     prepared = None
+    if src_from == SrcEsmFrom.fasta:
+        # Before any model: the output name names files of the output folder, and none of them is the FASTA file
+        # (P9.N; the ids, and so the files of csv and pt output, are fm-embedding's to check)
+        fasta = src_stream.path if isinstance(src_stream, FastaPreflight) else src_stream
+        check_outputs(out_folder, out_format, out_name, source=str(fasta),
+                      inputs=[("the FASTA file", fasta)] if isinstance(fasta, (str, os.PathLike)) else ())
     if residue_output is not None:
         prepared = check_residue_pass(residue_output, scoring_system, src_from=src_from, out_folder=out_folder,
                                       out_format=out_format, num_nodes=num_nodes)
@@ -95,6 +103,13 @@ def predict(
         min_res_n=min_res_n
     )
 
+    if src_from == SrcEsmFrom.structure:
+        # Before the models: each structure's outputs, <embedding name>.<chain ID>, name files of their own in
+        # out_folder, and none an input (P9.N)
+        data = inference_set.data.sort_index()  # in input order
+        check_outputs(out_folder, out_format, out_name, prefixes=list(data.item_name), separator=".",
+                      labels=row_labels(data), source=list_source(src_stream, src_location, "structure list"),
+                      inputs=list_inputs(data, src_stream, src_location, list_name="structure list"))
     logger.info(f"{src_from.name}-inference set running as iterator")
 
     inference_dataloader = DataLoader(

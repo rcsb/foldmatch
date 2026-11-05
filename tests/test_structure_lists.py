@@ -109,9 +109,8 @@ _LISTS = {
     ),
 }
 _READERS = {
-    _STRUCTURE_LIST: ("read_structure_list", "read_structure_list keep_default_na=False", "EsmProtFromStructure",
-                      "EsmAssemblyFromStructure", "ResidueEmbeddingFromStructure",
-                      "ResidueAssemblyDatasetFromStructure"),
+    _STRUCTURE_LIST: ("read_structure_list", "EsmProtFromStructure", "EsmAssemblyFromStructure",
+                      "ResidueEmbeddingFromStructure", "ResidueAssemblyDatasetFromStructure"),
     _RESIDUE_FILE_LIST: ("read_residue_file_list", "ResidueEmbeddingFromTensorFile"),
 }
 # A row of one element too many, and a list whose rows are longer still
@@ -246,8 +245,6 @@ class _ListCase(unittest.TestCase):
         """The read functions and the 5 readers (_READERS), each a callable that reads src, by name."""
         return {
             "read_structure_list": lambda: _read_structure_list(src, src_location),
-            "read_structure_list keep_default_na=False": lambda: _read_structure_list(src, src_location,
-                                                                                      keep_default_na=False),
             "EsmProtFromStructure": lambda: EsmProtFromStructure(src_stream=src, src_location=src_location),
             "EsmAssemblyFromStructure": lambda: EsmAssemblyFromStructure(src_stream=src, src_location=src_location),
             "ResidueEmbeddingFromStructure": lambda: ResidueEmbeddingFromStructure(
@@ -442,40 +439,37 @@ class EntryPointTest(_ListCase):
 
 
 class AsBeforeTest(_ListCase):
-    """Lists of at most that many fields per row read as before: the frames recorded from the readers of 8ded017, and
-    the streams of the commands."""
+    """Lists of at most that many fields per row read as before, but for P9.N's D5: the frames recorded from the readers
+    of 8ded017, and the streams of the commands. Since P9.N every reader reads NA, nan and null as text and a missing or
+    empty field as '' (before, ResidueEmbeddingFromStructure, ResidueAssemblyDatasetFromStructure and
+    ResidueEmbeddingFromTensorFile read them as NaN), and a missing or empty embedding name is the structure name, or
+    the residue file's name without its extension (before, '' or NaN)."""
 
-    # (case, structure list, the rows of EsmProtFromStructure's and EsmAssemblyFromStructure's frame,
-    # keep_default_na=False and no sort; the rows of ResidueEmbeddingFromStructure's and
-    # ResidueAssemblyDatasetFromStructure's, pandas' default NA values and sorted by structure name; that frame's index)
+    # (case, structure list, the rows of EsmProtFromStructure's and EsmAssemblyFromStructure's frame, in input order;
+    # the index of ResidueEmbeddingFromStructure's and ResidueAssemblyDatasetFromStructure's, sorted by structure name)
     STRUCTURE_LISTS = (
         ("rows of 1, 2 and 3 fields", "c,f.cif,c-n\nb,f.cif\na\n",
-         [["c", "f.cif", "c-n"], ["b", "f.cif", ""], ["a", "", ""]],
-         [["a", None, None], ["b", "f.cif", None], ["c", "f.cif", "c-n"]], [2, 1, 0]),
+         [["c", "f.cif", "c-n"], ["b", "f.cif", "b"], ["a", "", "a"]], [2, 1, 0]),
         ("an empty 3rd field and NA", "b,f.cif,\nNA,g.cif,a-n\na,NA,NA\n",
-         [["b", "f.cif", ""], ["NA", "g.cif", "a-n"], ["a", "NA", "NA"]],
-         [["a", None, None], ["b", "f.cif", None], [None, "g.cif", "a-n"]], [2, 0, 1]),
+         [["b", "f.cif", "b"], ["NA", "g.cif", "a-n"], ["a", "NA", "NA"]], [1, 2, 0]),
         ("a byte-order mark and CRLF", "﻿b,f.cif,b-n\r\na,g.cif,a-n\r\n",
-         [["b", "f.cif", "b-n"], ["a", "g.cif", "a-n"]],
-         [["a", "g.cif", "a-n"], ["b", "f.cif", "b-n"]], [1, 0]),
+         [["b", "f.cif", "b-n"], ["a", "g.cif", "a-n"]], [1, 0]),
         ("quoted fields", 'b,"f,1.cif","n,1"\n"a\nz",g.cif,\n',
-         [["b", "f,1.cif", "n,1"], ["a\nz", "g.cif", ""]],
-         [["a\nz", "g.cif", None], ["b", "f,1.cif", "n,1"]], [1, 0]),
+         [["b", "f,1.cif", "n,1"], ["a\nz", "g.cif", "a\nz"]], [1, 0]),
         ("blank lines", "\nb,f.cif,b-n\n\n  \n\t\na,g.cif,a-n\n\n",
-         [["b", "f.cif", "b-n"], ["a", "g.cif", "a-n"]],
-         [["a", "g.cif", "a-n"], ["b", "f.cif", "b-n"]], [1, 0]),
-        ("an empty file", "", [], [], []),
+         [["b", "f.cif", "b-n"], ["a", "g.cif", "a-n"]], [1, 0]),
+        ("an empty file", "", [], []),
     )
     # (case, residue file list, the rows of ResidueEmbeddingFromTensorFile's frame, sorted by file; its index)
     RESIDUE_FILE_LISTS = (
         ("rows of 1 and 2 fields", "c.pt,c-n\nb.pt\na.pt,a-n\n",
-         [["a.pt", "a-n"], ["b.pt", None], ["c.pt", "c-n"]], [2, 1, 0]),
+         [["a.pt", "a-n"], ["b.pt", "b"], ["c.pt", "c-n"]], [2, 1, 0]),
         ("an empty 2nd field and NA", "b.pt,\nNA,a-n\na.pt,NA\n",
-         [["a.pt", None], ["b.pt", None], [None, "a-n"]], [2, 0, 1]),
+         [["NA", "a-n"], ["a.pt", "NA"], ["b.pt", "b"]], [1, 2, 0]),
         ("a byte-order mark and CRLF", "﻿b.pt,b-n\r\na.pt,a-n\r\n",
          [["a.pt", "a-n"], ["b.pt", "b-n"]], [1, 0]),
         ("quoted fields", 'b.pt,"n,1"\n"a\nz.pt",\n',
-         [["a\nz.pt", None], ["b.pt", "n,1"]], [1, 0]),
+         [["a\nz.pt", "a\nz"], ["b.pt", "n,1"]], [1, 0]),
         ("blank lines", "\nb.pt,b-n\n\n  \n\t\na.pt,a-n\n\n",
          [["a.pt", "a-n"], ["b.pt", "b-n"]], [1, 0]),
         ("an empty file", "", [], []),
@@ -492,9 +486,10 @@ class AsBeforeTest(_ListCase):
         self.assertEqual(ResidueEmbeddingFromTensorFile.COLUMNS, RESIDUE_FILE_LIST_COLUMNS)
 
     def test_the_structure_readers_read_them_as_before(self):
-        """The 4 readers' frames, from a path, an open file and a text buffer, each with its NA handling and sort."""
-        for case, text, kept, rows, index in self.STRUCTURE_LISTS:
+        """The 4 readers' frames, from a path, an open file and a text buffer, each with its sort."""
+        for case, text, kept, index in self.STRUCTURE_LISTS:
             path = self.list_file(case, text)
+            rows = [kept[k] for k in index]
             for source, make, _ in self.sources(_STRUCTURE_LIST, path, text):
                 for reader, expected in (
                         ("EsmProtFromStructure", _expected(kept, list(range(len(kept))), _STRUCTURE_COLUMNS)),
@@ -512,8 +507,8 @@ class AsBeforeTest(_ListCase):
 
     def test_the_residue_file_reader_reads_them_as_before(self):
         """ResidueEmbeddingFromTensorFile's frame, from a path, an open file and a text buffer: its names as strings
-        where they are not numeric (D3 changes nothing there), an empty name or NA as NaN. An empty file's columns were
-        of object type on pandas 3: NamesTest."""
+        where they are not numeric (D3 changes nothing there), NA as text and an empty name the file's name without its
+        extension (P9.N). An empty file's columns were of object type on pandas 3: NamesTest."""
         for case, text, rows, index in self.RESIDUE_FILE_LISTS:
             path = self.list_file(case, text)
             for source, make, _ in self.sources(_RESIDUE_FILE_LIST, path, text):
@@ -530,18 +525,13 @@ class AsBeforeTest(_ListCase):
     def test_the_read_functions(self):
         """read_structure_list and read_residue_file_list: the frame of the readers' pandas call on 8ded017, in input
         order, its index pandas' (0, 1, ...). A residue file list's empty file: columns of strings (NamesTest)."""
-        for case, text, kept, rows, index in self.STRUCTURE_LISTS:
+        for case, text, kept, index in self.STRUCTURE_LISTS:
             path = self.list_file(case, text)
             for source, src in (("path", path), ("text buffer", None)):
-                with self.subTest(case=case, source=source, keep_default_na=False):
-                    data = _read_structure_list(src or io.StringIO(text), keep_default_na=False)
+                with self.subTest(case=case, source=source):
+                    data = _read_structure_list(src or io.StringIO(text))
                     pd.testing.assert_frame_equal(data, _expected(kept, list(range(len(kept))), _STRUCTURE_COLUMNS),
                                                   check_exact=True)
-                    self.assertIsInstance(data.index, pd.RangeIndex)
-                with self.subTest(case=case, source=source, keep_default_na=True):
-                    data = _read_structure_list(src or io.StringIO(text))
-                    pd.testing.assert_frame_equal(
-                        data, _expected(_unsorted(rows, index), sorted(index), _STRUCTURE_COLUMNS), check_exact=True)
                     self.assertIsInstance(data.index, pd.RangeIndex)
         for case, text, rows, index in self.RESIDUE_FILE_LISTS:
             path = self.list_file(case, text)
@@ -577,7 +567,7 @@ class AsBeforeTest(_ListCase):
                 ("(stem, Path, stem)", lambda: reversed_paths, as_read, [1, 0]),
                 ("a generator", lambda: iter(reversed_paths), as_read, [1, 0]),
                 ("short rows and None", lambda: [("b", "g.cif"), ("a", None, "x"), ("c",)],
-                 [["b", "g.cif", None], ["a", None, "x"], ["c", None, None]], [1, 0, 2]),
+                 [["b", "g.cif", "b"], ["a", None, "x"], ["c", None, "c"]], [1, 0, 2]),
                 ("an empty list", lambda: [], [], [])):
             with self.subTest(case=case):
                 self.assert_structure_stream(make, rows, index)
@@ -597,7 +587,7 @@ class AsBeforeTest(_ListCase):
             pd.testing.assert_frame_equal(
                 self.frame("ResidueEmbeddingFromTensorFile", [("b.pt", "n"), ("a.pt",), ("c.pt", None)],
                            SrcLocation.stream),
-                _expected([["a.pt", None], ["b.pt", "n"], ["c.pt", None]], [1, 0, 2], _RESIDUE_FILE_COLUMNS),
+                _expected([["a.pt", "a"], ["b.pt", "n"], ["c.pt", "c"]], [1, 0, 2], _RESIDUE_FILE_COLUMNS),
                 check_exact=True)
 
     def test_to_csv_without_the_index(self):
@@ -765,8 +755,8 @@ class ConventionalListTest(_StubModels):
 
 
 class NamesTest(_StubModels):
-    """D3: the residue file list is read as strings, as every other list is, its names keeping their spelling. An empty
-    name stays NaN (default NA values kept)."""
+    """D3: the residue file list is read as strings, as every other list is, its names keeping their spelling. Since
+    P9.N (D5), NA is a name and an empty name is the file's name without its extension (before, NaN)."""
 
     def setUp(self):
         super().setUp()
@@ -837,24 +827,23 @@ class NamesTest(_StubModels):
         self.assert_files(self.predict(("1", "2"), OutFormat.csv), {"1.csv": _csv(self.a), "2.csv": _csv(self.b)})
         self.assertEqual(sorted(f.name for f in self.predict(("1", "2"), OutFormat.pt).iterdir()), ["1.pt", "2.pt"])
 
-    def test_an_empty_name_is_nan(self):
-        """As before: an empty name or NA next to a text name is NaN, and names the file nan.csv."""
-        for names in (("x", ""), ("x", "NA")):
+    def test_an_empty_name_is_the_file_name(self):
+        """P9.N: an empty name is the file's name without its extension, b.csv (before, NaN, the file nan.csv), and NA
+        is a name, NA.csv (before, NaN too)."""
+        for names, files in ((("x", ""), ("x.csv", "b.csv")), (("x", "NA"), ("x.csv", "NA.csv"))):
             with self.subTest(names=names):
                 dataset = ResidueEmbeddingFromTensorFile(src_stream=self.names_list(*names))
-                self.assertEqual(dataset.data.item_name.iloc[0], "x")
-                self.assertTrue(pd.isna(dataset.data.item_name.iloc[1]))
-                self.assert_files(self.predict(names, OutFormat.csv), {"x.csv": _csv(self.a), "nan.csv": _csv(self.b)})
+                self.assertEqual(list(dataset.data.item_name), [names[0], files[1][:-4]])
+                self.assert_files(self.predict(names, OutFormat.csv), {files[0]: _csv(self.a), files[1]: _csv(self.b)})
 
     def test_an_integer_next_to_an_empty_name(self):
-        """An integer keeps its spelling next to an empty name, which is NaN: 1.csv and nan.csv (before, 1.0.csv)."""
-        self.assert_files(self.predict(("1", ""), OutFormat.csv), {"1.csv": _csv(self.a), "nan.csv": _csv(self.b)})
+        """An integer keeps its spelling next to an empty name: 1.csv and b.csv (before, 1.0.csv, then nan.csv)."""
+        self.assert_files(self.predict(("1", ""), OutFormat.csv), {"1.csv": _csv(self.a), "b.csv": _csv(self.b)})
 
     def test_the_empty_name_column_is_of_strings(self):
-        """Empty names only: NaN in a column of strings (before, of floats)."""
+        """Empty names only: the files' names, in a column of strings (before, NaN; before that, floats)."""
         data = ResidueEmbeddingFromTensorFile(src_stream=self.names_list("", "")).data
-        self.assertTrue(data.item_name.isna().all())
-        pd.testing.assert_frame_equal(data, _expected([[f"{self.tmp}/a.pt", None], [f"{self.tmp}/b.pt", None]], [0, 1],
+        pd.testing.assert_frame_equal(data, _expected([[f"{self.tmp}/a.pt", "a"], [f"{self.tmp}/b.pt", "b"]], [0, 1],
                                                       _RESIDUE_FILE_COLUMNS), check_exact=True)
 
     def test_an_empty_file_is_of_strings(self):

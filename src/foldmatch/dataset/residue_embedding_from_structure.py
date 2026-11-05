@@ -4,7 +4,8 @@ from pathlib import Path
 from tqdm import tqdm
 
 from foldmatch.dataset.residue_embedding_from_tensor_file import ResidueEmbeddingFromTensorFile
-from foldmatch.dataset.utils import get_structure_location, read_structure_list, refuse_shared_names
+from foldmatch.dataset.utils import STRUCTURE_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_structure_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import SrcLocation, StructureLocation, StructureFormat, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
@@ -46,11 +47,14 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
 
     def __get_chains(self, src_stream):
         chains = []
-        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
+        # embedding name is the structure name, and an embedding name given to more than one row is refused
         data = read_structure_list(src_stream, self.src_location)
         data = data.sort_values(by=data.columns[0])
         refuse_shared_names(data, ResidueEmbeddingFromStructure.STREAM_NAME_ATTR,
                             ResidueEmbeddingFromStructure.STREAM_ATTR)
+        refuse_repeated_names(data, list_source(src_stream, self.src_location, "structure list"),
+                              STRUCTURE_LIST_DEFAULT_NAME)
         progress = tqdm(data.iterrows(), total=len(data), desc="Loading structures")
         for idx, row in progress:
             src_name = row[ResidueEmbeddingFromStructure.STREAM_NAME_ATTR]

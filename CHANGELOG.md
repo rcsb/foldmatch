@@ -752,14 +752,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   elements with pandas' `ValueError`. Any other pandas `ParserError` (an
   unclosed quote, say) is refused the same way, with pandas' message. Lists
   of at most 4 fields per row are read as before. `complete-embedding` now
-  reads an assembly list in a regular file before its residue step, so such a
-  list, or one that gives one structure name to two files, is refused before
-  the ESM3 step instead of after its chain step, which had written the
-  residue and chain embeddings. A list given as a pipe (a named pipe, or
-  `<(...)` on macOS), or on macOS as `/dev/stdin` or `/dev/fd/N` (even of a
-  regular file), which can be read once only, or at any other path under
-  `/dev` (a file in `/dev/shm`, say), is read by the assembly step alone, as
-  before, and a longer row is refused there, after the chain step. The help
+  reads its assembly list before its residue step, so such a list, or one
+  that gives one structure name to two files, is refused before the ESM3
+  step instead of after its chain step, which had written the residue and
+  chain embeddings. A list given as a pipe (a named pipe, or `<(...)` on
+  macOS), or on macOS as `/dev/stdin` or `/dev/fd/N` (even of a regular
+  file), which can be read once only, or at any other path under `/dev` (a
+  file in `/dev/shm`, say), is read once, into memory, and its text given to
+  the assembly step. The help
   of `--src-file` and `--src-assembly-file` describes the columns.
 - **BREAKING — a structure list or residue file list row of too many fields
   is refused.** A structure list holds 3 fields per row (structure name,
@@ -819,8 +819,63 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `--output-chain-path` and `--output-assembly-path`, the assembly file
   replaced the chain file. Both are now kept. In any folder, the default
   assembly file is now `assembly-inference-<rank>.parquet` or `.json.gz`: read
-  it under that name, or pass `--output-assembly-name chain-inference` to keep
-  the old one. Output in `csv` or `pt` does not use the name.
+  it under that name. Output in `csv` or `pt` does not use the name.
+- **BREAKING — every row of a list has an embedding name of its own.** The
+  chain lists, assembly lists, structure lists and residue file lists of
+  `inference` and of the library (`read_chain_list`, `read_assembly_list`,
+  `read_structure_list`, `read_residue_file_list` and the readers built on
+  them) read `NA`, `nan`, `null` and pandas' other NA words as text, and a
+  missing or empty field as `''`, as chain lists already did; and a missing or
+  empty embedding name is a default, as in chain lists
+  (`<structure name>.<chain ID>`): `<structure name>-<assembly ID>` in an
+  assembly list, the structure name in a structure list, the residue file's
+  name without its extension in a residue file list (`x` for `x.pt`). Before,
+  such a name was NaN, which gave the file `nan.csv` (every unnamed row of an
+  assembly list into that one file), the id `nan` in JSON, an
+  `ArrowTypeError` in Parquet, or, in a structure list, hidden files `.A.csv`
+  shared by every unnamed structure. A name given to more than one row is now
+  refused (`RefusalError`, naming the names and their rows), in every output
+  format and before any model is built: with `csv` or `pt` each row replaced
+  the one before, and in Parquet and JSON the rows could not be told apart
+  (the assembly readers keep one). `read_structure_list` no longer takes
+  `keep_default_na`. A list that relied on NaN names, or repeated a name, must
+  give each row its own name.
+- **BREAKING — an `inference` run refuses outputs that would replace each
+  other or its inputs, before any model is built** (`RefusalError`, exit
+  status 1). With `--output-format csv` or `pt`, an embedding name is a file
+  name: one that is empty, `.` or `..`, holds `/` or NUL, or makes a file
+  name over 255 bytes is refused (`../x` wrote outside the output folder), and
+  so are two names that the output folder takes for one file (`A` and `a`,
+  or `straße` and `strasse`, on macOS's case-insensitive file system; a
+  case-sensitive folder keeps both), the names of a structure list's rows
+  (`<name>.<chain ID>`) included. A folder that cannot be written is probed
+  on the names it holds.
+  `--output-name`, `--output-chain-name` and `--output-assembly-name` follow
+  the same rules in every format (`<name>-<rank>.parquet`, a 6-digit rank
+  reserved). No output may be an input of its run: the list file, a structure
+  file of the list, or a residue embedding the run reads.
+  `chain-embedding` refuses an `--output-folder` that is
+  `--res-embedding-location` when `--output-format` is
+  `--res-embedding-format` (each chain embedding replaced the residue
+  embedding it was computed from); `assembly-embedding` refuses, in that same
+  case, an assembly name `<structure name>.<anything>`, which can be a residue
+  embedding's name (`1acb-1` is fine); `chain_inference.predict` refuses a
+  Parquet input in `out_folder` named like its Parquet output. Folders, and
+  inputs and output files joined by a link, are compared as files: a
+  symbolic link to the folder is the folder, and a residue embedding linked
+  (symbolic or hard link) from another folder to an output's file, or an
+  output's file linked to it, is that file.
+  `complete-embedding` checks all three steps before its residue step, and
+  refuses two steps that would write one file: the residue and chain
+  embeddings in one folder with `--output-format pt` (the chain step replaced
+  its own input and the assembly step failed), or one name for
+  `--output-chain-name` and `--output-assembly-name` with Parquet or JSON in
+  one folder; and an output of any step over either list or a structure file
+  of either. An assembly list that can be read once (a pipe, `/dev/fd/N`) is
+  read once, before the residue step, and checked as one in a regular file is
+  (before, it was not checked against the other steps). Files of earlier runs
+  are not checked: a rerun into the same folders replaces its own earlier
+  files, as before.
 
 ### Fixed
 
@@ -1129,6 +1184,18 @@ While the major version is `0`, breaking changes are released in a minor bump.
   they now name the default and say what each format writes. `chain-embedding`
   and `assembly-embedding` also name the CSV residue embeddings they read
   (`--res-embedding-format`).
+- **`inference` runs that destroyed their own output or input, with exit
+  status 0.** Two rows of one embedding name kept the last row's embedding
+  only; unnamed assemblies all went to `nan.csv`; an embedding name `../x`
+  replaced a file outside the output folder; `chain-embedding` into its
+  residue folder, in the residue format, replaced every residue embedding by a
+  chain vector; `complete-embedding` with `--output-format pt` and one folder
+  for residues and chains did the same, then failed in its assembly step; and
+  the recipe of P9.H2, `--output-assembly-name chain-inference` with one
+  folder for chains and assemblies, brought back the loss it fixed. All are
+  now refused before any model is built (see *BREAKING — an `inference` run
+  refuses outputs that would replace each other or its inputs* and *BREAKING
+  — every row of a list has an embedding name of its own*).
 
 ## [0.8.0] - 2026-07-21
 

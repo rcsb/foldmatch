@@ -8,7 +8,8 @@ from esm.utils.structure.protein_chain import ProteinChain
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
-from foldmatch.dataset.utils import get_structure_location, read_chain_list, refuse_shared_names
+from foldmatch.dataset.utils import CHAIN_LIST_DEFAULT_NAME, get_structure_location, list_source, read_chain_list, \
+    refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import StructureFormat, StructureLocation, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
 from foldmatch.utils.structure_parser import rename_atom_attr, filter_residues, protein_chain_iter
@@ -43,6 +44,8 @@ class EsmProtFromChain(Dataset):
         self.data = read_chain_list(src_stream, self.src_location)
         self.data = self.data.sort_values(by=self.data.columns[0])
         refuse_shared_names(self.data, EsmProtFromChain.STREAM_NAME_ATTR, EsmProtFromChain.STREAM_ATTR)
+        refuse_repeated_names(self.data, list_source(src_stream, self.src_location, "chain list"),
+                              CHAIN_LIST_DEFAULT_NAME)
 
     def __len__(self):
         return len(self.data)

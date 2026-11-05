@@ -7,12 +7,14 @@ from lightning import Trainer
 
 from foldmatch.dataset.esm_prot_from_structure import EsmProtFromStructure
 from foldmatch.dataset.esm_prot_from_chain import EsmProtFromChain
-from foldmatch.inference.utils import refuse_min_res_n
+from foldmatch.dataset.utils import list_source, row_labels
+from foldmatch.inference.utils import list_inputs, refuse_min_res_n
 from foldmatch.modules.esm_module import EsmModule
 from foldmatch.types.api_types import StructureFormat, Accelerator, Devices, Strategy, \
     SrcProteinFrom, FileOrStreamTuple, SrcLocation, OutFormat
 from foldmatch.utils.data import identity_collate
 from foldmatch.utils.model import get_residue_model
+from foldmatch.utils.output_files import check_outputs
 from foldmatch.writer.batch_writer import TensorBatchWriter, CsvBatchWriter, ParquetBatchWriter, JsonStorage
 
 
@@ -47,6 +49,13 @@ def predict(
         structure_format=structure_format,
         min_res_n=min_res_n
     )
+    # Before the model: each output names a file of its own in out_folder, and none an input (P9.N)
+    data = inference_set.data.sort_index()  # in input order
+    list_name = "chain list" if src_from == SrcProteinFrom.chain else "structure list"
+    check_outputs(out_folder, out_format, out_name, source=list_source(src_stream, src_location, list_name),
+                  labels=row_labels(data), inputs=list_inputs(data, src_stream, src_location, list_name=list_name),
+                  **({"names": list(data.item_name)} if src_from == SrcProteinFrom.chain else
+                     {"prefixes": list(data.item_name), "separator": "."}))
     if hasattr(inference_set, '__len__'):
         logger.info(f"esm-inference set contains {len(inference_set)} samples")
     else:

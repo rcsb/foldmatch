@@ -6,7 +6,8 @@ from esm.sdk.api import ESMProtein
 from esm.utils.structure.protein_chain import ProteinChain
 from torch.utils.data import IterableDataset, get_worker_info
 
-from foldmatch.dataset.utils import get_structure_location, read_structure_list, refuse_shared_names
+from foldmatch.dataset.utils import STRUCTURE_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_structure_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
 from foldmatch.utils.structure_parser import protein_chain_iter, rename_atom_attr, filter_residues, get_assemblies
@@ -39,9 +40,12 @@ class EsmAssemblyFromStructure(IterableDataset):
         self.__load_stream(src_stream)
 
     def __load_stream(self, src_stream):
-        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused
-        self.data = read_structure_list(src_stream, self.src_location, keep_default_na=False)
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
+        # embedding name is the structure name, and an embedding name given to more than one row is refused
+        self.data = read_structure_list(src_stream, self.src_location)
         refuse_shared_names(self.data, EsmAssemblyFromStructure.STREAM_NAME_ATTR, EsmAssemblyFromStructure.STREAM_ATTR)
+        refuse_repeated_names(self.data, list_source(src_stream, self.src_location, "structure list"),
+                              STRUCTURE_LIST_DEFAULT_NAME)
 
     def __iter__(self):
         # Handle multiple workers by splitting data across workers

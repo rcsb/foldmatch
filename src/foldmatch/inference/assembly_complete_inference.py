@@ -8,12 +8,14 @@ from torch.utils.data import DataLoader
 from lightning import Trainer
 
 from foldmatch.dataset.esm_assembly_from_structure import EsmAssemblyFromStructure
-from foldmatch.inference.utils import is_distributed
+from foldmatch.dataset.utils import list_source, row_labels
+from foldmatch.inference.utils import is_distributed, list_inputs
 from foldmatch.modules.assembly_complete_module import AssemblyCompleteModule
 from foldmatch.types.api_types import StructureFormat, Accelerator, Devices, Strategy, \
     FileOrStreamTuple, SrcLocation, OutFormat
 from foldmatch.utils.data import identity_collate
 from foldmatch.utils.model import get_residue_model, get_aggregator_model
+from foldmatch.utils.output_files import check_outputs
 from foldmatch.writer.batch_writer import ParquetBatchWriter, JsonStorage, TensorBatchWriter, CsvBatchWriter
 
 
@@ -43,6 +45,12 @@ def predict(
         min_res_n=min_res_n
     )
 
+    # Before the models: each structure's outputs, <embedding name>-<assembly ID>, name files of their own in
+    # out_folder, and none an input (P9.N)
+    data = inference_set.data.sort_index()  # in input order
+    check_outputs(out_folder, out_format, out_name, prefixes=list(data.item_name), separator="-",
+                  labels=row_labels(data), source=list_source(src_stream, src_location, "structure list"),
+                  inputs=list_inputs(data, src_stream, src_location, list_name="structure list"))
     logger.info("assembly-inference set running as iterator")
 
     inference_dataloader = DataLoader(

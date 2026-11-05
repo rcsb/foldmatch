@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -10,6 +11,8 @@ from foldmatch.modules.esm_module import EsmModule
 from foldmatch.types.api_types import Accelerator, Devices, Strategy, OutFormat
 from foldmatch.utils.data import identity_collate
 from foldmatch.utils.model import get_residue_model
+from foldmatch.utils.output_files import check_outputs
+from foldmatch.utils.sequence import FastaPreflight
 from foldmatch.writer.batch_writer import TensorBatchWriter, CsvBatchWriter, ParquetBatchWriter, JsonStorage
 
 
@@ -29,6 +32,11 @@ def predict(
 ):
     logger = logging.getLogger(__name__)
 
+    # Before the model: the output name names files of the output folder, and none of them is the FASTA file (P9.N;
+    # the ids, and so the files of csv and pt output, are fm-embedding's to check)
+    fasta = fasta_file.path if isinstance(fasta_file, FastaPreflight) else fasta_file
+    check_outputs(out_folder, out_format, out_name, source=str(fasta),
+                  inputs=[("the FASTA file", fasta)] if isinstance(fasta, (str, os.PathLike)) else ())
     inference_set = EsmProtFromFasta(
         fasta_file=fasta_file,
         min_res_n=min_res_n

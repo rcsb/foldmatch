@@ -4,13 +4,14 @@ The assembly lists of inference assembly-embedding and complete-embedding (--src
 library's ResidueAssemblyEmbeddingFromTensorFile and ResidueAssemblyEmbeddingFromParquet are CSV without a header, of
 structure name, structure file or URL, assembly ID and embedding name, read by read_assembly_list. A row of more than 4
 fields is refused (RefusalError), from a file and from a stream, naming the file or the stream and the row, as
-read_chain_list refuses one, and so by both commands before any model is built: complete-embedding now reads an assembly
-list in a regular file before its residue step (a pipe, /dev/stdin or /dev/fd/N, which can be read once, only in its
-assembly step, as before). Before, pandas read the leading fields of a first such row as the index, which shifted the
-columns of every row (a trailing comma was enough), stopped at a later one with a ParserError that named no file, and
-refused a stream row of 5 elements with its ValueError; complete-embedding read its assembly list only in its assembly
-step, after its residue and chain steps had written their files. Lists of at most 4 fields per row are read as before
-(pandas' default NA values kept: an empty field or NA is NaN).
+read_chain_list refuses one, and so by both commands before any model is built: complete-embedding now reads its
+assembly list before its residue step (a pipe, /dev/stdin or /dev/fd/N, which can be read once, into memory, its text
+given to the assembly step: P9.N). Before, pandas read the leading fields of a first such row as the index, which
+shifted the columns of every row (a trailing comma was enough), stopped at a later one with a ParserError that named no
+file, and refused a stream row of 5 elements with its ValueError; complete-embedding read its assembly list only in its
+assembly step, after its residue and chain steps had written their files. Lists of at most 4 fields per row are read as
+before, but for P9.N's D5: NA is text, an empty field '' (before, NaN), and a missing or empty embedding name is
+<structure name>-<assembly ID>.
 
 ESM3 and the aggregator are never loaded: the commands run with stub models (_esm3, _aggregate, as in
 test_inference_follow_ups.py) or with model getters that fail if called."""
@@ -118,7 +119,7 @@ def _read_assembly_list(*args):
 
 
 def _expected(rows: list, index: list) -> pd.DataFrame:
-    """A frame of the assembly list columns, as strings, None read as NaN."""
+    """A frame of the assembly list columns, as strings (None: a stream's missing element)."""
     return pd.DataFrame(rows, index=pd.Index(index, dtype="int64"), columns=_COLUMNS, dtype=str)
 
 
@@ -308,24 +309,26 @@ class CommandTest(_AssemblyListCase):
             with self.subTest(command=command):
                 self.assertEqual(next(p.help for p in commands[command].params if p.name == option),
                                  "CSV file of 4 columns, no header: Structure Name | Structure File Path or URL | "
-                                 "Assembly Id | Embedding Name.")
+                                 "Assembly Id | Embedding Name, <Structure Name>-<Assembly Id> when the 4th column is "
+                                 "missing or empty. Each row needs its own Embedding Name.")
 
 
 class AsBeforeTest(_AssemblyListCase):
-    """Lists of at most 4 fields per row read as before: the frames recorded from the readers of 9763f44 (pandas' call
-    unchanged, then sorted by structure name), and complete-embedding's files with stub models, its assembly list in
-    a regular file, a pipe or /dev/fd/N."""
+    """Lists of at most 4 fields per row read as before, but for P9.N's D5: the frames recorded from the readers of
+    9763f44 (pandas' call unchanged but for keep_default_na=False, then sorted by structure name), NA as text, an empty
+    field as '' and a missing or empty embedding name as <structure name>-<assembly ID> (before, NaN); and
+    complete-embedding's files with stub models, its assembly list in a regular file, a pipe or /dev/fd/N."""
 
     # (case, assembly list, the rows of the readers' frame, its index)
     LISTS = (
         ("rows of 2, 3 and 4 fields", "c,f.cif,3,c-3\nb,f.cif\na,g.cif,2\n",
-         [["a", "g.cif", "2", None], ["b", "f.cif", None, None], ["c", "f.cif", "3", "c-3"]], [2, 1, 0]),
+         [["a", "g.cif", "2", "a-2"], ["b", "f.cif", "", "b-"], ["c", "f.cif", "3", "c-3"]], [2, 1, 0]),
         ("an empty 4th field and NA", "b,f.cif,1,\nNA,g.cif,NA,a-1\na,NA,2,NA\n",
-         [["a", None, "2", None], ["b", "f.cif", "1", None], [None, "g.cif", None, "a-1"]], [2, 0, 1]),
+         [["NA", "g.cif", "NA", "a-1"], ["a", "NA", "2", "NA"], ["b", "f.cif", "1", "b-1"]], [1, 2, 0]),
         ("a byte-order mark and CRLF", "﻿b,f.cif,1,b-1\r\na,g.cif,2,a-2\r\n",
          [["a", "g.cif", "2", "a-2"], ["b", "f.cif", "1", "b-1"]], [1, 0]),
         ("quoted fields", 'b,"f,1.cif",1,"n,1"\n"a\nz",g.cif,"2",\n',
-         [["a\nz", "g.cif", "2", None], ["b", "f,1.cif", "1", "n,1"]], [1, 0]),
+         [["a\nz", "g.cif", "2", "a\nz-2"], ["b", "f,1.cif", "1", "n,1"]], [1, 0]),
         ("blank lines", "\nb,f.cif,1,b-1\n\n  \n\t\na,g.cif,2,a-2\n\n",
          [["a", "g.cif", "2", "a-2"], ["b", "f.cif", "1", "b-1"]], [1, 0]),
         ("an empty file", "", [], []),
@@ -350,8 +353,8 @@ class AsBeforeTest(_AssemblyListCase):
         for reader in _READERS[1:]:
             with self.subTest(stream=reader):
                 data = self.readers(self.STREAM, SrcLocation.stream)[reader]().data
-                pd.testing.assert_frame_equal(data, _expected([["a", "g.cif", "2", "a-2"], ["b", "f.cif", "1", None],
-                                                               ["c", None, "3", None]], [1, 0, 2]), check_exact=True)
+                pd.testing.assert_frame_equal(data, _expected([["a", "g.cif", "2", "a-2"], ["b", "f.cif", "1", "b-1"],
+                                                               ["c", None, "3", "c-3"]], [1, 0, 2]), check_exact=True)
 
     def test_read_assembly_list_reads_them_as_pandas_did(self):
         """read_assembly_list: the frame of the readers' pandas call on 9763f44, in input order, its index pandas'
@@ -367,8 +370,8 @@ class AsBeforeTest(_AssemblyListCase):
         for container in (list, tuple, iter):
             with self.subTest(stream=container.__name__):
                 data = _read_assembly_list(container(self.STREAM), SrcLocation.stream)
-                pd.testing.assert_frame_equal(data, _expected([["b", "f.cif", "1", None], ["a", "g.cif", "2", "a-2"],
-                                                               ["c", None, "3", None]], [0, 1, 2]), check_exact=True)
+                pd.testing.assert_frame_equal(data, _expected([["b", "f.cif", "1", "b-1"], ["a", "g.cif", "2", "a-2"],
+                                                               ["c", None, "3", "c-3"]], [0, 1, 2]), check_exact=True)
 
     def assert_complete_embedding(self, assemblies: Path):
         """complete-embedding on a chain list of archive 1acb's chains A and B and these assemblies (1acb's assembly 1,
@@ -403,9 +406,9 @@ class AsBeforeTest(_AssemblyListCase):
     @unittest.skipUnless(hasattr(os, "mkfifo"), "a named pipe needs os.mkfifo")
     def test_complete_embedding_on_an_assembly_list_in_a_pipe(self):
         """D3': an assembly list given as a pipe (a named pipe here, or <(...) on macOS) can be read once:
-        complete-embedding does not read it before its residue step, as it reads one in a regular file, so its assembly
-        step reads it and writes the assembly embedding, as before (read before the residue step too, the assembly
-        step would find it empty and write nothing, with exit status 0)."""
+        complete-embedding reads it once, into memory, before its residue step, and gives its text to its assembly
+        step, which writes the assembly embedding, as before (read from the pipe a second time, the assembly step
+        would find it empty and write nothing, with exit status 0)."""
         fifo = self.tmp / "assemblies.fifo"
         os.mkfifo(fifo)
         stop = threading.Event()
@@ -420,9 +423,9 @@ class AsBeforeTest(_AssemblyListCase):
     @unittest.skipUnless(os.path.isdir("/dev/fd"), "/dev/fd/N needs /dev/fd")
     def test_complete_embedding_on_an_assembly_list_as_dev_fd(self):
         """D3'': on macOS, an assembly list in a regular file given as /dev/fd/N (or as /dev/stdin, which click makes
-        /dev/fd/0) can be read once, as open shares the descriptor's offset: complete-embedding does not read a list
-        under /dev before its residue step, so its assembly step reads it and writes the assembly embedding, as before
-        (read before the residue step too, the assembly step would find it empty and write nothing, with exit status
+        /dev/fd/0) can be read once, as open shares the descriptor's offset: complete-embedding reads a list under
+        /dev once, into memory, before its residue step, and its assembly step writes the assembly embedding, as before
+        (read from the path a second time, the assembly step would find it empty and write nothing, with exit status
         0)."""
         fd = os.open(self.assembly_list("assemblies", f"1acb,{_CIF},1,1acb-1\n"), os.O_RDONLY)
         try:
