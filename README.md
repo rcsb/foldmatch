@@ -190,6 +190,8 @@ fm-embedding download-models
 
 Assembly-level embeddings are only available under `from-structures` — there is no assembly concept for a bare sequence.
 
+Each FASTA record's embedding is stored under its id, the first word of its header, so `from-sequences` refuses a repeated id before ESM3 is loaded. With `--output-format csv` or `pt` (one file per record or chain), an id is a file name: one that holds `/` or cannot name a file, ids that the output folder takes for one file (`abc` and `ABC` on macOS's default file system), and a `--fasta-file` named like an output are refused too, and a run stops at a second write of one file (chains `A` and `a` of one structure on macOS). Parquet and JSON keep any id. A rerun into the same folder replaces its own files, as before.
+
 Run `fm-embedding [from-structures|from-sequences] [command] --help` for full options (batch size, accelerator, devices, output format, distributed settings, etc.).
 
 ### `fm-search` — build and query FAISS databases

@@ -103,8 +103,8 @@ def refuse_unusable_names(names: Sequence, suffix: str, *, source: str, labels: 
             return f"{name!r}{'' if label is None else f' ({label})'} {problem}"
         raise RefusalError(
             f"{source}: {len(bad)} {what}(s) that cannot name a file {pattern or '<name>' + suffix} in the output "
-            f"folder: {shown(bad, describe)}. Each {what} names its own file there: give {given} an {what} "
-            f"{_usable_rule(suffix)}."
+            f"folder: {shown(bad, describe)}. Each {what} names its own file there: give {given} "
+            f"{'an' if what[0] in 'aeiou' else 'a'} {what} {_usable_rule(suffix)}."
         )
 
 
@@ -504,15 +504,16 @@ def check_outputs(out_folder, out_format, out_name, *, names: Optional[Sequence]
                   labels: Optional[Sequence] = None, source: str = "The input", prefixes: Optional[Sequence] = None,
                   separator: str = ".", inputs: Iterable[Tuple[str, object]] = (),
                   folding: Optional[Folding] = None, stem_what: str = "The output name",
+                  what: str = "embedding name", given: str = "those rows",
                   folded_advice: Optional[str] = None) -> Optional[OutputFiles]:
     """The checks of one output of a run, before any model is built (RefusalError): the output name ``out_name`` names
     files of the folder, whatever the format (D1); for csv and pt, each of ``names`` names one file ``<name>.<format>``
     (D1) of its own, as the folder compares names (D3), and each of ``prefixes`` names the files
     ``<prefix><separator><ID>.<format>`` of items known only once their structure is read, prefixes that the folder
     takes for one refused too; and no input (described, path) is one of the output files (D2). ``stem_what`` names the
-    output name in a refusal, ``folded_advice`` what keeps names apart that the folder takes for one
-    (repeated_files_message); ``folding`` is the folder's, when known. The output's files, or None without
-    ``out_folder``."""
+    output name in a refusal, ``what`` a name and ``given`` what holds them, ``folded_advice`` what keeps names apart
+    that the folder takes for one (repeated_files_message); ``folding`` is the folder's, when known. The output's
+    files, or None without ``out_folder``."""
     if out_folder is None:
         return None
     fmt = format_value(out_format)
@@ -525,14 +526,14 @@ def check_outputs(out_folder, out_format, out_name, *, names: Optional[Sequence]
         suffix = f".{fmt}"
         repeats = []
         if names is not None:
-            refuse_unusable_names(names, suffix, source=source, labels=labels)
+            refuse_unusable_names(names, suffix, source=source, labels=labels, what=what, given=given)
             repeats = outputs.add_files(names, suffix, labels)
         if prefixes is not None and not repeats:
             refuse_unusable_names(prefixes, separator + suffix, source=source, labels=labels,
                                   pattern=f"<name>{separator}<ID>{suffix}")
             repeats = outputs.add_prefixes(prefixes, separator, suffix, labels)
         if repeats:
-            raise RefusalError(repeated_files_message(source, repeats, outputs.folding, folded_advice=folded_advice))
+            raise RefusalError(repeated_files_message(source, repeats, outputs.folding, what, given, folded_advice))
     refuse_outputs_over_inputs(outputs, inputs)
     return outputs
 

@@ -876,6 +876,29 @@ While the major version is `0`, breaking changes are released in a minor bump.
   (before, it was not checked against the other steps). Files of earlier runs
   are not checked: a rerun into the same folders replaces its own earlier
   files, as before.
+- **BREAKING — `fm-embedding from-sequences` refuses FASTA ids that conflict
+  in its files, before ESM3.** A record id (the first word of a header)
+  repeated among the records kept (`--min-res-n`) is refused in every format,
+  as the residue-code pass of `fm-search build sequences --residue-codes`
+  refuses it: in `csv` and `pt` the last record replaced the others, in
+  Parquet and JSON two rows had one id. With `csv` or `pt`, an id that cannot
+  name a file (`../x` wrote outside the output folder, `Q9/1-100` stopped the
+  run with a traceback), ids that the output folder takes for one file (`abc`
+  and `ABC` on macOS), and a `--fasta-file` among the output files are
+  refused too; Parquet and JSON keep any id. `--output-name` follows the file
+  name rules in every `fm-embedding` command. `fm-search` keeps accepting a
+  repeated query id under BLOSUM62, with its warning.
+- **BREAKING — a csv or pt writer refuses to write one file twice in a run.**
+  `CsvBatchWriter` and `TensorBatchWriter` (`fm-embedding`, `inference` and
+  the library with `csv` or `pt` output) keep the files they have written in
+  the run, compared as the output folder compares names, and stop the run
+  with a `RefusalError` naming the file at a second write of one: the first
+  file is kept, the second item is not written. It catches what is known only
+  while structures are read whole, such as chains `A` and `a` of one structure
+  on macOS's case-insensitive file system (one of them was lost), and two
+  structures whose `<name>.<chain ID>` coincide. The check is per process, so
+  two ranks that write one file are not caught; it also refuses a name that
+  cannot be a file name there.
 
 ### Fixed
 
@@ -1196,6 +1219,13 @@ While the major version is `0`, breaking changes are released in a minor bump.
   now refused before any model is built (see *BREAKING — an `inference` run
   refuses outputs that would replace each other or its inputs* and *BREAKING
   — every row of a list has an embedding name of its own*).
+- **`fm-embedding` runs that lost their own output or input, with exit status
+  0.** `from-sequences` kept the last of the records of one id, wrote a record
+  `../x` outside the output folder, replaced its own `--fasta-file` when it was
+  named like an output, and on macOS kept one of two ids that differ in case;
+  `from-structures` kept one of two chains `A` and `a` of a structure on
+  macOS. Each is now refused (see the two *BREAKING* entries on
+  `fm-embedding from-sequences` and on the csv and pt writers).
 
 ## [0.8.0] - 2026-07-21
 

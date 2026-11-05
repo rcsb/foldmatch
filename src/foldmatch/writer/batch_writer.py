@@ -10,6 +10,7 @@ from collections import deque
 from lightning.pytorch.callbacks import BasePredictionWriter
 
 from foldmatch.errors import RefusalError
+from foldmatch.utils.output_files import name_key, name_problem, probe_folding
 from foldmatch.search.residue_shards import (
     SEQ_SHA1, SEQ_SHA1_BYTES, SEQ_SHA1_TYPE, check_residue_output, large_binary_array, pass_record, shard_schema,
 )
@@ -29,6 +30,9 @@ class CoreBatchWriter(BasePredictionWriter):
         super().__init__(write_interval)
         self.out_path = output_path
         self.postfix = postfix
+        # The files this writer has written in this run, by the name the folder compares (claim_file)
+        self._written = {}
+        self._folding = None
 
     def write_on_batch_end(
             self,
@@ -55,6 +59,39 @@ class CoreBatchWriter(BasePredictionWriter):
     def file_name(self, dom_id):
         return f'{self.out_path}/{dom_id}.{self.postfix}'
 
+    def claim_file(self, dom_id) -> str:
+        """The file of ``dom_id``, once this writer has checked that it may write it (P9.N D4): the name must make one
+        file of the output folder (name_problem), and one that this writer has not written in this run, compared as
+        the folder compares names (chains A and a of one structure are one file on a case-insensitive folder).
+        Otherwise RefusalError, naming the file: the run stops, the first file kept and this one not written.
+
+        A backstop for names known only during the run (the chains of structures read whole); the inference functions
+        refuse the names they know before any model is built. Kept per writer, so per process: two ranks that write
+        one file are not seen."""
+        suffix = f".{self.postfix}"
+        problem = name_problem(dom_id, suffix)
+        if problem is not None:
+            raise RefusalError(
+                f"The embedding {dom_id!r} cannot be written to {self.out_path}: its name {problem}, so it cannot name "
+                f"the file <name>{suffix} there. Write the embeddings as parquet or json, which keep each under its "
+                f"id, or give it another name."
+            )
+        if self._folding is None:
+            self._folding = probe_folding(self.out_path)
+        key = name_key(f"{dom_id}{suffix}", self._folding)
+        first = self._written.get(key)
+        if first is not None:
+            folded = self._folding.describe()
+            note = f" (the folder does not tell {folded} apart)" if folded and first != dom_id else ""
+            raise RefusalError(
+                f"{self.file_name(first)} would be written twice by this run, for {first!r} and then for "
+                f"{dom_id!r}{note}: the first is kept, {dom_id!r} is not written, and the run stops. Each embedding of "
+                f"a run needs a file of its own: write them as parquet or json, which keep each under its id, or, "
+                f"for names that differ only in case, to a folder of a case-sensitive file system."
+            )
+        self._written[key] = dom_id
+        return self.file_name(dom_id)
+
     @abstractmethod
     def _write_embedding(self, embedding, dom_id):
         pass
@@ -71,7 +108,7 @@ class CsvBatchWriter(CoreBatchWriter):
 
     def _write_embedding(self, embedding, dom_id):
         pd.DataFrame(embedding.to('cpu').numpy()).to_csv(
-            self.file_name(dom_id),
+            self.claim_file(dom_id),
             index=False,
             header=False
         )
@@ -91,7 +128,7 @@ class TensorBatchWriter(CoreBatchWriter):
     def _write_embedding(self, embedding, dom_id):
         torch.save(
             embedding.to(self.device),
-            self.file_name(dom_id)
+            self.claim_file(dom_id)
         )
 
 
