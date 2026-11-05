@@ -220,6 +220,8 @@ All `build` commands accept `--index-type [auto|flat|hnsw|ivf_pq]` and IVF-PQ tu
 
 Every command writes **tab-separated rows** to `--output-file` — one record per line. `query` results are ordered best-first per query, so rank is simply the row order.
 
+`--output-file` cannot be one of the command's inputs: a file of a database it reads (`<db path>.index`, `.metadata`, `.invlists`, `.sequences` or `.rescodes.*`), the query FASTA or structure file, or a query embedding file; such a run is refused before any work. A file written by an earlier command is replaced. `query embedding` refuses query embeddings that share an id (results are kept by query id).
+
 `--format-mode` selects the file layout:
 
 | Mode | Layout |

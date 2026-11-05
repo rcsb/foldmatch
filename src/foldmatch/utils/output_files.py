@@ -13,6 +13,7 @@ which :func:`probe_folding` finds out per folder. Folders are compared as files 
 a symbolic link and, on macOS, ``SHARED`` and ``shared`` are one folder; and an input and an output's file that
 exists are one file when either is a link to the other from another folder.
 """
+import glob
 import os
 import re
 import stat
@@ -581,3 +582,45 @@ def residue_files(res_folder, structure_names: Iterable, res_format) -> List[Tup
         return []
     return [("the residue embedding file", os.path.join(os.fspath(res_folder), entry)) for entry in entries
             if index.holds(entry) is not None]
+
+
+#: The files of a database that the commands read, ``<db path><suffix>``: the index and its metadata and inverted lists,
+#: the sequence store, and the residue-code store (``cli.search._SEQUENCE_DB_SUFFIXES``, ``search.residue_code_store``).
+DATABASE_SUFFIXES = (".index", ".metadata", ".invlists", ".sequences", ".rescodes.bin", ".rescodes.idx",
+                     ".rescodes.json")
+#: The files of a database's residue-code store, ``<db path>.rescodes.*`` (``search.split_run._CODE_STORE_GLOB``).
+CODE_STORE_GLOB = ".rescodes.*"
+
+
+def database_files(db_path) -> List[str]:
+    """The existing files of a database (DATABASE_SUFFIXES, then any other ``<db path>.rescodes.*``)."""
+    db_path = os.fspath(db_path)
+    db_dir, index_name = os.path.split(db_path)
+    files = [db_path + suffix for suffix in DATABASE_SUFFIXES]
+    pattern = os.path.join(glob.escape(db_dir or os.curdir), glob.escape(index_name) + CODE_STORE_GLOB)
+    files += sorted(glob.glob(pattern))
+    return [f for f in dict.fromkeys(files) if os.path.isfile(f)]
+
+
+def refuse_output_file_over_inputs(output_file, *, files: Iterable[Tuple[str, object]] = (),
+                                   databases: Iterable[Tuple[str, str]] = (), option: str = "--output-file"):
+    """Refuse (RefusalError) an output file that is one of the command's inputs (P9.N D6), before any work: one of
+    ``files`` (described, path), or a file of one of ``databases`` (described, path) that the commands read
+    (database_files). Compared as files (os.path.samefile): an input exists, so only an existing output file can be
+    one, and a symbolic link to it, or on macOS another case of its name, is. Any other file, such as the results of
+    an earlier command named ``<db path>.hits.tsv`` beside the database, is not an input."""
+    out = os.fspath(output_file)
+    if not os.path.isfile(out):
+        return
+    found = []
+    for described, path in files:
+        if path is not None and _names_it(out, os.fspath(path)):
+            found.append(f"{described} {os.fspath(path)}")
+    for described, db_path in databases:
+        found.extend(f"the file {path} of {described} {os.fspath(db_path)}" for path in database_files(db_path)
+                     if _names_it(out, path))
+    if found:
+        raise RefusalError(
+            f"{option} {out} is {'; and '.join(found)}: the results would replace an input of this command. Write "
+            f"them to another file."
+        )

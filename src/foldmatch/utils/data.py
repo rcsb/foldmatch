@@ -505,35 +505,7 @@ def stream_embeddings(
     else the first one's (Parquet files are read first, then .pt, then .csv). A single file is
     handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case.
     """
-    p = Path(path)
-    if not p.exists():
-        raise ValueError(f"Embeddings path does not exist: {path}")
-
-    if file_extension is not None and file_extension not in _SUPPORTED_EXTS:
-        raise ValueError(
-            f"Unsupported file extension '{file_extension}'. "
-            f"Use one of: {', '.join(_SUPPORTED_EXTS)}"
-        )
-
-    if p.is_file():
-        if p.suffix not in _SUPPORTED_EXTS:
-            raise ValueError(
-                f"Unsupported file extension '{p.suffix}'. "
-                f"Use one of: {', '.join(_SUPPORTED_EXTS)}"
-            )
-        files = [p]
-    else:
-        extensions = (file_extension,) if file_extension is not None else _SUPPORTED_EXTS
-        files = []
-        for ext in extensions:
-            files.extend(sorted(p.glob(f"*{ext}")))
-        if not files:
-            raise ValueError(
-                f"No embedding files found with extensions {list(extensions)} in {path}"
-            )
-
-    parquet_files = [f for f in files if f.suffix in _BATCH_EXTS]
-    point_files = [f for f in files if f.suffix in _POINT_EXTS]
+    parquet_files, point_files = embedding_files(path, file_extension)
 
     by_id = {}
     for f in point_files:
@@ -564,6 +536,73 @@ def stream_embeddings(
             ids_buf, emb_buf = [], []
     if ids_buf:
         yield ids_buf, np.ascontiguousarray(np.stack(emb_buf))
+
+
+def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[List[Path], List[Path]]:
+    """The (Parquet files, .pt and .csv files) that stream_embeddings reads from a file or a folder, each list sorted
+    by extension then name; a ValueError for a missing path, an unsupported extension or a folder without them."""
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f"Embeddings path does not exist: {path}")
+
+    if file_extension is not None and file_extension not in _SUPPORTED_EXTS:
+        raise ValueError(
+            f"Unsupported file extension '{file_extension}'. "
+            f"Use one of: {', '.join(_SUPPORTED_EXTS)}"
+        )
+
+    if p.is_file():
+        if p.suffix not in _SUPPORTED_EXTS:
+            raise ValueError(
+                f"Unsupported file extension '{p.suffix}'. "
+                f"Use one of: {', '.join(_SUPPORTED_EXTS)}"
+            )
+        files = [p]
+    else:
+        extensions = (file_extension,) if file_extension is not None else _SUPPORTED_EXTS
+        files = []
+        for ext in extensions:
+            files.extend(sorted(p.glob(f"*{ext}")))
+        if not files:
+            raise ValueError(
+                f"No embedding files found with extensions {list(extensions)} in {path}"
+            )
+
+    parquet_files = [f for f in files if f.suffix in _BATCH_EXTS]
+    point_files = [f for f in files if f.suffix in _POINT_EXTS]
+    return parquet_files, point_files
+
+
+def refuse_repeated_query_ids(path: Path, file_extension: Optional[str] = None):
+    """Refuse (RefusalError) query embeddings in which two vectors share an id (P9.N D7), read before any search as
+    stream_embeddings would read them: the ids of the Parquet files (their id column only) and the stems of the .pt and
+    .csv files. A search's results are kept by query id, so a repeated id kept one vector's hits and dropped the
+    others' without notice. A Parquet file whose ids cannot be read is left to stream_embeddings, which refuses it."""
+    parquet_files, point_files = embedding_files(path, file_extension)
+    where = {}
+    for f in parquet_files:
+        try:
+            ids = pq.read_table(f, columns=["id"]).column("id").to_pylist()
+        except Exception:
+            continue
+        for embedding_id in ids:
+            where.setdefault(embedding_id, []).append(f.name)
+    for f in point_files:
+        where.setdefault(f.stem, []).append(f.name)
+    repeated = [(embedding_id, files) for embedding_id, files in where.items() if len(files) > 1]
+    if repeated:
+        def describe(item):
+            embedding_id, files = item
+            counts = {name: files.count(name) for name in dict.fromkeys(files)}
+            return f"{embedding_id!r} in " + " and ".join(
+                f"{n} rows of {name}" if n > 1 else name for name, n in counts.items())
+        listed = "; ".join(describe(item) for item in repeated[:5])
+        more = f"; and {len(repeated) - 5} more ids" if len(repeated) > 5 else ""
+        raise RefusalError(
+            f"{path}: {len(repeated)} id(s) held by more than one query embedding: {listed}{more}. The results are "
+            f"written by query id, so a repeated id would keep the hits of one of its embeddings and drop the others': "
+            f"give each embedding its own id, or query its files apart (--file-extension, or one folder per kind)."
+        )
 
 STRUCTURE_FORMAT_EXTENSIONS = {
     StructureFormat.pdb: ('.pdb', '.pdb.gz'),

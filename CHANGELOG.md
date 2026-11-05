@@ -899,6 +899,23 @@ While the major version is `0`, breaking changes are released in a minor bump.
   structures whose `<name>.<chain ID>` coincide. The check is per process, so
   two ranks that write one file are not caught; it also refuses a name that
   cannot be a file name there.
+- **BREAKING — `fm-search` refuses an `--output-file` that is one of its
+  inputs, before any work.** `query structure`, `query embedding`, `query
+  sequences`, `query db`, `cluster` and `similarity-graph` refuse
+  (`RefusalError`, exit status 1) an output file that is a file of a
+  database they read (`<db path>.index`, `.metadata`, `.invlists`,
+  `.sequences` or `.rescodes.*`), the query FASTA or structure file, or a
+  query embedding file that `query embedding` reads. Compared as files: a
+  symbolic link to such a file, or on macOS another case of its name, is
+  refused too. An output file written by an earlier command is not an input,
+  even one named `<db path>.hits.tsv` beside the database, and is replaced as
+  before.
+- **BREAKING — `fm-search query embedding` refuses query embeddings that
+  share an id**, before the database is loaded, naming the ids and their
+  files: two rows of one id in a Parquet file, one id in two Parquet files,
+  or a Parquet id that is also a `.pt` or `.csv` file's name. The results are
+  kept by query id, so all but one of them disappeared from the output. Give
+  each embedding its own id, or query the files apart (`--file-extension`).
 
 ### Fixed
 
@@ -1226,6 +1243,13 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `from-structures` kept one of two chains `A` and `a` of a structure on
   macOS. Each is now refused (see the two *BREAKING* entries on
   `fm-embedding from-sequences` and on the csv and pt writers).
+- **`fm-search` commands that destroyed their own input, with exit status 0.**
+  `--output-file <db path>.index` (or `.metadata`, `.sequences`, ...)
+  replaced a file of the database the command had just searched, so every
+  later command on it failed until a rebuild; an output file named like the
+  query FASTA, structure or embedding file replaced it; and `query embedding`
+  dropped every query but one of a repeated id. Each is now refused (see the
+  two *BREAKING* entries on `fm-search`).
 
 ## [0.8.0] - 2026-07-21
 

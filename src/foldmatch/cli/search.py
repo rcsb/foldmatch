@@ -960,6 +960,8 @@ def query_database_from_structure(
     """Search database for similar structures."""
 
     set_log_level(log_level)
+    _refuse_output_over_inputs(output_file, files=[("the query structure file", query_structure)],
+                               databases=[("the database", db_path)])
 
     from foldmatch.search.embedding_computer import compute_from_structure_file
     embedding_batches = compute_from_structure_file(
@@ -1038,6 +1040,12 @@ def query_database_from_embedding(
     """Search database using a pre-computed embedding file."""
 
     set_log_level(log_level)
+    # The embedding files it reads are inputs (P9.N D6), and one query per id: the results are kept by query id (D7)
+    from foldmatch.utils.data import embedding_files, refuse_repeated_query_ids
+    _refuse_output_over_inputs(output_file, databases=[("the database", db_path)],
+                               files=[("the query embedding file", f)
+                                      for kind in embedding_files(embedding_folder, file_extension) for f in kind])
+    refuse_repeated_query_ids(embedding_folder, file_extension)
 
     logging.info("Loading database...")
     from foldmatch.search.embedding_database import EmbeddingDatabase
@@ -1203,6 +1211,8 @@ def query_database_from_fasta(
     """Search database using protein sequences from a FASTA file."""
 
     set_log_level(log_level)
+    _refuse_output_over_inputs(output_file, files=[("the FASTA file", fasta_file)],
+                               databases=[("the database", db_path)])
     # The per-scoring defaults; under esm-codes the BLOSUM62-only options are refused (exit 2), before anything is read.
     stage2 = resolve_query_stage2_options(
         scoring, seq_identity=seq_identity, min_seq_identity=min_seq_identity, min_coverage=min_coverage,
@@ -1404,6 +1414,8 @@ def query_database_from_database(
     """Search subject database using all entries from query database."""
 
     set_log_level(log_level)
+    _refuse_output_over_inputs(output_file, databases=[("the query database", query_db_path),
+                                                       ("the subject database", subject_db_path)])
     _check_comp_bias_corr_scale(comp_bias_corr_scale)
 
     if use_gpu_index:
@@ -1556,6 +1568,7 @@ def cluster_database(
     """Cluster database embeddings using Leiden algorithm."""
 
     set_log_level(log_level)
+    _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
@@ -1618,6 +1631,7 @@ def similarity_graph(
     """Build and export a similarity graph from database embeddings."""
 
     set_log_level(log_level)
+    _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
@@ -1670,6 +1684,16 @@ def _app_callback(
         )
 ):
     pass
+
+def _refuse_output_over_inputs(output_file: str, *, files=(), databases=()):
+    """Refuse an --output-file that is an input of the command (P9.N D6), before any work: one of ``files``
+    (described, path), or a file of a database of ``databases`` (described, --db-path) that the command reads
+    (``<db path>.index``, ``.metadata``, ``.invlists``, ``.sequences``, ``.rescodes.*``). Read-only; an output file of
+    an earlier command is not an input, even one named ``<db path>.hits.tsv``, and is replaced as before."""
+    from foldmatch.utils.output_files import refuse_output_file_over_inputs
+    refuse_output_file_over_inputs(output_file, files=files,
+                                   databases=[(described, parse_db_path(db)[2]) for described, db in databases])
+
 
 def _filter_results_by_threshold(results, threshold: float | None):
     """Filter search results by similarity threshold."""
