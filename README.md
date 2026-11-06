@@ -216,6 +216,8 @@ fm-search similarity-graph  --db-path dbs/my_db --output-file graph.graphml
 
 All `build` commands accept `--index-type [auto|flat|hnsw|ivf_pq]` and IVF-PQ tuning flags (`--ivf-nlist`, `--ivf-nprobe`). See `fm-search <subcommand> --help` for the full surface.
 
+`cluster` and `similarity-graph` work on every database type. On `ivf_pq` a score is estimated from the PQ codes (the chain's decoded embedding, normalised, against each stored code, as in `query db`), so two identical chains score close to, but not exactly, 1. The k-NN search takes time in proportion to the number of chains and `--max-neighbors`, whatever `--threshold`; the graph's memory grows with the number of edges, which `--threshold` and `--max-neighbors` bound (at most `--max-neighbors` edges from each chain's search), and the Leiden step's memory also grows with the number of chains. The Leiden step of `cluster` runs on one CPU thread.
+
 #### Output format
 
 Every command writes **tab-separated rows** to `--output-file` — one record per line. `query` results are ordered best-first per query, so rank is simply the row order.
@@ -559,6 +561,7 @@ pytest
 - `fm-search query embedding` with a multi-row `.parquet` file.
 - `fm-search query sequences` with more than one input sequence.
 - `fm-search query db` (database-to-database).
+- `fm-search cluster` and `fm-search similarity-graph`, which search many chains per FAISS call (safe at the default `OMP_NUM_THREADS=1` pin).
 
 Single-query paths (`fm-search query structure`, small `--index-type flat` builds) are unaffected.
 

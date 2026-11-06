@@ -1,4 +1,5 @@
 import logging
+import time
 import numpy as np
 import faiss
 import igraph as ig
@@ -10,9 +11,15 @@ from tqdm import tqdm
 from foldmatch.search import FaissEmbeddingDatabase
 from foldmatch.search.embedding_database import _parse_db_path
 from foldmatch.search.output import write_cluster_results
-from foldmatch.types.api_types import FormatMode
+from foldmatch.types.api_types import FormatMode, IndexType
 
 logger = logging.getLogger(__name__)
+
+# Byte budget of the search results of one block of chains (k int64 ids and k float32 scores a chain): 16,384 chains
+# a FAISS call at k = 1000. The block's embeddings are read with one reconstruct_n call of the same rows.
+_GRAPH_RESULT_BYTES = 16_384 * 1000 * 12
+# Row cap of a block, which bounds its embeddings at small k (16,384 x d x 4 bytes, 96 MiB at d = 1536).
+_GRAPH_MAX_ROWS = 16_384
 
 class EmbeddingClusterer:
     """Cluster protein structure embeddings using Leiden algorithm on similarity graphs."""
@@ -43,7 +50,8 @@ class EmbeddingClusterer:
         Build a similarity graph using FAISS k-NN search with threshold filtering.
 
         Args:
-            threshold: Minimum similarity score to create an edge (0-1, where 1.0 = identical)
+            threshold: Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on
+                ivf_pq, where scores are PQ estimates)
             max_neighbors: Maximum number of neighbors to consider per node
 
         Returns:
@@ -58,6 +66,9 @@ class EmbeddingClusterer:
 
         # Clamp max_neighbors to actual database size
         k = min(max_neighbors, n_chains)
+        # Chains per block, from the result budget and the row cap (k = 0 is left to FAISS to refuse, as before, after
+        # one chain is read)
+        rows = 1 if k < 1 else max(1, min(n_chains, _GRAPH_MAX_ROWS, _GRAPH_RESULT_BYTES // (k * 12)))
 
         # Get CPU index for reconstruction if using GPU
         index_to_use = self.db.index
@@ -65,37 +76,54 @@ class EmbeddingClusterer:
             logging.info("Moving GPU index to CPU for reconstruction...")
             index_to_use = faiss.index_gpu_to_cpu(self.db.index)
 
-        edges = []
-        weights = []
+        # ivf_pq decodes its PQ codes, which are not unit vectors: the query is normalised, as in query db, so a score
+        # is the inner product of the chain's unit decoded embedding with each stored code. flat and hnsw store the
+        # normalised embeddings, searched as they are.
+        normalize = self.db.index_type == IndexType.ivf_pq
 
-        # Search incrementally to avoid segfault with large batch searches
-        # Both IndexFlatIP and IndexHNSWFlat support reconstruction through their storage
+        edge_blocks = []
+        weight_blocks = []
+        n_edges = 0
+        start_time = time.perf_counter()
+
+        # Blocks of chains in ascending order, read with reconstruct_n (no direct map needed on ivf_pq) and searched
+        # with one FAISS call each. An edge (i, j) is kept from the search of the lower chain i only, which also drops
+        # self-hits and the -1 ids FAISS fills in; edges come in chain order, then in FAISS rank order.
         logging.info("Performing k-NN search ...")
-        for i in tqdm(range(n_chains), desc="Processing chains", unit="chain"):
-            # Reconstruct single embedding
-            query_embedding = index_to_use.reconstruct(i)
+        with tqdm(total=n_chains, desc="Processing chains", unit="chain") as progress:
+            for start in range(0, n_chains, rows):
+                end = min(start + rows, n_chains)
+                embeddings = np.ascontiguousarray(index_to_use.reconstruct_n(start, end - start), dtype=np.float32)
+                if normalize:
+                    faiss.normalize_L2(embeddings)
+                scores, indices = self.db.index.search(embeddings, k)
+                del embeddings
 
-            # Ensure contiguous C-order array with correct shape
-            query_embedding = np.ascontiguousarray(query_embedding, dtype=np.float32).reshape(1, -1)
+                chains = np.arange(start, end, dtype=np.int64)[:, None]
+                block_rows, block_cols = np.nonzero((chains < indices) & (scores >= threshold))
+                edge_blocks.append(np.stack([block_rows + start, indices[block_rows, block_cols]], axis=1))
+                weight_blocks.append(scores[block_rows, block_cols])
+                n_edges += len(block_rows)
+                del scores, indices, chains, block_rows, block_cols
 
-            # Search for k nearest neighbors
-            scores_i, indices_i = self.db.index.search(query_embedding, k)
+                progress.set_postfix(edges=n_edges, refresh=False)
+                progress.update(end - start)
 
-            # Build edges from this query
-            for j, score in zip(indices_i[0], scores_i[0]):
-                # Skip self-loops and edges below threshold
-                if i < j and score >= threshold:  # i < j to avoid duplicate edges
-                    edges.append((i, j))
-                    weights.append(float(score))
+        edges = np.concatenate(edge_blocks) if edge_blocks else np.empty((0, 2), dtype=np.int64)
+        weights = np.concatenate(weight_blocks) if weight_blocks else np.empty(0, dtype=np.float32)
+        del edge_blocks, weight_blocks
 
         logging.info(f"Created graph with {n_chains} nodes and {len(edges)} edges")
 
         # Create igraph from edge list
         self.graph = ig.Graph(n=n_chains, edges=edges, directed=False)
-        self.graph.es['weight'] = weights
+        self.graph.es['weight'] = weights.tolist()
+        del edges, weights
 
         # Add chain IDs as vertex attribute
         self.graph.vs['name'] = self.chain_ids
+
+        logging.info(f"Similarity graph built in {time.perf_counter() - start_time:.2f}s")
 
         return self.graph
 
@@ -120,6 +148,7 @@ class EmbeddingClusterer:
             raise ValueError("Graph not built. Call build_similarity_graph() first.")
 
         logging.info(f"Running Leiden clustering (resolution={resolution})...")
+        start_time = time.perf_counter()
 
         # Use RBConfigurationVertexPartition with weights
         # Higher edge weights (higher similarity) encourage nodes to be in same cluster
@@ -134,6 +163,7 @@ class EmbeddingClusterer:
 
         self.clusters = partition.membership
         logging.info(f"Found {len(set(self.clusters))} clusters")
+        logging.info(f"Leiden clustering completed in {time.perf_counter() - start_time:.2f}s")
 
         return self.clusters
 
@@ -147,12 +177,9 @@ class EmbeddingClusterer:
         if self.clusters is None:
             raise ValueError("Clustering not performed. Call cluster_leiden() first.")
 
-        cluster_sizes = {}
-        for cluster_id in self.clusters:
-            cluster_sizes[cluster_id] = cluster_sizes.get(cluster_id, 0) + 1
-
-        sizes = list(cluster_sizes.values())
-        n_clusters = len(cluster_sizes)
+        # Leiden memberships are 0..C-1
+        sizes = np.bincount(self.clusters).tolist()
+        n_clusters = len(sizes)
         n_singletons = sum(1 for s in sizes if s == 1)
 
         # Calculate modularity if graph exists
@@ -197,10 +224,8 @@ class EmbeddingClusterer:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Calculate cluster sizes
-        cluster_sizes = {}
-        for cluster_id in self.clusters:
-            cluster_sizes[cluster_id] = cluster_sizes.get(cluster_id, 0) + 1
+        # Calculate cluster sizes (Leiden memberships are 0..C-1)
+        cluster_sizes = np.bincount(self.clusters).tolist()
 
         assignments = [
             (chain_id, cluster_id, cluster_sizes[cluster_id])

@@ -1537,7 +1537,7 @@ def cluster_database(
             help='Path to the FAISS database.'
         )],
         threshold: Annotated[float, typer.Option(
-            help='Similarity threshold for edge creation (0-1, where 1.0 = identical).'
+            help='Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ estimates).'
         )] = 0.8,
         resolution: Annotated[float, typer.Option(
             help='Leiden resolution parameter (higher = more clusters).'
@@ -1613,7 +1613,7 @@ def similarity_graph(
             help='Path to the FAISS database.'
         )],
         threshold: Annotated[float, typer.Option(
-            help='Similarity threshold for edge creation (0-1, where 1.0 = identical).'
+            help='Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ estimates).'
         )] = 0.8,
         output_file: Annotated[str, typer.Option(
             help='Path to save the similarity graph (GraphML format).'

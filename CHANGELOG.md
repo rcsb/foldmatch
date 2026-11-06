@@ -285,6 +285,21 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Changed
 
+- **`fm-search cluster` and `fm-search similarity-graph` build the graph many
+  chains per FAISS call.** They searched one chain per FAISS call and went
+  through its neighbours in Python; they now read and search blocks of at most
+  16,384 chains (whose results take about 200 MB at the default
+  `--max-neighbors` 1000) and keep the edges with NumPy, which is much faster.
+  The edge rule is unchanged: an edge comes from the search of its
+  lower-numbered chain, in chain order, then in FAISS's rank order. On `hnsw`
+  the graph is the same, and so are the files of `cluster` (for the same
+  `--seed`) and `similarity-graph`. On `flat` it is the same up to float
+  rounding (scores within about 2e-6 at 1536 dimensions), so a pair at
+  `--threshold` or tied at a chain's `--max-neighbors`-th score can gain or lose
+  its edge, and near-tied neighbours of a chain can change order, which can
+  change the clusters of the same `--seed`; the scores now depend on FAISS's
+  thread count, as batched `flat` searches already do. Both commands log the
+  time of the graph build, and `cluster` that of the Leiden clustering.
 - **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
   sequences` and `fm-search query db`, matching the coverage cut-off other
   alignment tools apply by default. Pass `--min-coverage 0` for the previous
@@ -937,6 +952,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   (facebookresearch/faiss#5824) was merged on 2026-10-31, but it is not in
   1.15.1, the latest release and FoldMatch's pin. When the `faiss-cpu` pin moves
   to a release that has it, this workaround is to be re-examined.
+- **`fm-search cluster` and `fm-search similarity-graph` run on `ivf_pq`
+  databases.** They failed on every `ivf_pq` database, at the first chain, with
+  FAISS's `direct map not initialized`. The chains' embeddings are now read with
+  `reconstruct_n`, which needs no direct map. On `ivf_pq` a score is the inner
+  product of the chain's normalised decoded embedding with each stored PQ code,
+  as in `query db`: an estimate of the cosine, so two identical chains score the
+  norm of their code, close to but not exactly 1 (0.84 to 1.03 on a 30M-chain
+  database, 98% of chains between 0.94 and 1.01).
 - **Assembly embeddings of entries with more than one assembly.** Structures
   were cached under the entry name alone, so assemblies of an entry read one
   after another all got the first one's chains. `fm-search build structures
