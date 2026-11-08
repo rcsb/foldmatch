@@ -300,6 +300,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   change the clusters of the same `--seed`; the scores now depend on FAISS's
   thread count, as batched `flat` searches already do. Both commands log the
   time of the graph build, and `cluster` that of the Leiden clustering.
+- **`fm-search cluster` and `fm-search similarity-graph` need much less memory
+  per edge to build the similarity graph.** The kept edges are no longer
+  concatenated into one array, they are handed to igraph without a temporary
+  NumPy array conversion, and equal edge weights are stored once. The graph,
+  its weights, the clusters and the output files are unchanged.
 - **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
   sequences` and `fm-search query db`, matching the coverage cut-off other
   alignment tools apply by default. Pass `--min-coverage 0` for the previous

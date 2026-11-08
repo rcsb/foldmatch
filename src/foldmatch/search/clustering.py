@@ -1,4 +1,6 @@
+import ctypes
 import logging
+import sys
 import time
 import numpy as np
 import faiss
@@ -20,6 +22,75 @@ logger = logging.getLogger(__name__)
 _GRAPH_RESULT_BYTES = 16_384 * 1000 * 12
 # Row cap of a block, which bounds its embeddings at small k (16,384 x d x 4 bytes, 96 MiB at d = 1536).
 _GRAPH_MAX_ROWS = 16_384
+# Kept node ids are int32 (8 bytes an edge instead of 16 while the search runs) when the largest id fits, else int64.
+_GRAPH_INT32_MAX_ID = np.iinfo(np.int32).max
+# Edges (and weights) turned into Python objects at a time when handed to igraph.
+_GRAPH_EDGE_CHUNK = 1 << 20
+# An igraph attribute is a list of Python objects, one float an edge for the weights: equal weights share one float
+# when the kept weights' float32 bit patterns span at most this many values, in a table of 128 MiB of pointers and 16
+# MiB of flags at most (scores from 0.8 to 1.03 span about 3.6M); a wider span (scores of both signs, 0.0 with -0.0
+# included, or, with scores up to about 1.03, scores below about 0.26) gives one float an edge, as ndarray.tolist().
+_GRAPH_WEIGHT_TABLE_MAX = 1 << 24
+
+
+def _graph_id_dtype(n_chains: int):
+    """The dtype of the kept node ids of a graph of ``n_chains`` chains: int32 when the largest id fits, else int64."""
+    return np.int32 if n_chains - 1 <= _GRAPH_INT32_MAX_ID else np.int64
+
+
+def _edge_tuples(blocks: list):
+    """Yield the edges of the (m, 2) blocks as tuples of two ints, block by block, in chunks of _GRAPH_EDGE_CHUNK.
+    The list is emptied as it goes, so each block is released once consumed."""
+    blocks.reverse()
+    while blocks:
+        block = blocks.pop()
+        for s in range(0, len(block), _GRAPH_EDGE_CHUNK):
+            yield from map(tuple, block[s:s + _GRAPH_EDGE_CHUNK].tolist())
+        del block
+
+
+def _weight_list(blocks: list) -> list:
+    """The float32 weight blocks as one list of Python floats, in order, emptying the list as it goes. Each weight is
+    the float of its own float32 value, as ndarray.tolist() gives; equal bit patterns share one float object when the
+    patterns span at most _GRAPH_WEIGHT_TABLE_MAX values (0.0 and -0.0 stay apart)."""
+    weights = []
+    nonempty = [b for b in blocks if len(b)]
+    if not nonempty:
+        blocks.clear()
+        return weights
+    lo = min(int(b.view(np.uint32).min()) for b in nonempty)
+    span = max(int(b.view(np.uint32).max()) for b in nonempty) - lo + 1
+    del nonempty
+    table = seen = None
+    if span <= _GRAPH_WEIGHT_TABLE_MAX:
+        table = np.empty(span, dtype=object)
+        seen = np.zeros(span, dtype=bool)
+    blocks.reverse()
+    while blocks:
+        block = blocks.pop()
+        for s in range(0, len(block), _GRAPH_EDGE_CHUNK):
+            if table is None:
+                weights.extend(block[s:s + _GRAPH_EDGE_CHUNK].tolist())
+                continue
+            idx = block[s:s + _GRAPH_EDGE_CHUNK].view(np.uint32).astype(np.int64) - lo
+            new = np.unique(idx[~seen[idx]])
+            if len(new):
+                table[new] = (new + lo).astype(np.uint32).view(np.float32).tolist()
+                seen[new] = True
+            weights.extend(table[idx].tolist())
+        del block
+    return weights
+
+
+def _release_freed_memory():
+    """Hand freed heap memory back to the OS with glibc's malloc_trim(0); a no-op elsewhere or without the symbol."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
 
 class EmbeddingClusterer:
     """Cluster protein structure embeddings using Leiden algorithm on similarity graphs."""
@@ -81,14 +152,17 @@ class EmbeddingClusterer:
         # normalised embeddings, searched as they are.
         normalize = self.db.index_type == IndexType.ivf_pq
 
-        edge_blocks = []
+        id_dtype = _graph_id_dtype(n_chains)
+        pair_blocks = []
         weight_blocks = []
         n_edges = 0
         start_time = time.perf_counter()
 
         # Blocks of chains in ascending order, read with reconstruct_n (no direct map needed on ivf_pq) and searched
         # with one FAISS call each. An edge (i, j) is kept from the search of the lower chain i only, which also drops
-        # self-hits and the -1 ids FAISS fills in; edges come in chain order, then in FAISS rank order.
+        # self-hits and the -1 ids FAISS fills in; edges come in chain order, then in FAISS rank order. A block's kept
+        # pairs are stored with int32 ids when the database's largest id fits, and a block with no kept edge is not
+        # stored.
         logging.info("Performing k-NN search ...")
         with tqdm(total=n_chains, desc="Processing chains", unit="chain") as progress:
             for start in range(0, n_chains, rows):
@@ -101,24 +175,28 @@ class EmbeddingClusterer:
 
                 chains = np.arange(start, end, dtype=np.int64)[:, None]
                 block_rows, block_cols = np.nonzero((chains < indices) & (scores >= threshold))
-                edge_blocks.append(np.stack([block_rows + start, indices[block_rows, block_cols]], axis=1))
-                weight_blocks.append(scores[block_rows, block_cols])
-                n_edges += len(block_rows)
+                if len(block_rows):
+                    pair_blocks.append(np.stack([block_rows + start, indices[block_rows, block_cols]],
+                                                axis=1).astype(id_dtype, copy=False))
+                    weight_blocks.append(scores[block_rows, block_cols])
+                    n_edges += len(block_rows)
                 del scores, indices, chains, block_rows, block_cols
 
                 progress.set_postfix(edges=n_edges, refresh=False)
                 progress.update(end - start)
 
-        edges = np.concatenate(edge_blocks) if edge_blocks else np.empty((0, 2), dtype=np.int64)
-        weights = np.concatenate(weight_blocks) if weight_blocks else np.empty(0, dtype=np.float32)
-        del edge_blocks, weight_blocks
+        logging.info(f"Created graph with {n_chains} nodes and {n_edges} edges")
 
-        logging.info(f"Created graph with {n_chains} nodes and {len(edges)} edges")
-
-        # Create igraph from edge list
-        self.graph = ig.Graph(n=n_chains, edges=edges, directed=False)
-        self.graph.es['weight'] = weights.tolist()
-        del edges, weights
+        # Create igraph from the blocks, with no concatenation, through a generator of int tuples: python-igraph 1.0.0
+        # converts an edge ndarray through Python objects as well, at about 170 bytes an edge at its peak against 50 to
+        # 57. Each block is released once consumed, and each weight block once its floats are in the list. An error
+        # raised while igraph pulls the edges (MemoryError, KeyboardInterrupt) surfaces from python-igraph 1.0.0 as a
+        # SystemError, with the original as its __cause__.
+        self.graph = ig.Graph(n=n_chains, edges=_edge_tuples(pair_blocks), directed=False)
+        # glibc keeps freed blocks in the heap: give them back before the weights and before Leiden.
+        _release_freed_memory()
+        self.graph.es['weight'] = _weight_list(weight_blocks)
+        _release_freed_memory()
 
         # Add chain IDs as vertex attribute
         self.graph.vs['name'] = self.chain_ids

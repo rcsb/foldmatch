@@ -1,18 +1,24 @@
 """EmbeddingClusterer.build_similarity_graph: blocks of chains read with reconstruct_n and searched many at a time give,
 on every database type, the expected graph: on hnsw the one-query-per-call graph bit for bit, on flat the same up to
 float rounding, and on ivf_pq the normalised decoded query against each code."""
+import logging
 import math
 import tempfile
+import time
 import unittest
+import weakref
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 # As the commands run (set_log_level): Lightning first, which brings torch and, through scikit-learn,
 # KMP_DUPLICATE_LIB_OK; on macOS, FAISS's OpenMP regions abort a process that loaded torch's libomp without it.
 import lightning  # noqa: F401
 import faiss
+import igraph as ig
 import numpy as np
+from tqdm import tqdm
 
 from foldmatch.cli.search import cluster_database, similarity_graph
 from foldmatch.search import clustering
@@ -437,6 +443,525 @@ class EdgeCaseTest(_GraphCase):
              "min_cluster_size": min(values), "max_cluster_size": max(values),
              "mean_cluster_size": np.mean(values), "median_cluster_size": np.median(values)})
         self.assertEqual(stats["modularity"], clusterer.graph.modularity(membership, weights="weight"))
+
+
+# P9.Q1: the graph is built with less memory per edge (int32 ids, no concatenation, blocks released as consumed, equal
+# weights sharing one float, malloc_trim on glibc), and is K2's graph bit for bit.
+
+def _k2_way(clusterer: EmbeddingClusterer, threshold: float, max_neighbors: int):
+    """K2's build_similarity_graph (c40d4e1) verbatim, on ``clusterer``: int64 blocks, np.concatenate, ig.Graph of the
+    ndarray and weights.tolist(). It reads the module's block budget and row cap, as K2 did."""
+    if clusterer.db.index is None:
+        raise ValueError("Database not loaded. Call load_database() first.")
+
+    n_chains = len(clusterer.chain_ids)
+    logging.info(f"\nBuilding similarity graph with threshold >= {threshold}")
+    logging.info(f"Searching up to {max_neighbors} neighbors per chain")
+
+    k = min(max_neighbors, n_chains)
+    rows = 1 if k < 1 else max(1, min(n_chains, clustering._GRAPH_MAX_ROWS, clustering._GRAPH_RESULT_BYTES // (k * 12)))
+
+    index_to_use = clusterer.db.index
+    if clusterer.db.is_gpu_index:
+        logging.info("Moving GPU index to CPU for reconstruction...")
+        index_to_use = faiss.index_gpu_to_cpu(clusterer.db.index)
+
+    normalize = clusterer.db.index_type == IndexType.ivf_pq
+
+    edge_blocks = []
+    weight_blocks = []
+    n_edges = 0
+    start_time = time.perf_counter()
+
+    logging.info("Performing k-NN search ...")
+    with tqdm(total=n_chains, desc="Processing chains", unit="chain") as progress:
+        for start in range(0, n_chains, rows):
+            end = min(start + rows, n_chains)
+            embeddings = np.ascontiguousarray(index_to_use.reconstruct_n(start, end - start), dtype=np.float32)
+            if normalize:
+                faiss.normalize_L2(embeddings)
+            scores, indices = clusterer.db.index.search(embeddings, k)
+            del embeddings
+
+            chains = np.arange(start, end, dtype=np.int64)[:, None]
+            block_rows, block_cols = np.nonzero((chains < indices) & (scores >= threshold))
+            edge_blocks.append(np.stack([block_rows + start, indices[block_rows, block_cols]], axis=1))
+            weight_blocks.append(scores[block_rows, block_cols])
+            n_edges += len(block_rows)
+            del scores, indices, chains, block_rows, block_cols
+
+            progress.set_postfix(edges=n_edges, refresh=False)
+            progress.update(end - start)
+
+    edges = np.concatenate(edge_blocks) if edge_blocks else np.empty((0, 2), dtype=np.int64)
+    weights = np.concatenate(weight_blocks) if weight_blocks else np.empty(0, dtype=np.float32)
+    del edge_blocks, weight_blocks
+
+    logging.info(f"Created graph with {n_chains} nodes and {len(edges)} edges")
+
+    clusterer.graph = ig.Graph(n=n_chains, edges=edges, directed=False)
+    clusterer.graph.es['weight'] = weights.tolist()
+    del edges, weights
+
+    clusterer.graph.vs['name'] = clusterer.chain_ids
+
+    logging.info(f"Similarity graph built in {time.perf_counter() - start_time:.2f}s")
+
+    return clusterer.graph
+
+
+def _patched(name: str, value):
+    """A patch of the clustering module's constant ``name``; none when ``value`` is None."""
+    if value is None:
+        return mock.patch.object(clustering, name, getattr(clustering, name))
+    return mock.patch.object(clustering, name, value)
+
+
+def _exact_divisor(counts) -> int:
+    """A chunk size of at least 4 that divides one block's kept-edge count exactly, that block spanning two chunks or
+    more."""
+    for count in sorted((int(c) for c in counts), reverse=True):
+        for size in range(4, count // 2 + 1):
+            if count % size == 0:
+                return size
+    raise AssertionError(f"no block's edge count has a divisor: {list(counts)}")
+
+
+def _float32_span(weights) -> int:
+    bits = np.asarray(weights, dtype=np.float32).view(np.uint32).astype(np.int64)
+    return int(bits.max() - bits.min() + 1)
+
+
+def _shares_equal_weights(weights) -> bool:
+    """Whether equal weights are one float object: as many objects as distinct values, and some value repeated."""
+    distinct = {w.hex() for w in weights}
+    return len(distinct) < len(weights) and len({id(w) for w in weights}) == len(distinct)
+
+
+class _SameGraphAsK2:
+    """On a fixture database, the graph equals K2's bit for bit: the same edges in the same order, the same weights by
+    value and by bits, Python floats, and the same names, at every block size and every chunk of edges and weights
+    handed to igraph (chunks of 1 and 3 edges, and chunks that divide a block's edge count exactly), with int32 ids
+    and with the int64 fallback."""
+
+    index_type = config = None
+    n = threshold = max_neighbors = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = _build(Path(cls.tmp.name), cls.index_type.value, cls.vectors(), cls.index_type, cls.config)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def budget(self, rows):
+        """Blocks of ``rows`` chains at the fixture's k; the default budget when ``rows`` is None."""
+        return _patched("_GRAPH_RESULT_BYTES", None if rows is None else _budget(rows, min(self.max_neighbors, self.n)))
+
+    def assert_same_list(self, got, ref, what):
+        """``got == ref``, reported by the first difference (a diff of a million-edge list would not finish)."""
+        if got != ref:
+            first = next((i for i, (a, b) in enumerate(zip(got, ref)) if a != b), min(len(got), len(ref)))
+            self.fail(f"{what} differ: lengths {len(got)} and {len(ref)}, first difference at {first}: "
+                      f"{got[first:first + 3]} against {ref[first:first + 3]}")
+
+    def assert_same_graph(self, graph, ref):
+        self.assertEqual(graph.vcount(), ref.vcount())
+        self.assert_same_list(graph.get_edgelist(), ref.get_edgelist(), "edges")
+        weights, ref_weights = graph.es["weight"], ref.es["weight"]
+        self.assert_same_list(weights, ref_weights, "weights")
+        self.assertTrue(np.asarray(weights, dtype=np.float64).tobytes()
+                        == np.asarray(ref_weights, dtype=np.float64).tobytes(), "weight bits differ")
+        self.assertTrue(all(type(w) is float for w in weights))
+        self.assert_same_list(graph.vs["name"], ref.vs["name"], "names")
+
+    def test_same_graph_as_k2(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        several = self.n // 4 + 1
+        refs = {}
+        for rows in (None, 1, 7, several):
+            with self.budget(rows):
+                refs[rows] = _k2_way(clusterer, self.threshold, self.max_neighbors)
+        self.assertGreater(refs[None].ecount(), 1000)
+        counts = np.bincount(np.array(refs[several].get_edgelist())[:, 0] // several, minlength=4)
+        self.assertEqual(len(counts), 4)
+        divisor = _exact_divisor(counts)
+        for rows, ref in refs.items():
+            for chunk in (None, 1, 3, divisor):
+                with self.subTest(rows=rows, chunk=chunk), self.budget(rows), _patched("_GRAPH_EDGE_CHUNK", chunk):
+                    graph = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                             max_neighbors=self.max_neighbors)
+                    self.assert_same_graph(graph, ref)
+
+    def test_int64_ids_when_the_largest_id_is_above_the_int32_limit(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        rows = self.n // 4 + 1
+        with self.budget(rows):
+            ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
+        graphs = {}
+        for max_id, dtype in ((self.n - 1, np.int32), (self.n - 2, np.int64)):
+            with self.subTest(max_id=max_id):
+                dtypes = []
+                edge_tuples = clustering._edge_tuples
+
+                def recording(blocks):
+                    dtypes.extend(b.dtype for b in blocks)
+                    return edge_tuples(blocks)
+
+                with self.budget(rows), _patched("_GRAPH_INT32_MAX_ID", max_id), \
+                        mock.patch.object(clustering, "_edge_tuples", recording):
+                    graphs[dtype] = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                                     max_neighbors=self.max_neighbors)
+                self.assertGreater(len(dtypes), 1)
+                self.assertEqual(set(dtypes), {np.dtype(dtype)})
+                self.assert_same_graph(graphs[dtype], ref)
+        self.assert_same_graph(graphs[np.int64], graphs[np.int32])
+
+
+class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
+    """hnsw (HnswGraphTest's fixture): also how the graph is built (no concatenation, igraph pulling the edges from
+    the generator, freed memory released twice, with every block released before each release) and the weight table,
+    at its cap and past it."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.hnsw, 2000, 1536, 0.6, 40
+
+    @classmethod
+    def vectors(cls):
+        return _clustered_vectors(seed=3, n=cls.n, d=cls.d, n_centers=150, noise=1.0)
+
+    def test_no_concatenation(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        for rows in (None, 7):
+            with self.subTest(rows=rows), self.budget(rows):
+                ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
+                with mock.patch.object(clustering.np, "concatenate", side_effect=AssertionError("np.concatenate")):
+                    graph = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                             max_neighbors=self.max_neighbors)
+                self.assert_same_graph(graph, ref)
+
+    def test_igraph_is_given_no_ndarray(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
+        generators = []
+        edge_tuples = clustering._edge_tuples
+
+        def recording(blocks):
+            generators.append(edge_tuples(blocks))
+            return generators[-1]
+
+        with mock.patch.object(clustering.ig, "Graph", wraps=ig.Graph) as graph_class, \
+                mock.patch.object(clustering, "_edge_tuples", recording):
+            graph = clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=self.max_neighbors)
+        graph_class.assert_called_once()
+        args = list(graph_class.call_args.args) + list(graph_class.call_args.kwargs.values())
+        self.assertIn("edges", graph_class.call_args.kwargs)
+        self.assertFalse(any(isinstance(a, np.ndarray) for a in args))
+        # igraph pulls the edges from _edge_tuples' generator itself: no list or tuple of every edge is made first
+        self.assertEqual(len(generators), 1)
+        self.assertIs(graph_class.call_args.kwargs["edges"], generators[0])
+        self.assert_same_graph(graph, ref)
+
+    def test_freed_memory_released_after_the_graph_and_after_the_weights(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        calls = []
+
+        def record():
+            calls.append((clusterer.graph, clusterer.graph.ecount(), "weight" in clusterer.graph.es.attributes()))
+
+        with mock.patch.object(clustering, "_release_freed_memory", side_effect=record) as release:
+            graph = clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=self.max_neighbors)
+        self.assertEqual(release.call_count, 2)
+        self.assertGreater(graph.ecount(), 1000)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(c[0] is graph for c in calls))
+        self.assertEqual([c[1:] for c in calls], [(graph.ecount(), False), (graph.ecount(), True)])
+
+    def test_every_block_released_before_each_release(self):
+        """The build hands its own block lists to _edge_tuples and _weight_list and keeps no other reference: every
+        pair block is dead at the first release (after the igraph build), every weight block at the second."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        refs = {"pairs": [], "weights": []}
+        edge_tuples, weight_list = clustering._edge_tuples, clustering._weight_list
+
+        def recording(real, key):
+            def call(blocks):
+                refs[key].extend(weakref.ref(b) for b in blocks)
+                return real(blocks)
+            return call
+
+        alive = []
+
+        def release():
+            alive.append({key: sum(r() is not None for r in rs) for key, rs in refs.items()})
+
+        with self.budget(7), \
+                mock.patch.object(clustering, "_edge_tuples", recording(edge_tuples, "pairs")), \
+                mock.patch.object(clustering, "_weight_list", recording(weight_list, "weights")), \
+                mock.patch.object(clustering, "_release_freed_memory", side_effect=release):
+            graph = clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=self.max_neighbors)
+        self.assertGreater(len(refs["pairs"]), 1)
+        self.assertEqual(len(refs["weights"]), len(refs["pairs"]))
+        self.assertGreater(graph.ecount(), 1000)
+        self.assertEqual(alive, [{"pairs": 0, "weights": 0}, {"pairs": 0, "weights": 0}])
+
+    def test_release_without_malloc_trim_is_a_no_op(self):
+        """On this platform, with the C library lookup failing (OSError) and with a C library that has no malloc_trim
+        (AttributeError), the build gives the same graph; on Linux, malloc_trim(0) is called twice."""
+        self.assertIsNone(clustering._release_freed_memory())
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
+        linux = SimpleNamespace(platform="linux")
+        trim = mock.Mock(return_value=1)
+        cases = {
+            "this platform": (clustering.sys, clustering.ctypes),
+            "lookup raises OSError": (linux, SimpleNamespace(CDLL=mock.Mock(side_effect=OSError("no C library")))),
+            "no malloc_trim": (linux, SimpleNamespace(CDLL=mock.Mock(return_value=object()))),
+            "this C library on linux": (linux, clustering.ctypes),
+            "malloc_trim on linux": (linux, SimpleNamespace(CDLL=mock.Mock(return_value=SimpleNamespace(
+                malloc_trim=trim)))),
+            "malloc_trim not on linux": (SimpleNamespace(platform="darwin"), SimpleNamespace(CDLL=mock.Mock(
+                return_value=SimpleNamespace(malloc_trim=trim)))),
+        }
+        for case, (platform, c_library) in cases.items():
+            with self.subTest(case=case):
+                trim.reset_mock()
+                with mock.patch.object(clustering, "sys", platform), mock.patch.object(clustering, "ctypes", c_library):
+                    graph = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                             max_neighbors=self.max_neighbors)
+                self.assert_same_graph(graph, ref)
+                if case == "malloc_trim on linux":
+                    c_library.CDLL.assert_called_with(None)
+                    self.assertEqual(trim.call_args_list, [mock.call(0), mock.call(0)])
+                elif case == "malloc_trim not on linux":
+                    c_library.CDLL.assert_not_called()
+                    trim.assert_not_called()
+
+    def test_equal_weights_share_one_float(self):
+        """The table path, at the default cap and at a cap equal to the weights' float32 span: equal weights are one
+        object; past the cap (patched to 1), one float an edge as before. The same graph as K2's in all three, at
+        chunks of 1, 3, a divisor of the edge count, and the default."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
+        span = _float32_span(ref.es["weight"])
+        self.assertLess(span, clustering._GRAPH_WEIGHT_TABLE_MAX)
+        # One block: the whole fixture.
+        self.assertGreaterEqual(clustering._GRAPH_RESULT_BYTES // (self.max_neighbors * 12), self.n)
+        divisor = _exact_divisor([ref.ecount()])
+        for cap, shared in ((None, True), (span, True), (1, False)):
+            for chunk in (None, 1, 3, divisor):
+                with self.subTest(cap=cap, chunk=chunk), _patched("_GRAPH_WEIGHT_TABLE_MAX", cap), \
+                        _patched("_GRAPH_EDGE_CHUNK", chunk):
+                    graph = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                             max_neighbors=self.max_neighbors)
+                    self.assert_same_graph(graph, ref)
+                    if shared:
+                        self.assertTrue(_shares_equal_weights(graph.es["weight"]))
+
+
+class FlatSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
+    """flat (FlatGraphTest's fixture): also every pair, negative scores included, past the weight table's cap."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.flat, 1500, 256, 0.6, 30
+
+    @classmethod
+    def vectors(cls):
+        return _clustered_vectors(seed=5, n=cls.n, d=cls.d, n_centers=60, noise=1.0)
+
+    def test_every_pair_past_the_weight_table_cap(self):
+        """Threshold -1 at max_neighbors = n: every pair is an edge, in one block of two chunks, negative scores
+        among them, so the weights are one float an edge (no table)."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, -1.0, self.n)
+        self.assertEqual(ref.ecount(), self.n * (self.n - 1) // 2)
+        self.assertGreater(ref.ecount(), clustering._GRAPH_EDGE_CHUNK)
+        self.assertLess(ref.ecount(), 2 * clustering._GRAPH_EDGE_CHUNK)
+        self.assertGreaterEqual(clustering._GRAPH_RESULT_BYTES // (self.n * 12), self.n)
+        self.assertLess(min(ref.es["weight"]), 0)
+        self.assertGreater(_float32_span(ref.es["weight"]), clustering._GRAPH_WEIGHT_TABLE_MAX)
+        for chunk in (None, 1, 3, _exact_divisor([ref.ecount()])):
+            with self.subTest(chunk=chunk), _patched("_GRAPH_EDGE_CHUNK", chunk):
+                graph = clusterer.build_similarity_graph(threshold=-1.0, max_neighbors=self.n)
+                self.assert_same_graph(graph, ref)
+
+
+class IvfPqSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
+    """ivf_pq (IvfPqGraphTest's fixture): also the similarity-graph and cluster files equal K2's."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.ivf_pq, 1000, 64, 0.5, 1000
+    config = IndexConfig(nlist=16, m=8, nbits=4, nprobe=16, opq_train_size=1000)
+
+    @classmethod
+    def vectors(cls):
+        vectors = _clustered_vectors(seed=7, n=cls.n, d=cls.d, n_centers=40, noise=0.8)
+        for t in range(20):
+            vectors[500 + t] = vectors[10 * t]
+        return vectors
+
+    def test_files_as_k2(self):
+        """similarity-graph writes the GraphML of K2's graph, and cluster with a seed the TSV of leidenalg on it (both
+        at the commands' default --max-neighbors, 1000)."""
+        out = Path(self.tmp.name)
+        similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.graphml"))
+        cluster_database(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.tsv"), seed=1)
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, self.threshold, 1000)
+        self.assertIs(clusterer.graph, ref)
+        ref.write_graphml(str(out / "k2.graphml"))
+        clusterer.cluster_leiden(seed=1)
+        clusterer.export_clusters(str(out / "k2.tsv"))
+        self.assertGreater(ref.ecount(), 1000)
+        self.assertEqual((out / "q1.graphml").read_bytes(), (out / "k2.graphml").read_bytes())
+        self.assertEqual((out / "q1.tsv").read_bytes(), (out / "k2.tsv").read_bytes())
+
+
+class GraphEdgeCaseAsK2Test(unittest.TestCase):
+    """EdgeCaseTest's fixtures: no edge, one chain, and blocks with no kept edge between blocks with edges, each the
+    same as K2's graph; a block with no kept edge is not stored."""
+
+    n, d = 60, 16
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        folder = Path(cls.tmp.name)
+        vectors = np.zeros((cls.n, cls.d), dtype=np.float32)
+        vectors[:54, :8] = _clustered_vectors(seed=11, n=54, d=8, n_centers=6, noise=0.5)
+        vectors[54:, 8:14] = np.eye(6, dtype=np.float32)
+        cls.db_path = _build(folder, "flat", vectors, IndexType.flat)
+        cls.one_path = _build(folder, "one", vectors[:1], IndexType.flat)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    assert_same_list = _SameGraphAsK2.assert_same_list
+    assert_same_graph = _SameGraphAsK2.assert_same_graph
+
+    def test_no_edge(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = _k2_way(clusterer, 2.0, 10)
+        graph = clusterer.build_similarity_graph(threshold=2.0, max_neighbors=10)
+        self.assertEqual((graph.vcount(), graph.ecount(), graph.es["weight"]), (self.n, 0, []))
+        self.assert_same_graph(graph, ref)
+
+    def test_one_chain(self):
+        clusterer = EmbeddingClusterer(self.one_path)
+        ref = _k2_way(clusterer, 0.0, 10)
+        graph = clusterer.build_similarity_graph(threshold=0.0, max_neighbors=10)
+        self.assertEqual((graph.vcount(), graph.ecount()), (1, 0))
+        self.assert_same_graph(graph, ref)
+
+    def test_blocks_with_no_edge_between_blocks_with_edges(self):
+        threshold, k = 0.5, 10
+        clusterer = EmbeddingClusterer(self.db_path)
+        gaps = {}
+        for rows in (1, 2, 7):
+            with self.subTest(rows=rows), mock.patch.object(clustering, "_GRAPH_RESULT_BYTES", _budget(rows, k)):
+                ref = _k2_way(clusterer, threshold, k)
+                with_edges = sorted({i // rows for i, _ in ref.get_edgelist()})
+                gaps[rows] = len(set(range(with_edges[0], with_edges[-1])) - set(with_edges))
+                stored = []
+                edge_tuples, weight_list = clustering._edge_tuples, clustering._weight_list
+
+                def recording(real):
+                    def call(blocks):
+                        stored.append([len(b) for b in blocks])
+                        return real(blocks)
+                    return call
+
+                with mock.patch.object(clustering, "_edge_tuples", recording(edge_tuples)), \
+                        mock.patch.object(clustering, "_weight_list", recording(weight_list)):
+                    graph = clusterer.build_similarity_graph(threshold=threshold, max_neighbors=k)
+                self.assert_same_graph(graph, ref)
+                counts = np.bincount(np.array(ref.get_edgelist())[:, 0] // rows)
+                self.assertEqual(stored, [counts[with_edges].tolist()] * 2)
+        # Blocks of one chain: some with no kept edge lie between blocks with edges.
+        self.assertGreater(gaps[1], 0)
+
+
+class _PopRecorder(list):
+    """A list of blocks that records, at each pop, which of the original blocks are still alive."""
+
+    def __init__(self, blocks):
+        super().__init__(blocks)
+        self.refs = [weakref.ref(b) for b in blocks]
+        self.alive = []
+
+    def pop(self, *args):
+        self.alive.append([r() is not None for r in self.refs])
+        return super().pop(*args)
+
+
+class GraphPiecesTest(unittest.TestCase):
+    """The id dtype rule, the edge generator and the weight list on small blocks."""
+
+    def test_id_dtype(self):
+        self.assertEqual(clustering._GRAPH_INT32_MAX_ID, 2 ** 31 - 1)
+        for n_chains, dtype in ((0, np.int32), (1, np.int32), (2 ** 31, np.int32), (2 ** 31 + 1, np.int64),
+                                (2 ** 40, np.int64)):
+            with self.subTest(n_chains=n_chains):
+                self.assertIs(clustering._graph_id_dtype(n_chains), dtype)
+        with _patched("_GRAPH_INT32_MAX_ID", 9):
+            self.assertIs(clustering._graph_id_dtype(10), np.int32)
+            self.assertIs(clustering._graph_id_dtype(11), np.int64)
+
+    def test_edge_tuples_release_each_block_once_consumed(self):
+        blocks = [np.array([[0, 1], [0, 2]], dtype=np.int32), np.array([[1, 2], [1, 3], [1, 4]], dtype=np.int32),
+                  np.array([[3, 4]], dtype=np.int32)]
+        refs = [weakref.ref(b) for b in blocks]
+        with _patched("_GRAPH_EDGE_CHUNK", 2):
+            edges = clustering._edge_tuples(blocks)
+            got = [next(edges), next(edges)]
+            self.assertIsNotNone(refs[0]())
+            got.append(next(edges))
+            self.assertIsNone(refs[0]())
+            self.assertLess(len(blocks), 3)
+            got.extend(edges)
+        self.assertEqual(len(blocks), 0)
+        self.assertEqual([r() for r in refs], [None] * 3)
+        self.assertEqual(got, [(0, 1), (0, 2), (1, 2), (1, 3), (1, 4), (3, 4)])
+        self.assertTrue(all(type(e) is tuple and all(type(i) is int for i in e) for e in got))
+        self.assertEqual(list(clustering._edge_tuples([])), [])
+
+    def test_weight_list_releases_each_block_once_consumed(self):
+        for cap in (None, 1):
+            with self.subTest(cap=cap), _patched("_GRAPH_WEIGHT_TABLE_MAX", cap), _patched("_GRAPH_EDGE_CHUNK", 2):
+                blocks = _PopRecorder([np.float32([0.5, 0.75, 0.5]), np.float32([0.75]), np.float32([0.25, 0.5])])
+                expected = [0.5, 0.75, 0.5, 0.75, 0.25, 0.5]
+                got = clustering._weight_list(blocks)
+                self.assertEqual(got, expected)
+                self.assertEqual(len(blocks), 0)
+                self.assertEqual(blocks.alive, [[True, True, True], [False, True, True], [False, False, True]])
+                self.assertEqual([r() for r in blocks.refs], [None] * 3)
+
+    def test_weight_list_shares_equal_bit_patterns_across_slices_and_blocks(self):
+        blocks = [np.float32([0.5, 0.75, 0.5]), np.float32([]), np.float32([0.75, 0.5, 1.0])]
+        expected = [w for b in blocks for w in b.tolist()]
+        with _patched("_GRAPH_EDGE_CHUNK", 2):
+            got = clustering._weight_list(list(blocks))
+        self.assertEqual(got, expected)
+        self.assertTrue(all(type(w) is float for w in got))
+        self.assertTrue(got[0] is got[2] is got[4])
+        self.assertTrue(got[1] is got[3])
+        self.assertEqual(clustering._weight_list([]), [])
+        self.assertEqual(clustering._weight_list([np.float32([])]), [])
+
+    def test_weight_list_keeps_the_sign_of_zero(self):
+        """0.0 with -0.0 spans past the cap (one float an edge); -0.0 alone takes the table: signs kept either way."""
+        for values, shared in (([0.0, -0.0, 0.5], False), ([-0.0, -0.0], True)):
+            with self.subTest(values=values):
+                block = np.float32(values)
+                self.assertEqual(_float32_span(block) <= clustering._GRAPH_WEIGHT_TABLE_MAX, shared)
+                expected = block.tolist()
+                got = clustering._weight_list([block])
+                self.assertEqual(np.asarray(got, dtype=np.float64).tobytes(),
+                                 np.asarray(expected, dtype=np.float64).tobytes())
+                self.assertEqual([math.copysign(1.0, w) for w in got], [math.copysign(1.0, w) for w in expected])
+                self.assertTrue(all(type(w) is float for w in got))
+                if shared:
+                    self.assertIs(got[0], got[1])
 
 
 if __name__ == "__main__":
