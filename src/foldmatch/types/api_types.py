@@ -83,6 +83,12 @@ class IndexType(str, Enum):
     ivf_pq = "ivf_pq"    # OPQ + IVF-PQ with OnDiskInvertedLists — approximate, on-disk
 
 
+class ClusterMethod(str, Enum):
+    """Clustering method of ``fm-search cluster``."""
+    leiden = "leiden"    # Leiden on the similarity graph: memory grows with the edges (the default)
+    greedy = "greedy"    # greedy representatives in one streamed pass: memory grows with the chains
+
+
 class FormatMode(str, Enum):
     """How a result file is laid out.
 

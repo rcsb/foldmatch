@@ -24,12 +24,14 @@ from foldmatch.search.output import (
     DEFAULT_FORMAT_OUTPUT,
     EMBEDDING_OUTPUT_FIELDS,
     ESM_CODES_OUTPUT_FIELDS,
+    GREEDY_CLUSTER_OUTPUT_FIELDS,
     SUPPORTED_OUTPUT_FIELDS,
     write_embedding_results,
 )
 from foldmatch.types.api_types import (
     StructureFormat,
     Accelerator,
+    ClusterMethod,
     Strategy,
     Granularity,
     IndexConfig,
@@ -1530,24 +1532,38 @@ def show_statistics(
 
 @app.command(
     name="cluster",
-    help="Cluster database embeddings using Leiden algorithm on similarity graph."
+    help="Cluster database embeddings: Leiden on the similarity graph (default), or greedy representatives in one "
+         "streamed pass (--method greedy)."
 )
 def cluster_database(
         db_path: Annotated[str, typer.Option(
             help='Path to the FAISS database.'
         )],
+        method: Annotated[ClusterMethod, typer.Option(
+            help='Clustering method: leiden builds the similarity graph and runs Leiden (memory grows with the edges); '
+                 'greedy picks representatives in one streamed pass over the database (memory grows with the chains, '
+                 'searches only chains no representative has taken; for collections whose graph does not fit in '
+                 'memory).'
+        )] = ClusterMethod.leiden,
         threshold: Annotated[float, typer.Option(
-            help='Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ estimates).'
+            help='Similarity threshold (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ '
+                 'estimates): with --method leiden, the edge threshold; with --method greedy, a representative takes '
+                 'the still-unclustered neighbours scoring at least this.'
         )] = 0.8,
-        resolution: Annotated[float, typer.Option(
-            help='Leiden resolution parameter (higher = more clusters).'
-        )] = 1.0,
+        resolution: Annotated[Optional[float], typer.Option(
+            help='Leiden resolution parameter (higher = more clusters). Default: 1.0. --method leiden only.'
+        )] = None,
         output_file: Annotated[str, typer.Option(
             help='Path to save cluster assignments, as tab-separated rows with '
-                 f'no header: {", ".join(CLUSTER_OUTPUT_FIELDS)}.'
+                 f'no header: {", ".join(CLUSTER_OUTPUT_FIELDS)} (--method leiden) or '
+                 f'{", ".join(GREEDY_CLUSTER_OUTPUT_FIELDS)} (--method greedy, the representative\'s chain id last); '
+                 'cluster_id 0 is the largest cluster.'
         )] = "clusters.tsv",
         max_neighbors: Annotated[int, typer.Option(
-            help='Maximum number of neighbors to consider per chain'
+            help='Maximum number of neighbors to consider per chain. With --method greedy, the neighbours a '
+                 'representative takes from, so also a cluster\'s size cap (this + 1); when most representatives have '
+                 'this many neighbours above --threshold, clusters are bounded by it rather than by --threshold (see '
+                 'the statistics).'
         )] = 1000,
         min_cluster_size: Annotated[Optional[int], typer.Option(
             help='Minimum cluster size to include in output (filters smaller clusters).'
@@ -1556,7 +1572,7 @@ def cluster_database(
             help='Use GPU for FAISS operations (requires faiss-gpu).'
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
-            help='Random seed for reproducibility.'
+            help='Random seed for reproducibility (--method leiden only; greedy is deterministic).'
         )] = None,
         format_mode: Annotated[FormatMode, typer.Option(
             help=_FORMAT_MODE_HELP
@@ -1565,9 +1581,11 @@ def cluster_database(
             help='Logging level.'
         )] = LogLevel.info
 ):
-    """Cluster database embeddings using Leiden algorithm."""
+    """Cluster database embeddings: Leiden on the similarity graph, or greedy representatives in one streamed pass."""
 
     set_log_level(log_level)
+    method = _refuse_leiden_only_options(method, resolution=resolution, seed=seed)
+    _refuse_max_neighbors_below_1(max_neighbors)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
@@ -1581,17 +1599,24 @@ def cluster_database(
         use_gpu=use_gpu_index
     )
 
-    # Build similarity graph
-    clusterer.build_similarity_graph(
-        threshold=threshold,
-        max_neighbors=max_neighbors
-    )
+    if method is ClusterMethod.greedy:
+        # Greedy representatives, streamed: no graph
+        clusterer.cluster_greedy(
+            threshold=threshold,
+            max_neighbors=max_neighbors
+        )
+    else:
+        # Build similarity graph
+        clusterer.build_similarity_graph(
+            threshold=threshold,
+            max_neighbors=max_neighbors
+        )
 
-    # Perform clustering
-    clusterer.cluster_leiden(
-        resolution=resolution,
-        seed=seed
-    )
+        # Perform clustering
+        clusterer.cluster_leiden(
+            resolution=1.0 if resolution is None else resolution,
+            seed=seed
+        )
 
     # Display statistics
     clusterer.print_statistics()
@@ -1631,6 +1656,7 @@ def similarity_graph(
     """Build and export a similarity graph from database embeddings."""
 
     set_log_level(log_level)
+    _refuse_max_neighbors_below_1(max_neighbors)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
@@ -3231,6 +3257,34 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
         raise typer.BadParameter(f"must be >= 0 ('inf' for no E-value filter), got {values['max_evalue']}.",
                                  param_hint="--max-evalue")
     return QueryStage2Options(scoring=scoring, **values)
+
+
+#: The ``cluster`` options of the Leiden route only, refused under ``--method greedy`` (T5: exit status 2).
+_LEIDEN_ONLY_OPTIONS = (("resolution", "--resolution"), ("seed", "--seed"))
+
+
+def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
+    """``cluster``'s ``--method``: under greedy, every Leiden-only option given (not None; :data:`_LEIDEN_ONLY_OPTIONS`)
+    is refused in one ``typer.BadParameter`` (exit status 2), before the database is loaded. Returns the method."""
+    try:
+        method = ClusterMethod(method)
+    except ValueError:
+        raise typer.BadParameter(f"{method!r} is not a clustering method; expected one of "
+                                 f"{', '.join(m.value for m in ClusterMethod)}.", param_hint="--method") from None
+    refused = [flag for name, flag in _LEIDEN_ONLY_OPTIONS if given.get(name) is not None]
+    if method is ClusterMethod.greedy and refused:
+        raise typer.BadParameter(
+            f"{', '.join(refused)} {'is a Leiden option' if len(refused) == 1 else 'are Leiden options'}: "
+            f"--method greedy has no resolution and is deterministic. "
+            f"Remove {'it' if len(refused) == 1 else 'them'}, or use --method leiden.", param_hint="--method")
+    return method
+
+
+def _refuse_max_neighbors_below_1(max_neighbors: int):
+    """``cluster`` and ``similarity-graph``: ``--max-neighbors`` below 1 is refused (exit status 2) before the database
+    is loaded; FAISS would refuse k = 0 with a bare AssertionError after it."""
+    if max_neighbors < 1:
+        raise typer.BadParameter("--max-neighbors must be at least 1.", param_hint="--max-neighbors")
 
 
 def _output_fields(format_output: str) -> List[str]:

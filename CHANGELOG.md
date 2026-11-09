@@ -282,6 +282,27 @@ While the major version is `0`, breaking changes are released in a minor bump.
 - **`fm-search download-models`**: the same command, with the same `--system`
   option and help, as `fm-embedding download-models` and `inference
   download-models`, since `fm-search` now uses the scoring bundle too.
+- **`fm-search cluster --method greedy`**: greedy representatives in one
+  streamed pass over the database, for collections whose similarity graph does
+  not fit in memory. Chains are taken in database order; a chain in no cluster
+  yet becomes a representative and takes the chains among its
+  `--max-neighbors` nearest that score at least `--threshold` and are in no
+  cluster yet. Each block's search results are dropped once used, so memory
+  grows with the number of chains, not with the number of edges, and only
+  chains no representative has taken are searched. Deterministic (no seed).
+  Clusters have at most `--max-neighbors` + 1 chains and, when most
+  representatives have `--max-neighbors` neighbours above `--threshold`, are
+  bounded by `--max-neighbors` rather than by `--threshold` (the statistics
+  report that share, with a warning when it is above half). Results depend on
+  database order. The output gains a 4th column, `representative` (the
+  representative's chain id), and cluster ids are numbered by decreasing size
+  under both methods (`cluster_id` 0 is the largest cluster; Leiden's already
+  were). `--method leiden`, the graph and Leiden as before, stays the default.
+  Measured with this command: 30,430,281 chains, `ivf_pq`, `--max-neighbors`
+  1000, `--threshold` 0.8, one NERSC m4468 CPU node (2 x AMD EPYC 7763, 128
+  cores / 256 threads, `OMP_NUM_THREADS` 128): 53.4 min from the load to the
+  last block, 54:11 min wall for the whole command (with the start-up, the
+  statistics and the export of the 1.65 GB file), peak RSS 5.57 GiB.
 
 ### Changed
 
@@ -305,6 +326,12 @@ While the major version is `0`, breaking changes are released in a minor bump.
   concatenated into one array, they are handed to igraph without a temporary
   NumPy array conversion, and equal edge weights are stored once. The graph,
   its weights, the clusters and the output files are unchanged.
+- **BREAKING — `fm-search cluster --method greedy` refuses `--resolution` and
+  `--seed`**, the Leiden options (greedy has no resolution and is
+  deterministic), in one message. **`--max-neighbors` below 1 is refused** by
+  `cluster` and `similarity-graph` before the database is loaded (it raised a
+  bare FAISS `AssertionError` after the load). `--resolution`'s default, 1.0,
+  is now stated in its help instead of Typer's `[default: 1.0]`.
 - **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
   sequences` and `fm-search query db`, matching the coverage cut-off other
   alignment tools apply by default. Pass `--min-coverage 0` for the previous

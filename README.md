@@ -21,7 +21,7 @@ If you are interested in training a new model with a new structure dataset, visi
 - **Structure-level embeddings** aggregated via a transformer-based aggregator network 
 - **Fast and efficient** FAISS-based similarity search
 - **Two-stage sequence search** — an embedding prefilter followed by exact pairwise Smith-Waterman alignment on FoldMatch's native SIMD kernel, reporting sequence identity, coverage, and calibrated E-values over selectable output columns
-- **Structural clustering** using the Leiden algorithm for biological assembly identification
+- **Structural clustering**: Leiden on the similarity graph, or greedy representatives in one streamed pass for collections whose graph does not fit in memory
 - **Command-line interface** implemented with Typer for high-throughput inference workflows  
 - **Python API** for interactive embedding computation and integration into analysis pipelines  
 - **High-performance inference** leveraging PyTorch Lightning, with multi-node and multi-GPU support  
@@ -211,12 +211,15 @@ fm-search query db          --query-db-path dbs/queries --subject-db-path dbs/my
 # Inspect, cluster, export
 fm-search stats             --db-path dbs/my_db
 fm-search cluster           --db-path dbs/my_db --output-file clusters.tsv
+fm-search cluster           --db-path dbs/my_db --output-file clusters.tsv --method greedy
 fm-search similarity-graph  --db-path dbs/my_db --output-file graph.graphml
 ```
 
 All `build` commands accept `--index-type [auto|flat|hnsw|ivf_pq]` and IVF-PQ tuning flags (`--ivf-nlist`, `--ivf-nprobe`). See `fm-search <subcommand> --help` for the full surface.
 
-`cluster` and `similarity-graph` work on every database type. On `ivf_pq` a score is estimated from the PQ codes (the chain's decoded embedding, normalised, against each stored code, as in `query db`), so two identical chains score close to, but not exactly, 1. The k-NN search takes time in proportion to the number of chains and `--max-neighbors`, whatever `--threshold`; the graph's memory grows with the number of edges, which `--threshold` and `--max-neighbors` bound (at most `--max-neighbors` edges from each chain's search), and the Leiden step's memory also grows with the number of chains. The Leiden step of `cluster` runs on one CPU thread.
+`cluster` and `similarity-graph` work on every database type. On `ivf_pq` a score is estimated from the PQ codes (the chain's decoded embedding, normalised, against each stored code, as in `query db`), so two identical chains score close to, but not exactly, 1. With `--method leiden` (the default) the k-NN search takes time in proportion to the number of chains and `--max-neighbors`, whatever `--threshold`; `--method greedy` searches only chains no representative has taken, so its time also depends on `--threshold` and on database order. The graph's memory grows with the number of edges, which `--threshold` and `--max-neighbors` bound (at most `--max-neighbors` edges from each chain's search), and the Leiden step's memory also grows with the number of chains. The Leiden step of `cluster` runs on one CPU thread.
+
+`cluster --method greedy` clusters collections whose similarity graph does not fit in memory. When most chains have `--max-neighbors` neighbours above `--threshold`, the Leiden route keeps about `n x --max-neighbors / 2` edges for `n` chains: 447,547,205 edges for 1,000,000 chains in an `ivf_pq` database (`--max-neighbors 1000`, `--threshold 0.8`), about 15.1e9 for 30.4M chains (`ivf_pq`); with fewer neighbours above the threshold, fewer (219,292,519 for the same 1,000,000 chains on `hnsw`, where few chains reach `--max-neighbors`). Leiden's memory grows with the edges (on that 1M-chain `ivf_pq` database, `cluster` peaked at 34.99 GiB, about 83 bytes an edge above the memory before the load, on Linux x86_64 at 128 threads), greedy's with the chains: it picks representatives in one streamed pass over the database, dropping each block's search results once used. A cluster is a representative and the still-unclustered chains among its `--max-neighbors` nearest that score at least `--threshold` (MMseqs2/CD-HIT style): chains are taken in database order, and a chain in no cluster yet becomes a representative. When most representatives have `--max-neighbors` neighbours above the threshold (the statistics report the share; 98.96% of rows in the first 10 blocks of a 30.4M-chain `ivf_pq` database), clusters are bounded by `--max-neighbors`, and a representative or singleton can score above the threshold with an earlier representative. Greedy clusters are smaller and tighter than Leiden's few large communities at 0.8: higher family purity, lower completeness and family ARI (measured at 100k and 1M chains). Results depend on database order (the order chains were added), as CD-HIT's depend on length order. `--max-neighbors` caps cluster size at `--max-neighbors` + 1 chains (on `hnsw`, FAISS's `efSearch` of 16 returns fewer: 481.7 of 1000 on average on a 100k-chain database, so a larger value adds few). Greedy needs no graph and computes no modularity; it has no resolution and is deterministic, so `--resolution` and `--seed` are refused with it.
 
 #### Output format
 
@@ -254,6 +257,14 @@ A **sequence-identity** search (Stage 2, below) emits the columns chosen with `-
 ```
 chain_id   cluster_id   cluster_size
 ```
+
+and, with `--method greedy`, a fourth column, the representative's chain id (equal to `chain_id` on the representative's own row):
+
+```
+chain_id   cluster_id   cluster_size   representative
+```
+
+`cluster_id` 0 is the largest cluster, under both methods (ties under greedy in representative order). Rows are in database order; `--min-cluster-size` drops the rows of smaller clusters.
 
 (`similarity-graph` is the one exception: GraphML is a graph format, not tabular.)
 

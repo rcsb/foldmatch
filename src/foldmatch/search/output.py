@@ -175,28 +175,37 @@ def write_embedding_results(
 # rather than a query/target pair, so it has its own column set — but the same
 # tab-separated, no-header file convention.
 CLUSTER_OUTPUT_FIELDS: Tuple[str, ...] = ("chain_id", "cluster_id", "cluster_size")
+# Columns of ``fm-search cluster --method greedy``: the representative's chain
+# id follows (equal to ``chain_id`` on the representative's own row).
+GREEDY_CLUSTER_OUTPUT_FIELDS: Tuple[str, ...] = CLUSTER_OUTPUT_FIELDS + ("representative",)
 
 
 def write_cluster_results(
-        assignments: Iterable[Tuple[str, int, int]],
+        assignments: Iterable[Tuple],
         output_file: str,
         format_mode: FormatMode = FormatMode.headless_tsv,
+        fields: Tuple[str, ...] = CLUSTER_OUTPUT_FIELDS,
 ) -> int:
-    """Write cluster assignments in :data:`CLUSTER_OUTPUT_FIELDS` order.
+    """Write cluster assignments in ``fields`` order (:data:`CLUSTER_OUTPUT_FIELDS`
+    or :data:`GREEDY_CLUSTER_OUTPUT_FIELDS`).
 
-    ``assignments`` is an iterable of ``(chain_id, cluster_id, cluster_size)``;
-    the caller owns which rows to include (e.g. a ``min_cluster_size`` filter).
-    Emitting the columns here keeps their order next to the declared field list,
-    which the CLI help text is generated from. Returns the number of data rows.
+    ``assignments`` is an iterable of rows of one value per field, e.g.
+    ``(chain_id, cluster_id, cluster_size)``; the caller owns which rows to
+    include (e.g. a ``min_cluster_size`` filter). Emitting the columns here keeps
+    their order next to the declared field list, which the CLI help text is
+    generated from. Returns the number of data rows.
     """
     delimiter = format_spec(format_mode).delimiter
-    return _emit(
-        CLUSTER_OUTPUT_FIELDS,
-        (delimiter.join((str(chain_id), str(cluster_id), str(cluster_size)))
-         for chain_id, cluster_id, cluster_size in assignments),
-        output_file,
-        format_mode,
-    )
+    n_fields = len(fields)
+
+    def _rows():
+        for row in assignments:
+            if len(row) != n_fields:
+                raise ValueError(f"cluster row {row!r} has {len(row)} values for the {n_fields} fields "
+                                 f"{', '.join(fields)}")
+            yield delimiter.join(map(str, row))
+
+    return _emit(fields, _rows(), output_file, format_mode)
 
 
 # --------------------------------------------------------------------------- #
