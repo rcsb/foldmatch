@@ -1540,18 +1540,25 @@ def cluster_database(
             help='Path to the FAISS database.'
         )],
         method: Annotated[ClusterMethod, typer.Option(
-            help='Clustering method: leiden builds the similarity graph and runs Leiden (memory grows with the edges); '
+            help='Clustering method: leiden builds the similarity graph and runs Leiden (python-igraph, a fixed number '
+                 'of iterations, --leiden-iterations; memory grows with the edges); '
                  'greedy picks representatives in one streamed pass over the database (memory grows with the chains, '
                  'searches only chains no representative has taken; for collections whose graph does not fit in '
                  'memory).'
         )] = ClusterMethod.leiden,
         threshold: Annotated[float, typer.Option(
             help='Similarity threshold (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ '
-                 'estimates): with --method leiden, the edge threshold; with --method greedy, a representative takes '
+                 'estimates): with --method leiden, the edge threshold, and the kept scores must be at least 0 '
+                 '(Leiden\'s modularity needs non-negative edge weights); with --method greedy, a representative takes '
                  'the still-unclustered neighbours scoring at least this.'
         )] = 0.8,
         resolution: Annotated[Optional[float], typer.Option(
             help='Leiden resolution parameter (higher = more clusters). Default: 1.0. --method leiden only.'
+        )] = None,
+        leiden_iterations: Annotated[Optional[int], typer.Option(
+            help='Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured 1M-chain graphs '
+                 'agreed with Leiden run to convergence within seed noise; fewer are faster, with somewhat noisier '
+                 'partitions. --method leiden only.'
         )] = None,
         output_file: Annotated[str, typer.Option(
             help='Path to save cluster assignments, as tab-separated rows with '
@@ -1572,7 +1579,8 @@ def cluster_database(
             help='Use GPU for FAISS operations (requires faiss-gpu).'
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
-            help='Random seed for reproducibility (--method leiden only; greedy is deterministic).'
+            help='Random seed of the Leiden step: the same seed gives the same clusters; without it each run may '
+                 'differ. At least 0. --method leiden only (greedy is deterministic).'
         )] = None,
         format_mode: Annotated[FormatMode, typer.Option(
             help=_FORMAT_MODE_HELP
@@ -1584,7 +1592,11 @@ def cluster_database(
     """Cluster database embeddings: Leiden on the similarity graph, or greedy representatives in one streamed pass."""
 
     set_log_level(log_level)
-    method = _refuse_leiden_only_options(method, resolution=resolution, seed=seed)
+    method = _refuse_leiden_only_options(method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed)
+    if leiden_iterations is not None and leiden_iterations < 1:
+        raise typer.BadParameter("--leiden-iterations must be at least 1.", param_hint="--leiden-iterations")
+    if seed is not None and seed < 0:
+        raise typer.BadParameter("--seed must be at least 0.", param_hint="--seed")
     _refuse_max_neighbors_below_1(max_neighbors)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
@@ -1593,7 +1605,7 @@ def cluster_database(
 
     # Initialize clusterer
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import EmbeddingClusterer
+    from foldmatch.search.clustering import EmbeddingClusterer, _LEIDEN_ITERATIONS
     clusterer = EmbeddingClusterer(
         db_path=db_path,
         use_gpu=use_gpu_index
@@ -1611,10 +1623,16 @@ def cluster_database(
             threshold=threshold,
             max_neighbors=max_neighbors
         )
+        # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
+        if clusterer.min_weight < 0:
+            raise typer.BadParameter(f"with --method leiden, Leiden's modularity needs non-negative edge weights, and "
+                                     f"this --threshold kept a score of {clusterer.min_weight:.4g}. Use a --threshold "
+                                     f"of 0 or more, or --method greedy.", param_hint="--threshold")
 
         # Perform clustering
         clusterer.cluster_leiden(
             resolution=1.0 if resolution is None else resolution,
+            n_iterations=_LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations,
             seed=seed
         )
 
@@ -3260,7 +3278,8 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
 
 
 #: The ``cluster`` options of the Leiden route only, refused under ``--method greedy`` (T5: exit status 2).
-_LEIDEN_ONLY_OPTIONS = (("resolution", "--resolution"), ("seed", "--seed"))
+_LEIDEN_ONLY_OPTIONS = (("resolution", "--resolution"), ("leiden_iterations", "--leiden-iterations"),
+                        ("seed", "--seed"))
 
 
 def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
@@ -3275,7 +3294,7 @@ def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> Cluster
     if method is ClusterMethod.greedy and refused:
         raise typer.BadParameter(
             f"{', '.join(refused)} {'is a Leiden option' if len(refused) == 1 else 'are Leiden options'}: "
-            f"--method greedy has no resolution and is deterministic. "
+            f"--method greedy has no resolution or iteration count and is deterministic. "
             f"Remove {'it' if len(refused) == 1 else 'them'}, or use --method leiden.", param_hint="--method")
     return method
 

@@ -10,6 +10,16 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Added
 
+- **`--leiden-iterations`** on `fm-search cluster`: the number of Leiden
+  iterations, a fixed count (default 10, at least 1; below 1 it is refused
+  with exit status 2 before the database is loaded). Fewer iterations are
+  faster, with somewhat noisier partitions: on a 1M-chain graph
+  (`--max-neighbors` 50), the Leiden step took 26.9-28.4 s at 2 iterations
+  against 77.7-78.5 s at 10 (one thread, NERSC CPU nodes), and two seeds
+  agreed at a mean AMI of 0.7548 against 0.7659 (10 pairs of 5 seeds).
+  `--method leiden` only: refused under `--method greedy`, with
+  `--resolution` and `--seed`, in one message.
+
 - **`--max-evalue`** on `fm-search query sequences` and `fm-search query db`:
   drops Stage-2 hits whose database E-value is above the threshold. Defaults to
   `1e-3`, so a default search now reports only statistically significant
@@ -332,6 +342,51 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `cluster` and `similarity-graph` before the database is loaded (it raised a
   bare FAISS `AssertionError` after the load). `--resolution`'s default, 1.0,
   is now stated in its help instead of Typer's `[default: 1.0]`.
+- **BREAKING — `fm-search cluster`'s Leiden step runs on python-igraph's
+  `Graph.community_leiden`** (modularity, the same objective at
+  `--resolution`, a fixed 10 iterations by default, set by the new
+  `--leiden-iterations`) instead of `leidenalg` run to convergence;
+  `leidenalg` is no longer a dependency. `--resolution` works as before: at
+  0.5 and 2.0 on a 1M-chain graph (`--max-neighbors` 50) the new partitions'
+  largest cluster, cluster count and modularity overlap `leidenalg`'s across
+  seeds, and the new partitions agree with `leidenalg`'s about as well as two
+  seeds of either library agree. **Partitions and cluster labels change for
+  the same `--seed`**, by about as much as a change of seed: on a 1M-chain
+  graph (`hnsw`, `--threshold` 0.8, `--max-neighbors` 1000), the new
+  partitions agree with `leidenalg`'s converged ones at AMI 0.857 (ARI 0.778;
+  3 seeds against 2), while two `leidenalg` seeds agree at AMI 0.854 (ARI
+  0.763) and two new seeds at 0.859 (ARI 0.790); modularity 0.6663-0.6687
+  against 0.6653-0.6696. The Leiden step took 679-852 s instead of
+  6,514-7,671 s on that graph (one thread, NERSC CPU and GPU nodes), and
+  needed about 5.1 GiB of working memory instead of 11.8 GiB in a standalone
+  run of the Leiden step on that graph (`cluster`'s own `leidenalg` Leiden
+  phase measured about 8.7 GiB there). In `cluster` itself (seeds 42-44,
+  `--threshold` 0.8, `--max-neighbors` 1000, Linux x86_64 at 128 threads),
+  the Leiden phase needed 5.1 GiB above the built graph instead of 8.7 GiB
+  on that `hnsw` database, and the run peaked at 20.2 GiB instead of 23.79
+  GiB (VmHWM); on a 1M-chain `ivf_pq` database (447,547,205 edges), 10.3
+  GiB instead of 17.1 GiB, a peak of 28.16 GiB instead of 34.99 GiB, and a
+  Leiden step of 1,714-1,936 s instead of 17,945 s (new: a NERSC GPU node;
+  old: a CPU node). Cluster ids stay by decreasing size (0 the largest),
+  ties now by the smallest chain index, as under greedy. **`--seed` below 0
+  is refused** (exit status 2, before the load): the new generator gives
+  seeds n and -n the same partition. `--seed` 2**31 and above now work
+  (`leidenalg` raised `OverflowError`). **`--threshold` below 0 with
+  `--method leiden` is refused when a kept edge score is negative** (exit
+  status 2, after the graph is built; previously `leidenalg` raised a bare
+  `BaseException` then). A negative threshold whose kept scores are all at
+  least 0 worked and still works. **Library**:
+  `EmbeddingClusterer.cluster_leiden` returns a NumPy array (it returned a
+  list); its `n_iterations` defaults to 10 and must be at least 1 (it
+  defaulted to -1, run to convergence); it raises `ValueError` for a seed
+  below 0 (`leidenalg` accepted negative seeds; the new generator gives seeds
+  n and -n the same partition) and for a graph built with a negative kept
+  weight. It seeds python-igraph's random generator privately
+  (`random.Random(seed)`), leaving Python's global `random` state untouched
+  as `leidenalg` did, and restores python-igraph's generator to the `random`
+  module afterwards (a caller's own igraph generator is replaced). Seeds are
+  integers of at least 0 (`operator.index`: NumPy integers accepted, floats
+  refused).
 - **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
   sequences` and `fm-search query db`, matching the coverage cut-off other
   alignment tools apply by default. Pass `--min-coverage 0` for the previous

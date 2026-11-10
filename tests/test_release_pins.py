@@ -194,7 +194,7 @@ class DependencyPinsTest(unittest.TestCase):
         self.dependencies = tomllib.loads(path.read_text())["project"]["dependencies"]
 
     def test_every_dependency_is_an_exact_pin(self):
-        self.assertGreaterEqual(len(self.dependencies), 13)
+        self.assertGreaterEqual(len(self.dependencies), 12)
         for requirement in self.dependencies:
             with self.subTest(requirement=requirement):
                 self.assertRegex(requirement, r"^[A-Za-z0-9][A-Za-z0-9._-]*==[0-9][0-9A-Za-z.+!]*$")

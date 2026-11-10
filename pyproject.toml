@@ -25,7 +25,6 @@ dependencies=[
     "httpx==0.28.1",
     "faiss-cpu==1.15.1",
     "igraph==1.0.0",
-    "leidenalg==0.11.0",
     "pyarrow==24.0.0",
     "threadpoolctl==3.6.0",
 ]

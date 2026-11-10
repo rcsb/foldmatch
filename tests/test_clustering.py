@@ -1,8 +1,16 @@
 """EmbeddingClusterer.build_similarity_graph: blocks of chains read with reconstruct_n and searched many at a time give,
 on every database type, the expected graph: on hnsw the one-query-per-call graph bit for bit, on flat the same up to
-float rounding, and on ivf_pq the normalised decoded query against each code."""
+float rounding, and on ivf_pq the normalised decoded query against each code. Also cluster_leiden on python-igraph's
+Leiden (P9.U): the call, its private seeding, the cluster ids by size, and its refusals."""
+import hashlib
 import logging
 import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -19,7 +27,10 @@ import faiss
 import igraph as ig
 import numpy as np
 from tqdm import tqdm
+from typer.testing import CliRunner
 
+import foldmatch
+from foldmatch.cli import search
 from foldmatch.cli.search import cluster_database, similarity_graph
 from foldmatch.search import clustering
 from foldmatch.search.clustering import EmbeddingClusterer
@@ -403,7 +414,7 @@ class EdgeCaseTest(_GraphCase):
         clusterer = EmbeddingClusterer(self.one_path)
         graph = clusterer.build_similarity_graph(threshold=0.0, max_neighbors=10)
         self.assertEqual((graph.vcount(), graph.ecount()), (1, 0))
-        self.assertEqual(clusterer.cluster_leiden(seed=1), [0])
+        self.assertEqual(clusterer.cluster_leiden(seed=1).tolist(), [0])
         stats = clusterer.get_cluster_statistics()
         self.assertEqual((stats["n_clusters"], stats["n_singletons"]), (1, 1))
 
@@ -413,7 +424,7 @@ class EdgeCaseTest(_GraphCase):
         self.assertEqual((graph.vcount(), graph.ecount()), (self.n, 0))
         self.assertEqual(graph.es["weight"], [])
         clusters = clusterer.cluster_leiden(seed=1)
-        self.assertEqual(sorted(clusters), list(range(self.n)))
+        self.assertEqual(clusters.tolist(), list(range(self.n)))
         stats = clusterer.get_cluster_statistics()
         self.assertEqual((stats["n_clusters"], stats["n_singletons"], stats["max_cluster_size"]), (self.n, self.n, 1))
         self.assertTrue(math.isnan(stats["modularity"]))
@@ -800,7 +811,7 @@ class IvfPqSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
         return vectors
 
     def test_files_as_k2(self):
-        """similarity-graph writes the GraphML of K2's graph, and cluster with a seed the TSV of leidenalg on it (both
+        """similarity-graph writes the GraphML of K2's graph, and cluster with a seed the Leiden TSV on it (both
         at the commands' default --max-neighbors, 1000)."""
         out = Path(self.tmp.name)
         similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.graphml"))
@@ -962,6 +973,420 @@ class GraphPiecesTest(unittest.TestCase):
                 self.assertTrue(all(type(w) is float for w in got))
                 if shared:
                     self.assertIs(got[0], got[1])
+
+
+# P9.U: cluster_leiden runs python-igraph's community_leiden, a fixed number of iterations, seeded with a private
+# random.Random, cluster ids by decreasing size, ties by smallest chain index.
+
+_SRC = str(Path(foldmatch.__file__).resolve().parent.parent)
+
+
+def _reference_leiden(graph: ig.Graph, seed: int, resolution: float = 1.0, n_iterations: int = 10) -> list:
+    """P9.U's Leiden call, made here and not through the code under test: python-igraph's community_leiden with its
+    arguments, seeded with random.seed (Python's global state saved and restored around it), and the cluster ids
+    renumbered in pure Python by (-size, smallest chain index)."""
+    state = random.getstate()
+    try:
+        random.seed(seed)
+        membership = graph.community_leiden(objective_function="modularity", weights="weight", resolution=resolution,
+                                            beta=0.01, n_iterations=n_iterations).membership
+    finally:
+        random.setstate(state)
+    members = {}
+    for chain, cluster in enumerate(membership):
+        members.setdefault(cluster, []).append(chain)
+    order = sorted(members, key=lambda c: (-len(members[c]), members[c][0]))
+    new_id = {cluster: rank for rank, cluster in enumerate(order)}
+    return [new_id[cluster] for cluster in membership]
+
+
+def _as_sets(membership) -> set:
+    """A partition as a set of frozensets of chain indexes, whatever its labels."""
+    members = {}
+    for chain, cluster in enumerate(membership):
+        members.setdefault(int(cluster), set()).add(chain)
+    return {frozenset(m) for m in members.values()}
+
+
+def _flat(text: str) -> str:
+    """Text on one line, typer's error panel borders and colour codes dropped."""
+    return " ".join(re.sub(r"\x1b\[[0-9;]*m", "", text).translate({ord(c): " " for c in "│╭╮╰╯─"}).split())
+
+
+class _LeidenSpy:
+    """python-igraph's Graph.community_leiden, recording the keyword arguments of each call while patched."""
+
+    def __init__(self):
+        self.calls = []
+
+    def patch(self):
+        real, calls = ig.Graph.community_leiden, self.calls
+
+        def community_leiden(graph, *args, **kwargs):
+            assert not args, args
+            calls.append(kwargs)
+            return real(graph, **kwargs)
+
+        return mock.patch.object(ig.Graph, "community_leiden", community_leiden)
+
+
+# Imports the clustering module and the CLI with the removed Leiden package blocked, then runs cluster on a database.
+# The package's name is spelled in two pieces so that a grep of the repository for it finds nothing.
+_NO_LEIDEN_PACKAGE_CHILD = """
+import sys
+sys.modules["leiden" + "alg"] = None
+import lightning  # noqa: F401
+import foldmatch
+assert foldmatch.__file__.startswith(sys.argv[1]), foldmatch.__file__
+import foldmatch.search.clustering
+from foldmatch.cli.search import cluster_database
+cluster_database(db_path=sys.argv[2], threshold=0.5, max_neighbors=10, seed=3, output_file=sys.argv[3])
+print("cluster ran")
+"""
+
+# Prints the digest of cluster_leiden's array at one seed, in a fresh process.
+_SEED_DIGEST_CHILD = """
+import hashlib
+import sys
+import lightning  # noqa: F401
+import foldmatch
+assert foldmatch.__file__.startswith(sys.argv[1]), foldmatch.__file__
+from foldmatch.search.clustering import EmbeddingClusterer
+clusterer = EmbeddingClusterer(sys.argv[2])
+clusterer.build_similarity_graph(threshold=float(sys.argv[4]), max_neighbors=10)
+clusters = clusterer.cluster_leiden(seed=int(sys.argv[3]))
+print(clusters.dtype.name, hashlib.sha256(clusters.tobytes()).hexdigest())
+"""
+
+
+class LeidenIgraphTest(unittest.TestCase):
+    """cluster_leiden: python-igraph's community_leiden with modularity at the resolution, beta 0.01 and a fixed
+    number of iterations (10 by default); seeded with a private random.Random, Python's global random state untouched
+    and python-igraph's generator set back to the random module; cluster ids by decreasing size, ties by smallest chain
+    index, as an int32 array; and the refusals (iterations below 1, negative seeds, negative kept weights)."""
+
+    n, d = 90, 16
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        folder = Path(cls.tmp.name)
+        # Six well-separated clusters: a chain's few nearest neighbours score above 0, but some pairs of chains of
+        # different clusters score below 0.
+        cls.vectors = _clustered_vectors(seed=31, n=cls.n, d=cls.d, n_centers=6, noise=0.3)
+        cls.db_path = _build(folder, "flat", cls.vectors, IndexType.flat)
+        # Noisier clusters, kept from threshold 0 at k 10: their partition depends on the seed (the fixture above
+        # gives one partition whatever the seed), so the seeding tests tell a seeded generator from any other.
+        cls.sensitive_db_path = _build(folder, "flat_seed_sensitive", _clustered_vectors(
+            seed=31, n=cls.n, d=cls.d, n_centers=6, noise=2.0), IndexType.flat)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.addCleanup(ig.set_random_number_generator, random)
+
+    def clusterer(self, threshold: float = 0.5, max_neighbors: int = 10) -> EmbeddingClusterer:
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.build_similarity_graph(threshold=threshold, max_neighbors=max_neighbors)
+        return clusterer
+
+    def seed_sensitive_clusterer(self) -> EmbeddingClusterer:
+        """A clusterer whose Leiden partition depends on the seed (threshold 0, k 10)."""
+        clusterer = EmbeddingClusterer(self.sensitive_db_path)
+        clusterer.build_similarity_graph(threshold=0.0, max_neighbors=10)
+        return clusterer
+
+    def with_graph(self, graph: ig.Graph) -> EmbeddingClusterer:
+        """A clusterer whose graph a caller set (not built by build_similarity_graph)."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.graph = graph
+        return clusterer
+
+    @staticmethod
+    def planted_graph():
+        """A weighted planted partition: four blocks of 40, 30, 20 and 10 nodes, dense and heavy inside a block,
+        sparse and light between blocks. Returns the graph and its blocks."""
+        rng = np.random.default_rng(37)
+        sizes = (40, 30, 20, 10)
+        block = np.repeat(np.arange(len(sizes)), sizes)
+        n = len(block)
+        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        same = np.array([block[i] == block[j] for i, j in pairs])
+        keep = rng.random(len(pairs)) < np.where(same, 0.6, 0.02)
+        weights = np.where(same, rng.uniform(0.8, 1.0, len(pairs)), 0.1)
+        graph = ig.Graph(n=n, edges=[p for p, k in zip(pairs, keep) if k], directed=False)
+        graph.es["weight"] = weights[keep].tolist()
+        return graph, _as_sets(block)
+
+    @staticmethod
+    def cliques_graph():
+        """67 disjoint cliques in node order: 64 of 3 nodes, and 3 of 10 nodes at positions 20, 41 and 65, so
+        igraph's first-appearance ids are not by size and 64 clusters tie (more than 16, so an unstable sort of the
+        sizes would misorder ties)."""
+        cliques, start = [], 0
+        for c in range(67):
+            size = 10 if c in (20, 41, 65) else 3
+            cliques.append(list(range(start, start + size)))
+            start += size
+        edges = [(a, b) for clique in cliques for i, a in enumerate(clique) for b in clique[i + 1:]]
+        graph = ig.Graph(n=start, edges=edges, directed=False)
+        graph.es["weight"] = [1.0] * len(edges)
+        return graph, cliques
+
+    # The call
+
+    def test_the_call(self):
+        """The keyword arguments of community_leiden: exactly "modularity", the weights, the resolution, beta 0.01, and
+        10 iterations unless given."""
+        clusterer = self.clusterer()
+        spy = _LeidenSpy()
+        with spy.patch():
+            clusterer.cluster_leiden(seed=1)
+            clusterer.cluster_leiden(resolution=2.5, seed=1)
+            clusterer.cluster_leiden(n_iterations=3, seed=1)
+        expected = dict(objective_function="modularity", weights="weight", resolution=1.0, beta=0.01, n_iterations=10)
+        self.assertEqual(spy.calls, [expected, {**expected, "resolution": 2.5}, {**expected, "n_iterations": 3}])
+        self.assertIs(type(spy.calls[0]["objective_function"]), str)
+        self.assertEqual(clustering._LEIDEN_ITERATIONS, 10)
+
+    def test_planted_partition(self):
+        graph, blocks = self.planted_graph()
+        clusterer = self.with_graph(graph)
+        clusters = clusterer.cluster_leiden(seed=2)
+        self.assertEqual(_as_sets(clusters), blocks)
+        self.assertEqual(clusters.tolist(), _reference_leiden(graph, 2))
+        stats = clusterer.get_cluster_statistics()
+        self.assertEqual(stats["modularity"], graph.modularity(clusters, weights="weight"))
+        self.assertGreater(stats["modularity"], 0.5)
+
+    # Seeding
+
+    def test_same_seed_same_partition_as_global_seeding(self):
+        """The same seed twice gives the same array, equal to random.seed seeding of the same call, on a fixture
+        whose partition depends on the seed."""
+        clusterer = self.seed_sensitive_clusterer()
+        partitions = {tuple(clusterer.cluster_leiden(seed=seed).tolist()) for seed in range(4)}
+        self.assertGreater(len(partitions), 1)
+        first = clusterer.cluster_leiden(seed=5)
+        second = clusterer.cluster_leiden(seed=5)
+        np.testing.assert_array_equal(first, second)
+        self.assertEqual(first.tolist(), _reference_leiden(clusterer.graph, 5))
+        for seed in (0, 1, 2 ** 31, 2 ** 64):
+            with self.subTest(seed=seed):
+                self.assertEqual(clusterer.cluster_leiden(seed=seed).tolist(),
+                                 _reference_leiden(clusterer.graph, seed))
+        self.assertGreater(len(set(first.tolist())), 3)
+
+    def test_same_seed_in_fresh_processes(self):
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([_SRC] + [p for p in os.environ.get(
+            "PYTHONPATH", "").split(os.pathsep) if p and p != _SRC])}
+        digests = []
+        for _ in range(2):
+            run = subprocess.run([sys.executable, "-c", _SEED_DIGEST_CHILD, _SRC, self.sensitive_db_path, "5", "0"],
+                                 env=env, capture_output=True, text=True, timeout=600)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            digests.append(run.stdout.split())
+        clusters = self.seed_sensitive_clusterer().cluster_leiden(seed=5)
+        self.assertEqual(digests, [["int32", hashlib.sha256(clusters.tobytes()).hexdigest()]] * 2)
+
+    def test_global_random_state_untouched(self):
+        """random.getstate() is the same before and after, seeded or not, and a caller's seeded stream goes on."""
+        clusterer = self.clusterer()
+        for seed in (5, None):
+            with self.subTest(seed=seed):
+                state = random.getstate()
+                clusterer.cluster_leiden(seed=seed)
+                self.assertEqual(random.getstate(), state)
+        random.seed(7)
+        expected = [random.random() for _ in range(3)]
+        random.seed(7)
+        clusterer.cluster_leiden(seed=1)
+        self.assertEqual([random.random() for _ in range(3)], expected)
+
+    def test_generator_restored_to_the_random_module(self):
+        """After the call, and after an error inside it, python-igraph's generator is the random module again."""
+        clusterer = self.clusterer()
+        with mock.patch.object(ig, "set_random_number_generator", wraps=ig.set_random_number_generator) as setter:
+            clusterer.cluster_leiden(seed=1)
+        self.assertIsInstance(setter.call_args_list[0].args[0], random.Random)
+        self.assertEqual(setter.call_args_list[-1], mock.call(random))
+        failing = mock.patch.object(ig.Graph, "community_leiden", side_effect=ig.InternalError("inside Leiden"))
+        with mock.patch.object(ig, "set_random_number_generator", wraps=ig.set_random_number_generator) as setter, \
+                failing, self.assertRaisesRegex(ig.InternalError, "inside Leiden"):
+            clusterer.cluster_leiden(seed=1)
+        self.assertEqual(setter.call_args_list[-1], mock.call(random))
+        self.assertEqual(len(setter.call_args_list), 2)
+
+    # Cluster ids
+
+    def test_ids_by_size_ties_by_smallest_chain_index(self):
+        graph, cliques = self.cliques_graph()
+        raw = graph.community_leiden(objective_function="modularity", weights="weight", n_iterations=10).membership
+        # igraph numbers by first appearance: a 3-node clique is its cluster 0
+        self.assertEqual(raw[0], 0)
+        clusterer = self.with_graph(graph)
+        clusters = clusterer.cluster_leiden(seed=3)
+        self.assertIs(clusters, clusterer.clusters)
+        self.assertIsInstance(clusters, np.ndarray)
+        self.assertEqual(clusters.dtype, np.int32)
+        self.assertEqual(_as_sets(clusters), _as_sets(raw))
+        self.assertEqual(_as_sets(clusters), {frozenset(c) for c in cliques})
+        # The three 10-node cliques first, then the 3-node cliques, each group in node order
+        by_size = sorted(cliques, key=lambda c: (-len(c), c[0]))
+        self.assertEqual([int(clusters[c[0]]) for c in by_size], list(range(len(cliques))))
+        sizes = np.bincount(clusters)
+        self.assertTrue(np.all(np.diff(sizes) <= 0), sizes.tolist())
+        self.assertEqual(clusters.tolist(), _reference_leiden(graph, 3))
+
+    # Refusals
+
+    def test_iterations_below_1(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        for n_iterations in (0, -1):
+            with self.subTest(n_iterations=n_iterations), self.assertRaisesRegex(
+                    ValueError, r"^n_iterations must be at least 1 \(Leiden runs a fixed number of iterations\)\.$"):
+                clusterer.cluster_leiden(n_iterations=n_iterations, seed=1)
+        self.assertIsNone(clusterer.clusters)
+
+    def test_seed_values(self):
+        clusterer = self.clusterer()
+        with self.assertRaisesRegex(ValueError, r"^--seed must be at least 0\.$"):
+            clusterer.cluster_leiden(seed=-1)
+        with self.assertRaises(TypeError):
+            clusterer.cluster_leiden(seed=5.0)
+        self.assertIsNone(clusterer.clusters)
+        clusterer = self.seed_sensitive_clusterer()
+        expected = clusterer.cluster_leiden(seed=5)
+        for seed in (np.int64(5), np.int32(5)):
+            with self.subTest(seed=type(seed).__name__):
+                np.testing.assert_array_equal(clusterer.cluster_leiden(seed=seed), expected)
+
+    def test_negative_kept_weights_refused(self):
+        """Every pair of chains (k = n) at threshold -1 keeps negative scores: refused, naming the smallest weight."""
+        clusterer = self.clusterer(threshold=-1.0, max_neighbors=self.n)
+        weights = clusterer.graph.es["weight"]
+        self.assertEqual(clusterer.graph.ecount(), self.n * (self.n - 1) // 2)
+        self.assertLess(min(weights), 0)
+        self.assertEqual(clusterer.min_weight, min(weights))
+        message = (f"Leiden needs non-negative edge weights: the graph's smallest weight is {min(weights):.4g} (edges "
+                   f"keep scores at or above the threshold of build_similarity_graph).")
+        with self.assertRaisesRegex(ValueError, f"^{re.escape(message)}$"):
+            clusterer.cluster_leiden(seed=1)
+        self.assertIsNone(clusterer.clusters)
+
+    def test_negative_threshold_with_non_negative_kept_weights_runs(self):
+        """At a few neighbours a chain, threshold -1 keeps only scores of at least 0: the edges and the partition of
+        threshold 0."""
+        clusterer = self.clusterer(threshold=-1.0, max_neighbors=5)
+        self.assertGreaterEqual(clusterer.min_weight, 0)
+        self.assertEqual(clusterer.min_weight, min(clusterer.graph.es["weight"]))
+        at_zero = self.clusterer(threshold=0.0, max_neighbors=5)
+        self.assertEqual(clusterer.graph.get_edgelist(), at_zero.graph.get_edgelist())
+        np.testing.assert_array_equal(clusterer.cluster_leiden(seed=4), at_zero.cluster_leiden(seed=4))
+
+    def test_a_kept_weight_of_exactly_0_runs(self):
+        """Orthogonal unit vectors score exactly 0, which threshold 0 keeps: 0 is not below 0, in the library and the
+        CLI."""
+        vectors = np.zeros((3, self.d), dtype=np.float32)
+        vectors[[0, 2], 0] = 1.0
+        vectors[1, 1] = 1.0
+        db_path = _build(Path(self.tmp.name), "flat_zero_score", vectors, IndexType.flat)
+        clusterer = EmbeddingClusterer(db_path)
+        clusterer.build_similarity_graph(threshold=0.0, max_neighbors=3)
+        self.assertEqual(sorted(clusterer.graph.es["weight"]), [0.0, 0.0, 1.0])
+        self.assertEqual(clusterer.min_weight, 0.0)
+        self.assertEqual(len(clusterer.cluster_leiden(seed=1)), 3)
+        out = Path(self.tmp.name) / "zero_score.tsv"
+        result = self.invoke("cluster", "--db-path", db_path, "--output-file", out, "--threshold", "0",
+                             "--max-neighbors", 3, "--seed", 1)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+        self.assertEqual(len(out.read_text().splitlines()), 3)
+
+    def test_a_graph_set_after_the_build_is_not_judged_by_its_weights(self):
+        clusterer = self.clusterer(threshold=-1.0, max_neighbors=self.n)
+        self.assertLess(clusterer.min_weight, 0)
+        other = self.clusterer(threshold=0.5, max_neighbors=10)
+        clusterer.graph = other.graph
+        np.testing.assert_array_equal(clusterer.cluster_leiden(seed=4), other.cluster_leiden(seed=4))
+        # A build that fails records nothing
+        clusterer.db.index = None
+        with self.assertRaises(ValueError):
+            clusterer.build_similarity_graph(threshold=-1.0, max_neighbors=self.n)
+        self.assertIsNone(clusterer.min_weight)
+        self.assertIsNone(clusterer._min_weight_graph)
+
+    def test_no_edge_records_inf(self):
+        clusterer = self.clusterer(threshold=2.0, max_neighbors=10)
+        self.assertEqual(clusterer.graph.ecount(), 0)
+        self.assertEqual(clusterer.min_weight, float("inf"))
+        self.assertIs(clusterer._min_weight_graph(), clusterer.graph)
+
+    # Through the CLI
+
+    def invoke(self, *args):
+        root = logging.getLogger()
+        handlers, level = root.handlers[:], root.level
+        try:
+            return CliRunner().invoke(search.app, [str(a) for a in args])
+        finally:
+            root.handlers[:] = handlers
+            root.setLevel(level)
+
+    def test_cli_negative_kept_weights(self):
+        out = Path(self.tmp.name) / "neg.tsv"
+        base = ("cluster", "--db-path", self.db_path, "--output-file", out, "--threshold", "-1")
+        clusterer = self.clusterer(threshold=-1.0, max_neighbors=self.n)
+        for method in ((), ("--method", "leiden")):
+            with self.subTest(method=method):
+                result = self.invoke(*base, *method, "--max-neighbors", self.n)
+                self.assertEqual(result.exit_code, 2, f"{result.output}\n{result.exception!r}")
+                self.assertIn(f"Invalid value for --threshold: with --method leiden, Leiden's modularity needs "
+                              f"non-negative edge weights, and this --threshold kept a score of "
+                              f"{clusterer.min_weight:.4g}. Use a --threshold of 0 or more, or --method greedy.",
+                              _flat(result.output))
+                self.assertFalse(out.exists())
+        # Non-negative kept scores at threshold -1: runs, as at threshold 0
+        result = self.invoke(*base, "--max-neighbors", 5, "--seed", 4)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+        at_zero = self.clusterer(threshold=0.0, max_neighbors=5)
+        at_zero.cluster_leiden(seed=4)
+        at_zero.export_clusters(str(Path(self.tmp.name) / "zero.tsv"))
+        self.assertEqual(out.read_bytes(), (Path(self.tmp.name) / "zero.tsv").read_bytes())
+        # Greedy computes no modularity: not refused
+        result = self.invoke(*base, "--max-neighbors", self.n, "--method", "greedy")
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+        self.assertEqual(len(out.read_text().splitlines()), self.n)
+
+    def test_cli_seed_2_to_the_31(self):
+        out = Path(self.tmp.name) / "big_seed.tsv"
+        result = self.invoke("cluster", "--db-path", self.sensitive_db_path, "--output-file", out, "--threshold",
+                             "0", "--max-neighbors", 10, "--seed", 2 ** 31)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+        clusterer = self.seed_sensitive_clusterer()
+        expected = _reference_leiden(clusterer.graph, 2 ** 31)
+        self.assertEqual([int(line.split("\t")[1]) for line in out.read_text().splitlines()], expected)
+
+    # The removed package
+
+    def test_runs_without_the_removed_leiden_package(self):
+        out = Path(self.tmp.name) / "blocked.tsv"
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([_SRC] + [p for p in os.environ.get(
+            "PYTHONPATH", "").split(os.pathsep) if p and p != _SRC])}
+        run = subprocess.run([sys.executable, "-c", _NO_LEIDEN_PACKAGE_CHILD, _SRC, self.db_path, str(out)], env=env,
+                             capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.splitlines()[-1], "cluster ran")
+        self.assertEqual(len(out.read_text().splitlines()), self.n)
+
+    def test_no_name_of_the_removed_package_in_the_repository(self):
+        root = Path(_SRC).parent
+        if shutil.which("git") is None or not (root / ".git").exists():
+            self.skipTest("not a git checkout")
+        run = subprocess.run(["git", "grep", "-n", "-i", "leiden" + "alg", "--", "src", "tests", "pyproject.toml",
+                              "uv.lock", "README.md"], cwd=root, capture_output=True, text=True, timeout=60)
+        self.assertEqual((run.returncode, run.stdout), (1, ""), run.stderr)
 
 
 if __name__ == "__main__":

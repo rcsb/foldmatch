@@ -2,9 +2,11 @@
 computed in streamed blocks that search only the chains no representative has taken at the block's start. On hnsw, and
 on flat below FAISS's BLAS switch, the partition equals the sequential rule on one query per chain bit for bit, at every
 block size; on ivf_pq it is checked against the result rows the method used. Also the cluster ids (by decreasing size,
-ties by representative index), the statistics, the 4-column output, the refusals, and the Leiden output unchanged."""
+ties by representative index), the statistics, the 4-column output, the refusals (with cluster's Leiden options),
+and the Leiden output in c40d4e1's format."""
 import logging
 import math
+import random
 import re
 import tempfile
 import unittest
@@ -17,8 +19,9 @@ from unittest import mock
 # KMP_DUPLICATE_LIB_OK; on macOS, FAISS's OpenMP regions abort a process that loaded torch's libomp without it.
 import lightning  # noqa: F401
 import faiss
-import leidenalg
+import igraph as ig
 import numpy as np
+import typer
 from typer.testing import CliRunner
 
 from foldmatch.cli import search
@@ -759,6 +762,25 @@ class EdgeCaseTest(_GreedyCase):
         self.assertIsNone(clusterer.clusters)
 
 
+def _reference_leiden(graph, seed: int, n_iterations: int = 10) -> list:
+    """P9.U's Leiden call at resolution 1, made here and not through the code under test (tests/test_clustering.py's
+    reference): python-igraph's community_leiden seeded with random.seed (Python's global state saved and restored),
+    cluster ids renumbered in pure Python by (-size, smallest chain index)."""
+    state = random.getstate()
+    try:
+        random.seed(seed)
+        membership = graph.community_leiden(objective_function="modularity", weights="weight", resolution=1.0,
+                                            beta=0.01, n_iterations=n_iterations).membership
+    finally:
+        random.setstate(state)
+    members = {}
+    for chain, cluster in enumerate(membership):
+        members.setdefault(cluster, []).append(chain)
+    order = sorted(members, key=lambda c: (-len(members[c]), members[c][0]))
+    new_id = {cluster: rank for rank, cluster in enumerate(order)}
+    return [new_id[cluster] for cluster in membership]
+
+
 def _c40d4e1_export(chain_ids, membership, output_file: str, min_cluster_size=None,
                     format_mode=FormatMode.headless_tsv):
     """c40d4e1's export_clusters and write_cluster_results, verbatim but for the file handling: a list of every
@@ -778,7 +800,7 @@ def _c40d4e1_export(chain_ids, membership, output_file: str, min_cluster_size=No
 
 class ClusterCommandTest(unittest.TestCase):
     """cluster_database, called directly as test_cli_search's test_23: the greedy rows, and the Leiden file as
-    c40d4e1 wrote it, at several export chunks, with and without --min-cluster-size."""
+    c40d4e1 wrote it for the reference membership, at several export chunks, with and without --min-cluster-size."""
 
     n, d, threshold, max_neighbors, seed = 600, 128, 0.6, 20, 42
 
@@ -790,10 +812,9 @@ class ClusterCommandTest(unittest.TestCase):
         clusterer = EmbeddingClusterer(cls.db_path)
         cls.chain_ids = clusterer.chain_ids
         graph = clusterer.build_similarity_graph(threshold=cls.threshold, max_neighbors=cls.max_neighbors)
-        # c40d4e1's cluster_leiden call, made here and not through the code under test: the reference membership
-        cls.membership = leidenalg.find_partition(
-            graph, leidenalg.RBConfigurationVertexPartition, weights="weight", resolution_parameter=1.0,
-            n_iterations=-1, seed=cls.seed).membership
+        # The Leiden call, made here and not through the code under test: the reference membership
+        cls.graph = graph
+        cls.membership = _reference_leiden(graph, cls.seed)
         greedy = EmbeddingClusterer(cls.db_path)
         greedy.cluster_greedy(threshold=cls.threshold, max_neighbors=cls.max_neighbors)
         cls.greedy_clusters = greedy.clusters
@@ -847,16 +868,16 @@ class ClusterCommandTest(unittest.TestCase):
                                          min_cluster_size=min_size)
                     self.assertEqual(out.read_text().splitlines(), lines[1:])
 
-    def test_leiden_membership_as_c40d4e1(self):
-        """cluster_leiden returns c40d4e1's membership, cluster ids by non-increasing size (0 the largest)."""
+    def test_leiden_membership_as_reference(self):
+        """cluster_leiden returns the reference membership, cluster ids by non-increasing size (0 the largest)."""
         clusterer = EmbeddingClusterer(self.db_path)
         clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=self.max_neighbors)
-        self.assertEqual(list(clusterer.cluster_leiden(seed=self.seed)), self.membership)
+        self.assertEqual(clusterer.cluster_leiden(seed=self.seed).tolist(), self.membership)
         sizes = np.bincount(self.membership)
         self.assertGreater(len(set(sizes.tolist())), 2)
         self.assertTrue(np.all(np.diff(sizes) <= 0), sizes.tolist())
 
-    def test_leiden_file_as_c40d4e1(self):
+    def test_leiden_file_as_reference(self):
         for chunk in self.chunks():
             for min_size in (None, 2):
                 for format_mode in (FormatMode.headless_tsv, FormatMode.tsv):
@@ -875,23 +896,57 @@ class ClusterCommandTest(unittest.TestCase):
 
     def test_methods_route(self):
         """greedy calls cluster_greedy and builds no graph; leiden (the default) the graph, then Leiden at resolution
-        1.0 when --resolution is not given."""
+        1.0 when --resolution is not given and 10 iterations when --leiden-iterations is not given."""
         out = str(Path(self.tmp.name) / "routed.tsv")
         cases = [
             (dict(), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
-                      mock.call.cluster_leiden(resolution=1.0, seed=None)]),
+                      mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.leiden, resolution=2.5, seed=4),
              [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
-              mock.call.cluster_leiden(resolution=2.5, seed=4)]),
+              mock.call.cluster_leiden(resolution=2.5, n_iterations=10, seed=4)]),
+            (dict(leiden_iterations=3), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
+                                         mock.call.cluster_leiden(resolution=1.0, n_iterations=3, seed=None)]),
             (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
         ]
         for kwargs, calls in cases:
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
                 with mock.patch.object(clustering, "EmbeddingClusterer") as made:
+                    # A graph whose kept scores are all at least 0
+                    made.return_value.min_weight = 0.7
                     cluster_database(db_path=self.db_path, threshold=0.7, max_neighbors=9, output_file=out, **kwargs)
                 clusterer = made.return_value
                 self.assertEqual([c for c in clusterer.mock_calls if c[0] in (
                     "build_similarity_graph", "cluster_leiden", "cluster_greedy")], calls)
+
+    def test_leiden_iterations_reach_igraph(self):
+        """cluster --leiden-iterations 3 --seed 5 runs python-igraph's Leiden at 3 iterations, and writes the reference
+        file at 3 iterations, seed 5; without the option, 10 iterations."""
+        real = ig.Graph.community_leiden
+        calls = []
+
+        def community_leiden(graph, *args, **kwargs):
+            calls.append(kwargs["n_iterations"])
+            return real(graph, *args, **kwargs)
+
+        out = Path(self.tmp.name) / "iterations.tsv"
+        ref = Path(self.tmp.name) / "iterations_ref.tsv"
+        base = ("cluster", "--db-path", self.db_path, "--threshold", self.threshold, "--max-neighbors",
+                self.max_neighbors, "--output-file", out, "--seed", 5)
+        for extra, n_iterations in ((("--leiden-iterations", 3), 3), ((), 10)):
+            with self.subTest(extra=extra):
+                calls.clear()
+                root = logging.getLogger()
+                handlers, level = root.handlers[:], root.level
+                try:
+                    with mock.patch.object(ig.Graph, "community_leiden", community_leiden):
+                        result = CliRunner().invoke(search.app, [str(a) for a in (*base, *extra)])
+                finally:
+                    root.handlers[:] = handlers
+                    root.setLevel(level)
+                self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+                self.assertEqual(calls, [n_iterations])
+                _c40d4e1_export(self.chain_ids, _reference_leiden(self.graph, 5, n_iterations), str(ref))
+                self.assertEqual(out.read_bytes(), ref.read_bytes())
 
 
 def _flat(text: str) -> str:
@@ -934,14 +989,21 @@ class RefusalTest(unittest.TestCase):
 
     def test_leiden_options_under_greedy_in_one_message(self):
         base = ("cluster", "--db-path", "no/such/db", "--method", "greedy")
+        greedy = "--method greedy has no resolution or iteration count and is deterministic."
         cases = (
-            (("--resolution", "1.0"), "--resolution is a Leiden option: --method greedy has no resolution and is "
-                                      "deterministic. Remove it, or use --method leiden."),
-            (("--seed", "7"), "--seed is a Leiden option: --method greedy has no resolution and is deterministic. "
-                              "Remove it, or use --method leiden."),
-            (("--seed", "7", "--resolution", "2"), "--resolution, --seed are Leiden options: --method greedy has no "
-                                                   "resolution and is deterministic. Remove them, or use --method "
-                                                   "leiden."),
+            (("--resolution", "1.0"), f"--resolution is a Leiden option: {greedy} Remove it, or use --method leiden."),
+            (("--seed", "7"), f"--seed is a Leiden option: {greedy} Remove it, or use --method leiden."),
+            (("--seed", "7", "--resolution", "2"), f"--resolution, --seed are Leiden options: {greedy} Remove them, "
+                                                   f"or use --method leiden."),
+            (("--leiden-iterations", "5"), f"--leiden-iterations is a Leiden option: {greedy} Remove it, or use "
+                                           f"--method leiden."),
+            # The greedy refusal comes first: not the minimum's message
+            (("--leiden-iterations", "0"), f"--leiden-iterations is a Leiden option: {greedy} Remove it, or use "
+                                           f"--method leiden."),
+            (("--seed", "-1"), f"--seed is a Leiden option: {greedy} Remove it, or use --method leiden."),
+            (("--seed", "3", "--leiden-iterations", "5", "--resolution", "2"),
+             f"--resolution, --leiden-iterations, --seed are Leiden options: {greedy} Remove them, or use --method "
+             f"leiden."),
         )
         for extra, message in cases:
             with self.subTest(extra=extra):
@@ -959,11 +1021,47 @@ class RefusalTest(unittest.TestCase):
 
     def test_leiden_options_with_leiden_are_not_refused(self):
         for method in ((), ("--method", "leiden")):
-            with self.subTest(method=method):
-                result = self.invoke("cluster", "--db-path", "no/such/db", *method, "--resolution", "2",
-                                     "--seed", "3")
-                self.assertEqual(result.exit_code, 1)
-                self.assertEqual(str(result.exception), "the database was loaded")
+            for extra in (("--resolution", "2", "--seed", "3"), ("--leiden-iterations", "1"),
+                          ("--resolution", "2", "--leiden-iterations", "1", "--seed", "0")):
+                with self.subTest(method=method, extra=extra):
+                    result = self.invoke("cluster", "--db-path", "no/such/db", *method, *extra)
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertEqual(str(result.exception), "the database was loaded")
+
+    def test_leiden_iterations_below_1(self):
+        for method in ((), ("--method", "leiden")):
+            for value in ("0", "-2"):
+                with self.subTest(method=method, value=value):
+                    output = self.refused("cluster", "--db-path", "no/such/db", *method, "--leiden-iterations", value)
+                    self.assertIn("Invalid value for --leiden-iterations: --leiden-iterations must be at least 1.",
+                                  output)
+
+    def test_leiden_iterations_must_be_an_integer(self):
+        for value in ("2.5", "ten"):
+            with self.subTest(value=value):
+                output = self.refused("cluster", "--db-path", "no/such/db", "--leiden-iterations", value)
+                self.assertIn("--leiden-iterations", output)
+                self.assertNotIn("must be at least 1", output)
+
+    def test_seed_below_0(self):
+        for method in ((), ("--method", "leiden")):
+            for value in ("-1", "-5"):
+                with self.subTest(method=method, value=value):
+                    output = self.refused("cluster", "--db-path", "no/such/db", *method, "--seed", value)
+                    self.assertIn("Invalid value for --seed: --seed must be at least 0.", output)
+
+    def test_leiden_iterations_checked_before_the_seed(self):
+        output = self.refused("cluster", "--db-path", "no/such/db", "--leiden-iterations", "0", "--seed", "-1")
+        self.assertIn("Invalid value for --leiden-iterations: --leiden-iterations must be at least 1.", output)
+        self.assertNotIn("--seed must be at least 0", output)
+
+    def test_leiden_iterations_help(self):
+        command = typer.main.get_command(search.app).commands["cluster"]
+        text = next(p.help for p in command.params if p.name == "leiden_iterations")
+        self.assertEqual(text, "Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured "
+                               "1M-chain graphs agreed with Leiden run to convergence within seed noise; fewer are "
+                               "faster, with somewhat noisier partitions. --method leiden only.")
+        self.assertIn(f"Default: {clustering._LEIDEN_ITERATIONS},", text)
 
     def test_unknown_method(self):
         output = self.refused("cluster", "--db-path", "no/such/db", "--method", "components")

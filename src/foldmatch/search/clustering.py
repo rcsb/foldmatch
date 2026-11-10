@@ -1,12 +1,14 @@
 import ctypes
 import logging
+import operator
+import random
 import sys
 import time
+import weakref
 import numpy as np
 import faiss
 import igraph as ig
-import leidenalg
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from pathlib import Path
 from tqdm import tqdm
 
@@ -33,6 +35,9 @@ _GRAPH_EDGE_CHUNK = 1 << 20
 _GRAPH_WEIGHT_TABLE_MAX = 1 << 24
 # Chains whose output rows are made at a time by export_clusters.
 _EXPORT_CHUNK = 1 << 20
+# Leiden iterations of cluster_leiden: a fixed count, since run-to-convergence is open-ended (221 iterations on a
+# 1M-chain graph).
+_LEIDEN_ITERATIONS = 10
 
 
 def _graph_id_dtype(n_chains: int):
@@ -114,6 +119,10 @@ class EmbeddingClusterer:
 
         self.graph = None
         self.clusters = None
+        # The smallest kept edge weight of the last build_similarity_graph, and a weak reference to the graph it was
+        # recorded for (cluster_leiden refuses a negative one for that graph only)
+        self.min_weight = None
+        self._min_weight_graph = None
         # The method of the last clustering ("leiden" or "greedy"), and under greedy each cluster's representative
         self.method = None
         self.representatives = None
@@ -134,6 +143,8 @@ class EmbeddingClusterer:
         Returns:
             igraph Graph object with edges weighted by similarity
         """
+        self.min_weight = None
+        self._min_weight_graph = None
         if self.db.index is None:
             raise ValueError("Database not loaded. Call load_database() first.")
 
@@ -201,11 +212,16 @@ class EmbeddingClusterer:
         self.graph = ig.Graph(n=n_chains, edges=_edge_tuples(pair_blocks), directed=False)
         # glibc keeps freed blocks in the heap: give them back before the weights and before Leiden.
         _release_freed_memory()
+        # The smallest kept weight (+inf with no edge), before the weight blocks are consumed: Leiden refuses negative
+        # weights
+        min_weight = min((float(b.min()) for b in weight_blocks), default=float("inf"))
         self.graph.es['weight'] = _weight_list(weight_blocks)
         _release_freed_memory()
 
         # Add chain IDs as vertex attribute
         self.graph.vs['name'] = self.chain_ids
+        self.min_weight = min_weight
+        self._min_weight_graph = weakref.ref(self.graph)
 
         logging.info(f"Similarity graph built in {time.perf_counter() - start_time:.2f}s")
 
@@ -214,39 +230,89 @@ class EmbeddingClusterer:
     def cluster_leiden(
             self,
             resolution: float = 1.0,
-            n_iterations: int = -1,
+            n_iterations: int = _LEIDEN_ITERATIONS,
             seed: Optional[int] = None
-    ) -> List[int]:
+    ) -> np.ndarray:
         """
         Apply Leiden clustering algorithm to the similarity graph.
 
+        The call is python-igraph's ``Graph.community_leiden(objective_function="modularity", weights="weight",
+        resolution=resolution, beta=0.01, n_iterations=n_iterations)``: modularity at ``resolution`` with the edge
+        weights. It runs a fixed number of iterations (``n_iterations``, the CLI's --leiden-iterations), 10 by default,
+        since run-to-convergence is open-ended on sparse graphs (221 iterations on a 1M-chain graph).
+
+        Seeding: python-igraph draws from a ``random.Random(seed)`` of its own during the call
+        (``ig.set_random_number_generator``), so Python's global ``random`` state is neither used nor changed; the same
+        seed gives the same partition, and ``seed=None`` (seeded from ``os.urandom``) a different one each call.
+        Caveats: afterwards python-igraph's generator is set back to the ``random`` module, its default (python-igraph
+        has no getter), so a caller's own igraph generator is replaced; and the generator is process-global, so igraph
+        calls of other threads during the Leiden step draw from it.
+
+        Cluster ids are numbered by decreasing cluster size, ties by the smallest chain index in the cluster (0 is the
+        largest cluster), as under greedy.
+
         Args:
             resolution: Resolution parameter (higher = more clusters, default: 1.0)
-            n_iterations: Number of iterations (-1 for until convergence)
-            seed: Random seed for reproducibility
+            n_iterations: Number of Leiden iterations, at least 1 (default: 10)
+            seed: Random seed for reproducibility, an integer of at least 0 (``operator.index``: NumPy integers are
+                accepted, floats refused with TypeError)
 
         Returns:
-            List of cluster IDs (one per chain)
+            Array of cluster IDs (one per chain), int32 below 2**31 chains
+
+        Raises:
+            ValueError: ``n_iterations`` below 1, ``seed`` below 0, no graph, or a graph built by
+                build_similarity_graph with a negative kept weight (modularity needs non-negative edge weights)
         """
+        if n_iterations < 1:
+            raise ValueError("n_iterations must be at least 1 (Leiden runs a fixed number of iterations).")
+        if seed is not None:
+            seed = operator.index(seed)
+            if seed < 0:
+                raise ValueError("--seed must be at least 0.")
         if self.graph is None:
             raise ValueError("Graph not built. Call build_similarity_graph() first.")
+        if self._min_weight_graph is not None and self._min_weight_graph() is self.graph and self.min_weight < 0:
+            raise ValueError(f"Leiden needs non-negative edge weights: the graph's smallest weight is "
+                             f"{self.min_weight:.4g} (edges keep scores at or above the threshold of "
+                             f"build_similarity_graph).")
 
         logging.info(f"Running Leiden clustering (resolution={resolution})...")
         start_time = time.perf_counter()
 
-        # Use RBConfigurationVertexPartition with weights
-        # Higher edge weights (higher similarity) encourage nodes to be in same cluster
-        partition = leidenalg.find_partition(
-            self.graph,
-            leidenalg.RBConfigurationVertexPartition,
-            weights='weight',
-            resolution_parameter=resolution,
-            n_iterations=n_iterations,
-            seed=seed
-        )
+        # Higher edge weights (higher similarity) encourage nodes to be in same cluster. The objective must be exactly
+        # "modularity": python-igraph normalises the resolution only for that spelling. A private generator: Python's
+        # global random state is left alone.
+        rng = random.Random(seed)
+        ig.set_random_number_generator(rng)
+        try:
+            partition = self.graph.community_leiden(
+                objective_function="modularity",
+                weights="weight",
+                resolution=resolution,
+                beta=0.01,
+                n_iterations=n_iterations
+            )
+        finally:
+            # python-igraph 1.0.0's default; it has no getter
+            ig.set_random_number_generator(random)
 
-        self.clusters = partition.membership
-        logging.info(f"Found {len(set(self.clusters))} clusters")
+        # Cluster ids by decreasing size, ties by smallest chain index (igraph numbers by first appearance)
+        n = self.graph.vcount()
+        dtype = _graph_id_dtype(n)
+        membership = np.fromiter(partition.membership, dtype=dtype, count=n)
+        del partition
+        sizes = np.bincount(membership)
+        # Every cluster has a member, so minimum.at overwrites the fill
+        first = np.full(len(sizes), n - 1, dtype=dtype)
+        np.minimum.at(first, membership, np.arange(n, dtype=dtype))
+        order = np.lexsort((first, -sizes))
+        new_id = np.empty(len(sizes), dtype=dtype)
+        new_id[order] = np.arange(len(sizes), dtype=dtype)
+        self.clusters = new_id[membership]
+        del membership, first, order, new_id
+
+        logging.info(f"Found {len(sizes)} clusters")
         logging.info(f"Leiden clustering completed in {time.perf_counter() - start_time:.2f}s")
         self.method = "leiden"
         self.representatives = None
