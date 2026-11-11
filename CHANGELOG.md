@@ -19,27 +19,6 @@ While the major version is `0`, breaking changes are released in a minor bump.
   agreed at a mean AMI of 0.7548 against 0.7659 (10 pairs of 5 seeds).
   `--method leiden` only: refused under `--method greedy`, with
   `--resolution` and `--seed`, in one message.
-
-- **`--max-evalue`** on `fm-search query sequences` and `fm-search query db`:
-  drops Stage-2 hits whose database E-value is above the threshold. Defaults to
-  `1e-3`, so a default search now reports only statistically significant
-  alignments; pass `--max-evalue inf` to keep every hit. Because the E-value is
-  a significance quantity, the option turns the significance pass on even when
-  neither `evalue` nor `bits` is in `--format-output` (and so, under
-  `--significance-mode default`, requires the 11/1 gap penalties).
-- **Compositional bias correction** (`--comp-bias-corr`, `--comp-bias-corr-scale`)
-  on `fm-search query sequences` and `fm-search query db`, and as
-  `comp_bias_corr` / `comp_bias_corr_scale` on `align_candidates`. A port of
-  mmseqs's correction: each query position's score is offset according to its
-  local (40-residue) composition before Smith-Waterman, which lowers scores of
-  locally biased regions. With the same settings, raw scores, bit scores and
-  E-values match `mmseqs search` 18-8cc5c on identical pairs, except for
-  alignments containing a non-standard residue (`X`, `B`, `Z`, `J`, `U`, `O`,
-  `*`), which FoldMatch still scores with biotite's BLOSUM62. Off by default,
-  unlike mmseqs: on a 48-query SCOP benchmark it cost more true positives than
-  the false positives it removed. When on, E-values rise (median about 1.8x on
-  that benchmark) and alignments over biased regions get shorter, lowering
-  coverage. Pass `--comp-bias-corr` to compare with a default mmseqs run.
 - **`--cleanup-embeddings`** on `fm-search build structures` and `fm-search
   build sequences`: deletes the build's intermediate embedding shards from
   `--tmp-embedding-folder` once the database is built. Off by default, so the
@@ -387,17 +366,6 @@ While the major version is `0`, breaking changes are released in a minor bump.
   module afterwards (a caller's own igraph generator is replaced). Seeds are
   integers of at least 0 (`operator.index`: NumPy integers accepted, floats
   refused).
-- **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
-  sequences` and `fm-search query db`, matching the coverage cut-off other
-  alignment tools apply by default. Pass `--min-coverage 0` for the previous
-  behaviour.
-- **`align_candidates` thresholds now default to the CLI's values**
-  (`min_seq_identity=0.3`, `min_coverage=0.8`, `max_evalue=1e-3`), so the Python
-  entry point filters like the equivalent `fm-search query` run instead of
-  returning every alignment. Callers that want the old permissive behaviour pass
-  `min_coverage=0.0, max_evalue=None`; `max_evalue=None` is also required when
-  no `subject_db_size` is available, since an E-value threshold needs a search
-  space.
 - **Structure-based chain selection keeps chains with at least `min_res_n`
   residues** (was more than `min_res_n`). This covers `fm-search build
   structures`, `fm-embedding` and `inference`, and matches `FoldMatch(min_res=...)`
@@ -1379,6 +1347,50 @@ While the major version is `0`, breaking changes are released in a minor bump.
   dropped every query but one of a repeated id. Each is now refused (see the
   two *BREAKING* entries on `fm-search`).
 
+## [0.10.0] - 2026-09-15
+
+### Added
+
+- **Compositional bias correction** (`--comp-bias-corr`, `--comp-bias-corr-scale`)
+  on `fm-search query sequences` and `fm-search query db`, and as
+  `comp_bias_corr` / `comp_bias_corr_scale` on `align_candidates`. A port of
+  mmseqs's correction: each query position's score is offset according to its
+  local (40-residue) composition before Smith-Waterman, which lowers scores of
+  locally biased regions. With the same settings, raw scores, bit scores and
+  E-values match `mmseqs search` 18-8cc5c on identical pairs, except for
+  alignments containing a non-standard residue (`X`, `B`, `Z`, `J`, `U`, `O`,
+  `*`), which FoldMatch still scores with biotite's BLOSUM62. Off by default,
+  unlike mmseqs: on a 48-query SCOP benchmark it cost more true positives than
+  the false positives it removed. When on, E-values rise (median about 1.8x on
+  that benchmark) and alignments over biased regions get shorter, lowering
+  coverage. Pass `--comp-bias-corr` to compare with a default mmseqs run.
+
+## [0.9.0] - 2026-08-27
+
+### Added
+
+- **`--max-evalue`** on `fm-search query sequences` and `fm-search query db`:
+  drops Stage-2 hits whose database E-value is above the threshold. Defaults to
+  `1e-3`, so a default search now reports only statistically significant
+  alignments; pass `--max-evalue inf` to keep every hit. Because the E-value is
+  a significance quantity, the option turns the significance pass on even when
+  neither `evalue` nor `bits` is in `--format-output` (and so, under
+  `--significance-mode default`, requires the 11/1 gap penalties).
+
+### Changed
+
+- **`--min-coverage` now defaults to `0.8`** (was `0.0`) on `fm-search query
+  sequences` and `fm-search query db`, matching the coverage cut-off other
+  alignment tools apply by default. Pass `--min-coverage 0` for the previous
+  behaviour.
+- **`align_candidates` thresholds now default to the CLI's values**
+  (`min_seq_identity=0.3`, `min_coverage=0.8`, `max_evalue=1e-3`), so the Python
+  entry point filters like the equivalent `fm-search query` run instead of
+  returning every alignment. Callers that want the old permissive behaviour pass
+  `min_coverage=0.0, max_evalue=None`; `max_evalue=None` is also required when
+  no `subject_db_size` is available, since an E-value threshold needs a search
+  space.
+
 ## [0.8.0] - 2026-07-21
 
 This release reworks how `fm-search` reports results and makes its alignment
@@ -1476,4 +1488,6 @@ explicit `--format-output` to pin the column order you expect.
 
 Not tracked in this file; see the git history and release tags.
 
+[0.10.0]: https://github.com/rcsb/foldmatch/releases/tag/v0.10.0
+[0.9.0]: https://github.com/rcsb/foldmatch/releases/tag/v0.9.0
 [0.8.0]: https://github.com/rcsb/foldmatch/releases/tag/v0.8.0
