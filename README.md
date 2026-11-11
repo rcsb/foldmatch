@@ -269,7 +269,7 @@ chain_id   cluster_id   cluster_size   representative
 
 #### Two-stage sequence search (exact identity)
 
-`build sequences` also writes a sidecar `{db}.sequences` store next to the FAISS index. This lets sequence-built databases report **exact** sequence identity, not just embedding similarity: when you run `query sequences` (or `query db`) against such a database, a second stage pairwise-aligns each embedding hit (local Smith-Waterman, BLOSUM62) and re-ranks the surviving hits by identity.
+`build sequences` also writes a sidecar `{db}.sequences` store next to the FAISS index. This lets sequence-built databases report **exact** sequence identity, not just embedding similarity: when you run `query sequences` (or `query db`) against such a database, a second stage pairwise-aligns each embedding hit (local Smith-Waterman, BLOSUM62) and re-ranks the surviving hits by bitscore.
 
 Stage 2 aligns on FoldMatch's native SIMD Smith-Waterman kernel, a compiled library (see *Requirements*). It reproduces biotite 1.7.1's `align_optimal` (local, affine gaps), ties included, which Stage 2 used before: the same scores, coordinates and alignments, so the same output. Without the kernel, `query sequences` and `query db` refuse to run Stage 2 before the queries are embedded or the database is searched, and print the command that rebuilds it; `--no-seq-identity` still runs an embedding-only search.
 
