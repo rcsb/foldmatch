@@ -68,7 +68,7 @@ jobs:
           - { job: kernel-x86, os: ubuntu-latest, cc: gcc, isas: "sse2 avx2 generic" }
           - { job: kernel-x86, os: ubuntu-latest, cc: clang, isas: "sse2 avx2 generic" }
           - { job: kernel-arm64-linux, os: ubuntu-24.04-arm, cc: gcc, isas: "neon generic" }
-          - { job: kernel-macos, os: macos-14, cc: cc, isas: "neon generic" }
+          - { job: kernel-macos, os: macos-15, cc: cc, isas: "neon generic" }
     env:
       CC: ${{ matrix.cc }}
       PYTHONPATH: src
@@ -156,7 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     env:
       FOLDMATCH_REQUIRE_NATIVE: "1"
     steps:
@@ -233,7 +233,7 @@ jobs:
         include:
           - { name: linux-x86_64, os: ubuntu-latest, archs: x86_64 }
           - { name: linux-aarch64, os: ubuntu-24.04-arm, archs: aarch64 }
-          - { name: macos, os: macos-14, archs: "arm64 x86_64" }
+          - { name: macos, os: macos-15, archs: "arm64 x86_64" }
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
