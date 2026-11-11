@@ -358,7 +358,6 @@ def complete_embedding(
             exists=True,
             file_okay=True,
             dir_okay=False,
-            resolve_path=True,
             help=_ASSEMBLY_LIST_HELP
         )],
         output_res_path: Annotated[Path, typer.Option(
@@ -442,6 +441,7 @@ def complete_embedding(
     # once (a pipe, a named pipe or <(...) on macOS; /dev/stdin or /dev/fd/N, whose open shares the descriptor's offset
     # on macOS, even on a regular file; any path under /dev) is read once, here, and its text given to the assembly
     # step, so that it is checked as a list in a regular file is
+    src_assembly_file = _resolved_list_path(src_assembly_file)
     src_assembly_list = _read_once(src_assembly_file)
     assemblies = read_assembly_list(src_assembly_list)
     refuse_shared_names(assemblies, "stream_name", "stream")
@@ -502,6 +502,13 @@ class _ListText(io.StringIO):
     def __init__(self, text: str, name: str):
         super().__init__(text)
         self.name = name
+
+
+def _resolved_list_path(src_file: Path) -> Path:
+    """A list path as Typer's resolve_path makes it (absolute, links resolved), but a path under /dev as given: Linux
+    resolves /dev/fd/N to the file the descriptor is open on (and refusals would name that file, not the path given)
+    and /dev/stdin from a pipe to a pipe:[N] that is no path."""
+    return src_file if os.fspath(src_file).startswith("/dev/") else Path(os.path.realpath(src_file))
 
 
 def _read_once(src_file):

@@ -728,16 +728,24 @@ class CompleteEmbeddingInputTest(_Case):
     @unittest.skipUnless(os.path.isdir("/dev/fd"), "/dev/fd/N needs /dev/fd")
     def test_a_long_row_in_an_assembly_list_as_dev_fd(self):
         """A row of more than 4 fields in an assembly list given as /dev/fd/N is refused before the residue step too,
-        naming the path given."""
+        naming the path given, also where os.path.realpath resolves /dev/fd/N to the file the descriptor is open on
+        (Linux; emulated elsewhere)."""
         listed = self.write("long.csv", f"1acb,{_CIF},1,1acb-1,extra\n")
-        folders = [self.folder(name) for name in ("r", "c", "a")]
-        fd = os.open(listed, os.O_RDONLY)
-        try:
-            message = self.complete(self.chains(), f"/dev/fd/{fd}", folders, "csv", refused=True)
-        finally:
-            os.close(fd)
-        self.assertTrue(message.startswith(f"/dev/fd/{fd}: "), message)
-        self.assertEqual(list(folders[0].iterdir()), [])
+        realpath = os.path.realpath
+        for linux in (False, True):
+            with self.subTest(linux=linux):
+                folders = [self.folder(name) for name in ("r", "c", "a")]
+                fd = os.open(listed, os.O_RDONLY)
+                given = f"/dev/fd/{fd}"
+                as_linux = (lambda path, *args, **kwargs: os.fspath(listed) if os.fspath(path) == given
+                            else realpath(path, *args, **kwargs))
+                try:
+                    with mock.patch("os.path.realpath", as_linux) if linux else contextlib.nullcontext():
+                        message = self.complete(self.chains(), given, folders, "csv", refused=True)
+                finally:
+                    os.close(fd)
+                self.assertTrue(message.startswith(f"{given}: "), message)
+                self.assertEqual(list(folders[0].iterdir()), [])
 
 
 class PrefixTest(_Case):

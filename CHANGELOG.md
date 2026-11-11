@@ -1356,6 +1356,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   deleted by hand during a build, then taken by a second build, was removed
   by the first. The lock now holds a random `lock_id`, and a build removes
   only the lock with its own.
+- **`complete-embedding --src-assembly-file /dev/fd/N` on Linux** named, in
+  its refusals, the file the descriptor is open on instead of the path given,
+  and `/dev/stdin` from a pipe was refused as a file that does not exist. A
+  path under `/dev` is now taken as given (other paths are resolved as
+  before).
 
 ## [0.10.0] - 2026-09-15
 
