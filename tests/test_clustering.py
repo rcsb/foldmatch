@@ -632,15 +632,21 @@ class _SameGraphAsK2:
 
 
 class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
-    """hnsw (HnswGraphTest's fixture): also how the graph is built (no concatenation, igraph pulling the edges from
-    the generator, freed memory released twice, with every block released before each release) and the weight table,
-    at its cap and past it."""
+    """hnsw (HnswGraphTest's fixture, with 20 vectors repeated): also how the graph is built (no concatenation, igraph
+    pulling the edges from the generator, freed memory released twice, with every block released before each release)
+    and the weight table, at its cap and past it."""
 
     index_type, n, d, threshold, max_neighbors = IndexType.hnsw, 2000, 1536, 0.6, 40
 
     @classmethod
     def vectors(cls):
-        return _clustered_vectors(seed=3, n=cls.n, d=cls.d, n_centers=150, noise=1.0)
+        # Equal weights on every platform: a repeated vector has its original's scores. Without the repeats, equal
+        # float32 scores came by chance: 1 to 4 values of 2,796 edges, by platform (FAISS's SIMD code), and maybe none
+        # on CI's Linux runner, where the test failed.
+        vectors = _clustered_vectors(seed=3, n=cls.n, d=cls.d, n_centers=150, noise=1.0)
+        for t in range(20):
+            vectors[1000 + t] = vectors[10 * t]
+        return vectors
 
     def test_no_concatenation(self):
         clusterer = EmbeddingClusterer(self.db_path)
@@ -757,6 +763,8 @@ class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
         ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
         span = _float32_span(ref.es["weight"])
         self.assertLess(span, clustering._GRAPH_WEIGHT_TABLE_MAX)
+        # Equal weights to share: the repeated vectors' scores.
+        self.assertLess(len({w.hex() for w in ref.es["weight"]}), ref.ecount())
         # One block: the whole fixture.
         self.assertGreaterEqual(clustering._GRAPH_RESULT_BYTES // (self.max_neighbors * 12), self.n)
         divisor = _exact_divisor([ref.ecount()])
