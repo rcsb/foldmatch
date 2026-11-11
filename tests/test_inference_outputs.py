@@ -18,6 +18,7 @@ from foldmatch.cli import inference
 # Imported before any test patches chain_inference.predict, which assembly_inferece binds at its import
 from foldmatch.inference import assembly_inferece, chain_inference, esm_inference
 from foldmatch.types.api_types import StructureFormat
+from click_messages import no_such_option
 
 _CIF = Path(__file__).parent / "resources" / "pdb" / "1acb.cif"
 _CPU = ("--accelerator", "cpu", "--devices", "1")
@@ -172,7 +173,7 @@ class StructureFormatTest(_Lists):
             result = _invoke("chain-embedding", "--src-file", self.chains, "--res-embedding-location", out,
                              "--output-folder", out, "--structure-format", "pdb")
         self.assertEqual(result.exit_code, 2, result.output)
-        self.assertIn("No such option: --structure-format", _flat(result.output))
+        self.assertRegex(_flat(result.output), no_such_option("--structure-format"))
         chain.assert_not_called()
 
     def test_complete_embedding_keeps_it_for_the_steps_that_read_structures(self):

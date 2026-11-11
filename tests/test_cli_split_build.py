@@ -61,6 +61,7 @@ from foldmatch.search.sequence_store import SequenceStore
 from foldmatch.types.api_types import Accelerator, IndexConfig, IndexType, LogLevel, Strategy
 from foldmatch.utils.esm.loaders import ESM_REVISION
 from foldmatch.utils.sequence import preflight_fasta
+from click_messages import no_such_option
 from test_cli_residue_codes import A4_XCPU_BITS, OTHER_ENCODING, PLAN_HELP, _DDP_ENV, _DDP_ENV_PREFIXES, \
     _LAUNCH_ENV, _SITECUSTOMIZE, _SRC, _TWO_RANK_CHILD_ENV, _bits_equal, _esm3_spy, _f2c, _fake_codes, _Tmp, \
     _WithBundle, _build_args, _write, fake_chain_predict, invoke, launch_env
@@ -612,7 +613,8 @@ class EmbedOptionTest(_Tmp):
                        ("--tmp-embedding-folder", self.shards), ("--from-shards", self.shards), ("--run-id", "x")):
             with self.subTest(option=option[0]), _esm3_spy() as esm3:
                 result = invoke(*_embed_args(_FASTA, self.tmp / "db", self.shards, *option))
-                self.usage_error(result, f"No such option: {option[0]}")
+                self.usage_error(result, option[0])
+                self.assertRegex(_flat(result.output), no_such_option(option[0]))
                 esm3.assert_not_called()
         self.usage_error(invoke(*_embed_args(_FASTA, self.tmp / "db", self.shards, "--min-res-n", "-1")),
                          "--min-res-n")
@@ -1452,7 +1454,8 @@ class IndexOptionTest(_Tmp):
                        ("--shards-folder", self.shards), ("--tmp-embedding-folder", self.shards), ("--force",)):
             with self.subTest(option=option[0]), _esm3_spy() as esm3:
                 result = invoke(*_index_args(_FASTA, self.tmp / "db", self.shards, *option))
-                self.usage_error(result, f"No such option: {option[0]}")
+                self.usage_error(result, option[0])
+                self.assertRegex(_flat(result.output), no_such_option(option[0]))
                 esm3.assert_not_called()
         for bad in ("a b", "a/b", "a*"):
             with self.subTest(run_id=bad), mock.patch.object(split_run, "find_run") as find_run:
@@ -2621,7 +2624,8 @@ class SealOptionTest(_Tmp):
                        ("--cleanup-embeddings",), ("--force",)):
             with self.subTest(option=option[0]), _esm3_spy() as esm3:
                 result = invoke(*_seal_args(_FASTA, self.shards, "run", *option))
-                self.usage_error(result, f"No such option: {option[0]}")
+                self.usage_error(result, option[0])
+                self.assertRegex(_flat(result.output), no_such_option(option[0]))
                 esm3.assert_not_called()
         for bad in ("a b", "a/b", "a*"):
             with self.subTest(run_id=bad), mock.patch.object(split_run, "refuse_existing_record") as refuse:

@@ -43,6 +43,7 @@ from foldmatch.types.api_types import Accelerator, Granularity, SrcLocation, Src
     StructureFormat
 from foldmatch.utils.structure_parser import filter_residues, get_protein_chains, get_structure_from_src, \
     protein_chain_iter, rename_atom_attr
+from click_messages import no_such_option
 
 _RESOURCES = Path(__file__).parent / "resources"
 _CIF = _RESOURCES / "pdb" / "1acb.cif"
@@ -316,7 +317,7 @@ class MinResNTest(unittest.TestCase):
                     result = _invoke(command, "--src-file", self.chains, "--output-folder", self.out, *extra,
                                      "--min-res-n", 10)
                     self.assertEqual(result.exit_code, 2, result.output)
-                    self.assertIn("No such option: --min-res-n", _flat(result.output))
+                    self.assertRegex(_flat(result.output), no_such_option("--min-res-n"))
         never.assert_not_called()
 
     def test_assembly_and_complete_embedding_take_it(self):

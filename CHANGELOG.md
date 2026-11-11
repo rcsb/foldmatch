@@ -986,6 +986,9 @@ While the major version is `0`, breaking changes are released in a minor bump.
   or a Parquet id that is also a `.pt` or `.csv` file's name. The results are
   kept by query id, so all but one of them disappeared from the output. Give
   each embedding its own id, or query the files apart (`--file-extension`).
+- **`click` pinned at 8.3.1** (Typer's dependency, as in `uv.lock`): click
+  8.5 words its usage errors differently. The tests no longer depend on
+  that wording.
 
 ### Fixed
 

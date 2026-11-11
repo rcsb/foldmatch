@@ -643,6 +643,7 @@ version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "biotite" },
+    { name = "click" },
     { name = "esm" },
     { name = "faiss-cpu" },
     { name = "hf-xet" },
@@ -664,6 +665,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "biotite", specifier = "==1.7.1" },
+    { name = "click", specifier = "==8.3.1" },
     { name = "esm", specifier = "==3.2.3" },
     { name = "faiss-cpu", specifier = "==1.15.1" },
     { name = "hf-xet", specifier = "==1.4.2" },
