@@ -684,7 +684,8 @@ class BuildLockTest(_Run):
         with launch_env(SLURM_JOB_ID=4242), split_run.build_lock(self.db, self.record) as held:
             self.assertEqual(held, lock)
             content = json.loads(lock.read_text())
-        self.assertEqual(set(content), {"run_id", "host", "pid", "slurm_job_id", "started_utc"})
+        self.assertEqual(set(content), {"run_id", "host", "pid", "slurm_job_id", "started_utc", "lock_id"})
+        self.assertRegex(content["lock_id"], r"^[0-9a-f]{32}$")
         self.assertEqual((content["run_id"], content["host"], content["pid"], content["slurm_job_id"]),
                          ("r", socket.gethostname(), os.getpid(), "4242"))
         self.assertRegex(content["started_utc"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
@@ -714,11 +715,27 @@ class BuildLockTest(_Run):
         self.assertFalse(Path(f"{self.db}.build.lock").exists())
 
     def test_a_lock_that_is_no_longer_ours_stays(self):
+        """A lock deleted during the build, and maybe created again by another build, is not removed at the end. The
+        other build's lock can be a new file on the inode of the deleted one (Linux reuses it at once); "in place" is
+        that case on every system: another build's lock, another lock_id, on the same inode."""
         lock = Path(f"{self.db}.build.lock")
-        with split_run.build_lock(self.db, self.record):
-            lock.unlink()
-            lock.write_text("another build's")
-        self.assertEqual(lock.read_text(), "another build's")
+        another = json.dumps({"run_id": "other", "lock_id": "0" * 32})
+        for case in ("deleted", "deleted and created again", "in place", "in place, not JSON"):
+            with self.subTest(case=case):
+                with split_run.build_lock(self.db, self.record):
+                    if case.startswith("deleted"):
+                        lock.unlink()
+                        if case == "deleted and created again":
+                            lock.write_text(another)
+                    else:
+                        with open(lock, "r+") as f:
+                            f.truncate()
+                            f.write(another if case == "in place" else "another build's")
+                if case == "deleted":
+                    self.assertFalse(lock.exists())
+                else:
+                    self.assertEqual(lock.read_text(), another if "JSON" not in case else "another build's")
+                    lock.unlink()
 
     def test_the_hint_when_only_the_code_store_is_missing(self):
         lock = Path(f"{self.db}.build.lock")

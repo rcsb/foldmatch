@@ -1349,6 +1349,13 @@ While the major version is `0`, breaking changes are released in a minor bump.
   query FASTA, structure or embedding file replaced it; and `query embedding`
   dropped every query but one of a repeated id. Each is now refused (see the
   two *BREAKING* entries on `fm-search`).
+- **A step-2 build could delete another build's lock on Linux.** At its
+  end, `fm-search build sequences-index` removed `<output-db>.build.lock`
+  when the file there had the inode of its own lock; Linux can give that
+  inode to a lock created right after the first was deleted, so a lock
+  deleted by hand during a build, then taken by a second build, was removed
+  by the first. The lock now holds a random `lock_id`, and a build removes
+  only the lock with its own.
 
 ## [0.10.0] - 2026-09-15
 

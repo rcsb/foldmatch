@@ -37,6 +37,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -770,11 +771,14 @@ def build_lock(db_path, record: Dict[str, Any], *, shards_folder=None) -> Iterat
     """Hold ``{db_path}.build.lock`` (``db_path``: :func:`~foldmatch.search.db_path.parse_db_path`'s resolved path)
     for a step-2 build of the record's run.
 
-    The lock is created exclusively and holds the run id, the host, the pid, ``SLURM_JOB_ID`` and the start time. It
-    is removed when the block ends, also on an exception (which then propagates), so it stays only when the process
-    is killed (wall time, out of memory). An existing lock is refused with its content, the database files present
-    and the recovery; when only the residue-code store is missing from an otherwise complete database, the refusal
-    also names the ``build residue-codes`` command that adds it (``shards_folder`` is the run's folder).
+    The lock is created exclusively and holds the run id, the host, the pid, ``SLURM_JOB_ID``, the start time and a
+    random ``lock_id``. It is removed when the block ends, also on an exception (which then propagates), so it stays
+    only when the process is killed (wall time, out of memory); a lock that is no longer this one (deleted, and maybe
+    created again by another build) is left alone. It is told apart by its ``lock_id``, not by its inode, which Linux
+    can give a file created right after this one was deleted. An existing lock is refused with its content, the
+    database files present and the recovery; when only the residue-code store is missing from an otherwise complete
+    database, the refusal also names the ``build residue-codes`` command that adds it (``shards_folder`` is the run's
+    folder).
     """
     db_path = str(db_path)
     lock = Path(f"{db_path}{BUILD_LOCK_SUFFIX}")
@@ -784,6 +788,7 @@ def build_lock(db_path, record: Dict[str, Any], *, shards_folder=None) -> Iterat
         "pid": os.getpid(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID") or None,
         "started_utc": datetime.now(timezone.utc).strftime(_CREATED_FORMAT),
+        "lock_id": token_hex(16),
     }
     try:
         fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -795,7 +800,6 @@ def build_lock(db_path, record: Dict[str, Any], *, shards_folder=None) -> Iterat
         try:
             _write_all(fd, (json.dumps(content, indent=2, sort_keys=True) + "\n").encode("utf-8"))
             os.fsync(fd)
-            own = os.fstat(fd)
         finally:
             os.close(fd)
     except OSError as exc:
@@ -804,12 +808,18 @@ def build_lock(db_path, record: Dict[str, Any], *, shards_folder=None) -> Iterat
     try:
         yield lock
     finally:
-        try:
-            current = os.stat(lock)
-        except FileNotFoundError:
-            current = None
-        if current is not None and (current.st_dev, current.st_ino) == (own.st_dev, own.st_ino):
-            lock.unlink()
+        if _lock_id(lock) == content["lock_id"]:
+            lock.unlink(missing_ok=True)
+
+
+def _lock_id(lock: Path) -> Optional[str]:
+    """The ``lock_id`` of the build lock at ``lock``; None when it is gone or holds none (not a lock of this
+    version, or not JSON)."""
+    try:
+        held = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return held.get("lock_id") if isinstance(held, dict) else None
 
 
 def code_store_command(db_path, record: Dict[str, Any], shards_folder=None) -> Optional[str]:
