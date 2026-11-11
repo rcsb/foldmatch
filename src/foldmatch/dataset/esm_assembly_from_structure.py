@@ -2,15 +2,15 @@ import logging
 
 import pandas as pd
 import torch
-from biotite.structure import chain_iter
 from esm.sdk.api import ESMProtein
 from esm.utils.structure.protein_chain import ProteinChain
 from torch.utils.data import IterableDataset, get_worker_info
 
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import STRUCTURE_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_structure_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
-from foldmatch.utils.structure_parser import get_protein_chains, rename_atom_attr, filter_residues, get_assemblies
+from foldmatch.utils.structure_parser import protein_chain_iter, rename_atom_attr, filter_residues, get_assemblies
 from foldmatch.utils.structure_provider import StructureProvider
 
 logger = logging.getLogger(__name__)
@@ -29,29 +29,23 @@ class EsmAssemblyFromStructure(IterableDataset):
             src_location: SrcLocation = SrcLocation.file,
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.min_res_n = min_res_n
         self.src_location = src_location
         self.structure_format = structure_format
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
 
     def __load_stream(self, src_stream):
-        self.data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=EsmAssemblyFromStructure.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            keep_default_na=False,
-            dtype=str,
-            names=EsmAssemblyFromStructure.COLUMNS
-        )
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
+        # embedding name is the structure name, and an embedding name given to more than one row is refused
+        self.data = read_structure_list(src_stream, self.src_location)
+        refuse_shared_names(self.data, EsmAssemblyFromStructure.STREAM_NAME_ATTR, EsmAssemblyFromStructure.STREAM_ATTR)
+        refuse_repeated_names(self.data, list_source(src_stream, self.src_location, "structure list"),
+                              STRUCTURE_LIST_DEFAULT_NAME)
 
     def __iter__(self):
         # Handle multiple workers by splitting data across workers
@@ -92,35 +86,32 @@ class EsmAssemblyFromStructure(IterableDataset):
             src_structure = row[EsmAssemblyFromStructure.STREAM_ATTR]
             item_name = row[EsmAssemblyFromStructure.ITEM_NAME_ATTR]
 
-            structure = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
-            for assembly_id in get_assemblies(structure=structure, structure_format=self.structure_format):
+            src = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
+            for assembly_id in get_assemblies(structure=src, structure_format=self.structure_format):
                 structure = self.__structure_provider.get_structure(
                     src_name=src_name,
-                    src_structure=structure,
+                    src_structure=src,
                     structure_format=self.structure_format,
                     assembly_id=assembly_id
                 )
 
-                # Get all protein chains from structure
-                chain_ids = get_protein_chains(structure, self.min_res_n)
-
                 protein_chain_list = []
-                # Process each chain
-                for chain_id in chain_ids:
-                    chain_structure = structure[structure.chain_id == chain_id]
-                    for atom_ch in chain_iter(chain_structure):
-                        if len(atom_ch) == 0:
-                            raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
-                        try:
-                            atom_ch = filter_residues(atom_ch)
-                            atom_ch = rename_atom_attr(atom_ch)
-                            protein_chain = ProteinChain.from_atomarray(atom_ch)
-                            protein_chain = ESMProtein.from_protein_chain(protein_chain)
-                        except Exception as e:
-                            raise IOError(f"Error while creating ESMProtein from structure chain {src_name}.{chain_id}: {e}")
+                # Each protein chain of the assembly, from its own atoms: the copies of a chain share its chain ID
+                for atom_ch in protein_chain_iter(structure, self.min_res_n):
+                    chain_id = atom_ch.chain_id[0]
+                    try:
+                        atom_ch = filter_residues(atom_ch)
+                        atom_ch = rename_atom_attr(atom_ch)
+                        protein_chain = ProteinChain.from_atomarray(atom_ch)
+                        protein_chain = ESMProtein.from_protein_chain(protein_chain)
+                    except Exception as e:
+                        raise IOError(f"Error while creating ESMProtein from structure chain {src_name}.{chain_id}: {e}")
 
-                        if len(protein_chain) == 0:
-                            raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
-                        protein_chain_list.append(protein_chain)
-                        break  # Only process first atom_ch (same as original logic)
+                    if len(protein_chain) == 0:
+                        raise IOError(f"No atoms were found in structure chain {src_name}.{chain_id}")
+                    protein_chain_list.append(protein_chain)
+                if not protein_chain_list:
+                    logger.warning(f"Assembly {item_name}-{assembly_id} has no protein chain of at least "
+                                   f"{self.min_res_n} residues: skipped")
+                    continue
                 yield protein_chain_list, f"{item_name}-{assembly_id}"

@@ -10,6 +10,9 @@
 # Gitignored directories
 node_modules/
 
+# Native kernel libraries built in place (the image compiles its own)
+/src/foldmatch/_native/_fmsw_*
+
 # Directories
 /dist/
 /tests/

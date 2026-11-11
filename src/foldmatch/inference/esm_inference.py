@@ -7,11 +7,14 @@ from lightning import Trainer
 
 from foldmatch.dataset.esm_prot_from_structure import EsmProtFromStructure
 from foldmatch.dataset.esm_prot_from_chain import EsmProtFromChain
+from foldmatch.dataset.utils import list_source, row_labels
+from foldmatch.inference.utils import list_inputs, refuse_min_res_n
 from foldmatch.modules.esm_module import EsmModule
 from foldmatch.types.api_types import StructureFormat, Accelerator, Devices, Strategy, \
     SrcProteinFrom, FileOrStreamTuple, SrcLocation, OutFormat
 from foldmatch.utils.data import identity_collate
 from foldmatch.utils.model import get_residue_model
+from foldmatch.utils.output_files import check_outputs
 from foldmatch.writer.batch_writer import TensorBatchWriter, CsvBatchWriter, ParquetBatchWriter, JsonStorage
 
 
@@ -34,6 +37,8 @@ def predict(
 ):
     logger = logging.getLogger(__name__)
 
+    if src_from == SrcProteinFrom.chain:
+        refuse_min_res_n(min_res_n, "the chains of a chain list (src_from chain)")
     inference_set = EsmProtFromChain(
         src_stream=src_stream,
         src_location=src_location,
@@ -44,6 +49,13 @@ def predict(
         structure_format=structure_format,
         min_res_n=min_res_n
     )
+    # Before the model: each output names a file of its own in out_folder, and none an input (P9.N)
+    data = inference_set.data.sort_index()  # in input order
+    list_name = "chain list" if src_from == SrcProteinFrom.chain else "structure list"
+    check_outputs(out_folder, out_format, out_name, source=list_source(src_stream, src_location, list_name),
+                  labels=row_labels(data), inputs=list_inputs(data, src_stream, src_location, list_name=list_name),
+                  **({"names": list(data.item_name)} if src_from == SrcProteinFrom.chain else
+                     {"prefixes": list(data.item_name), "separator": "."}))
     if hasattr(inference_set, '__len__'):
         logger.info(f"esm-inference set contains {len(inference_set)} samples")
     else:
@@ -67,7 +79,7 @@ def predict(
 
     if out_folder is not None:
         if out_format == OutFormat.parquet:
-            inference_writer = ParquetBatchWriter(out_folder, out_name)
+            inference_writer = ParquetBatchWriter(out_folder, out_name, residue_embeddings=True)
         elif out_format == OutFormat.json:
             inference_writer = JsonStorage(out_folder, out_name)
         elif out_format == OutFormat.pt:

@@ -1,11 +1,11 @@
 import os
 from pathlib import Path
 
-import pandas as pd
 from tqdm import tqdm
 
 from foldmatch.dataset.residue_embedding_from_tensor_file import ResidueEmbeddingFromTensorFile
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import STRUCTURE_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_structure_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import SrcLocation, StructureLocation, StructureFormat, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
@@ -29,7 +29,7 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
             res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         if not os.path.isdir(res_embedding_location):
             raise FileNotFoundError(f"Folder {res_embedding_location} does not exist")
@@ -38,7 +38,7 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
         self.structure_format = structure_format
         self.min_res_n = min_res_n
         self.res_embedding_format = res_embedding_format
-        self.__structure_provider = structure_provider
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         super().__init__(
             src_stream=self.__get_chains(src_stream),
             src_location=SrcLocation.stream,
@@ -47,18 +47,14 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
 
     def __get_chains(self, src_stream):
         chains = []
-        data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueEmbeddingFromStructure.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueEmbeddingFromStructure.COLUMNS
-        )
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
+        # embedding name is the structure name, and an embedding name given to more than one row is refused
+        data = read_structure_list(src_stream, self.src_location)
         data = data.sort_values(by=data.columns[0])
+        refuse_shared_names(data, ResidueEmbeddingFromStructure.STREAM_NAME_ATTR,
+                            ResidueEmbeddingFromStructure.STREAM_ATTR)
+        refuse_repeated_names(data, list_source(src_stream, self.src_location, "structure list"),
+                              STRUCTURE_LIST_DEFAULT_NAME)
         progress = tqdm(data.iterrows(), total=len(data), desc="Loading structures")
         for idx, row in progress:
             src_name = row[ResidueEmbeddingFromStructure.STREAM_NAME_ATTR]

@@ -20,7 +20,8 @@ import typer
 from typing import Annotated, Optional, List
 
 from foldmatch import __version__
-from foldmatch.cli.args_utils import arg_devices, set_log_level
+from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, \
+    download_models_command, set_log_level
 from foldmatch.types.api_types import (
     Accelerator,
     LogLevel,
@@ -77,7 +78,7 @@ def from_structures_residue(
             help='Output folder to store predictions.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
-            help='Format of the output. Options: csv, pt, parquet, json.'
+            help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per chain, with one list of D values per residue.'
         )] = OutFormat.csv,
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
@@ -324,7 +325,7 @@ def from_sequences_residue(
             help='Output folder to store predictions.'
         )],
         output_format: Annotated[OutFormat, typer.Option(
-            help='Format of the output. Options: csv, pt, parquet, json.'
+            help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per sequence, with one list of D values per residue.'
         )] = OutFormat.csv,
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
@@ -358,7 +359,8 @@ def from_sequences_residue(
     set_log_level(log_level)
 
     predict(
-        fasta_file=fasta_file,
+        # Its pre-flight, which the dataset reads its records' offsets from
+        fasta_file=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n),
         min_res_n=min_res_n,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -427,7 +429,8 @@ def from_sequences_chain(
 
     from foldmatch.inference.chain_complete_inference import predict
     predict(
-        src_stream=fasta_file,
+        # Its pre-flight, which the dataset reads its records' offsets from
+        src_stream=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n),
         src_location=SrcLocation.file,
         src_from=SrcEsmFrom.fasta,
         min_res_n=min_res_n,
@@ -444,18 +447,48 @@ def from_sequences_chain(
     )
 
 
+def _refuse_fasta_conflicts(fasta_file: Path, output_folder: Path, output_format: OutFormat, min_res_n: int):
+    """The FASTA checks of from-sequences, before ESM3 (P9.N), on every rank alike: a record id repeated among the
+    records kept (at least min_res_n residues), in every format, found by the residue pass's pre-flight
+    (preflight_fasta, its duplicates); with csv and pt, ids that cannot name a file <id>.<format> of the output folder,
+    or that the folder takes for one file (abc and ABC on APFS), and the FASTA file among the output files. The
+    pre-flight, whose offsets the dataset reads."""
+    from foldmatch.errors import RefusalError
+    from foldmatch.utils.output_files import ITEM_FORMATS, check_outputs
+    from foldmatch.utils.sequence import preflight_fasta, scan_fasta
+    preflight = preflight_fasta(fasta_file, min_res_n)
+    if preflight.duplicates:
+        raise RefusalError(
+            f"{fasta_file}: {preflight.problems()[0]}. fm-embedding writes each record's embedding under its id, the "
+            f"first word of its header (the file <id>.csv or <id>.pt, or the id of its row in Parquet and JSON), so a "
+            f"repeated id keeps one of them: give each record its own id."
+        )
+    if output_format.value in ITEM_FORMATS:
+        ids, labels = [], []
+        for k, (_, name, length) in enumerate(scan_fasta(fasta_file), start=1):
+            if min_res_n <= 0 or length >= min_res_n:
+                ids.append(name)
+                labels.append(f"record {k}")
+        check_outputs(output_folder, output_format, None, names=ids, labels=labels, source=str(fasta_file),
+                      inputs=[("the FASTA file", fasta_file)], what="FASTA id", given="those records")
+    return preflight
+
+
 # =====================================================================
 # top-level
 # =====================================================================
 
 @app.command(
     name="download-models",
-    help="Download ESM3 and aggregator models from Hugging Face."
+    help=DOWNLOAD_MODELS_HELP
 )
-def download_models():
-    from foldmatch.utils.model import get_residue_model, get_aggregator_model
-    get_residue_model()
-    get_aggregator_model()
+def download_models(
+        system: Annotated[Optional[List[str]], typer.Option(
+            "--system",
+            help=DOWNLOAD_MODELS_SYSTEM_HELP
+        )] = None
+):
+    download_models_command(system)
 
 
 def version_callback(value: bool):

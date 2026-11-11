@@ -4,13 +4,13 @@ from pathlib import Path
 
 import torch
 import pandas as pd
-import pyarrow.parquet as pq
 
 from torch.utils.data import Dataset
 
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import ASSEMBLY_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_assembly_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import StructureLocation, StructureFormat, SrcLocation, FileOrStreamTuple
-from foldmatch.utils.data import stringio_from_url
+from foldmatch.utils.data import residue_embeddings_from_parquet, stringio_from_url
 from foldmatch.utils.structure_parser import get_protein_chains
 from foldmatch.utils.structure_provider import StructureProvider
 
@@ -28,41 +28,34 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
             self,
             src_stream: FileOrStreamTuple,
             parquet_path: Path,
-            embedding_dim: int,
+            *,
             src_location: SrcLocation = SrcLocation.file,
             structure_format: StructureFormat = StructureFormat.mmcif,
             min_res_n: int = 0,
             max_res_n: int = sys.maxsize,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         super().__init__()
         self.src_location = src_location
         self.structure_format = structure_format
         self.min_res_n = min_res_n
         self.max_res_n = max_res_n
-        self.embedding_dim = embedding_dim
         self.data = pd.DataFrame()
         self.__load_stream(src_stream)
-        self.__structure_provider = structure_provider
-        self.table = pq.read_table(parquet_path)
-        self._id_index = {
-            self.table.column('id')[i].as_py(): i
-            for i in range(len(self.table))
-        }
+        self.__structure_provider = structure_provider if structure_provider is not None else StructureProvider()
+        # One row per chain, one list of D values per residue: the [L, D] tables by id, D from the column type.
+        ids, embeddings = residue_embeddings_from_parquet(parquet_path)
+        self._embeddings = dict(zip(ids, embeddings))
 
     def __load_stream(self, src_stream):
-        self.data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueAssemblyEmbeddingFromParquet.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueAssemblyEmbeddingFromParquet.COLUMNS
-        )
+        # The assembly list, whose columns are COLUMNS: a row of more than 4 fields is refused, a missing or empty
+        # embedding name is <structure name>-<assembly ID>, and an embedding name given to more than one row is refused
+        self.data = read_assembly_list(src_stream, self.src_location)
         self.data = self.data.sort_values(by=self.data.columns[0])
+        refuse_shared_names(self.data, ResidueAssemblyEmbeddingFromParquet.STREAM_NAME_ATTR,
+                            ResidueAssemblyEmbeddingFromParquet.STREAM_ATTR)
+        refuse_repeated_names(self.data, list_source(src_stream, self.src_location, "assembly list"),
+                              ASSEMBLY_LIST_DEFAULT_NAME)
 
     def __len__(self):
         return len(self.data)
@@ -84,12 +77,10 @@ class ResidueAssemblyEmbeddingFromParquet(Dataset):
         total_residues = 0
         for ch in chain_ids:
             lookup_id = f"{src_name}.{ch}"
-            if lookup_id not in self._id_index:
+            if lookup_id not in self._embeddings:
                 logger.warning(f"Chain {lookup_id} not found in parquet file")
                 continue
-            row_idx = self._id_index[lookup_id]
-            embedding_flat = self.table.column('embedding')[row_idx].as_py()
-            tensor = torch.tensor(embedding_flat, dtype=torch.float32).reshape(-1, self.embedding_dim)
+            tensor = torch.tensor(self._embeddings[lookup_id])
             total_residues += tensor.shape[0]
             tensors.append(tensor)
             if total_residues > self.max_res_n:

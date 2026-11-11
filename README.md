@@ -20,8 +20,8 @@ If you are interested in training a new model with a new structure dataset, visi
 - **Sequence-based embeddings** from FASTA files without requiring 3D structures
 - **Structure-level embeddings** aggregated via a transformer-based aggregator network 
 - **Fast and efficient** FAISS-based similarity search
-- **Two-stage sequence search** — an embedding prefilter followed by exact pairwise Smith-Waterman alignment, reporting sequence identity, coverage, and calibrated E-values over selectable output columns
-- **Structural clustering** using the Leiden algorithm for biological assembly identification
+- **Two-stage sequence search** — an embedding prefilter followed by exact pairwise Smith-Waterman alignment on FoldMatch's native SIMD kernel, reporting sequence identity, coverage, and calibrated E-values over selectable output columns
+- **Structural clustering**: Leiden (python-igraph) on the similarity graph, or greedy representatives in one streamed pass for collections whose graph does not fit in memory
 - **Command-line interface** implemented with Typer for high-throughput inference workflows  
 - **Python API** for interactive embedding computation and integration into analysis pipelines  
 - **High-performance inference** leveraging PyTorch Lightning, with multi-node and multi-GPU support  
@@ -50,15 +50,107 @@ pip install -e .
 - ESM 3.2.3
 - Lightning 2.6.1
 - Typer 0.24.1
-- Biotite 1.6.0
-- FAISS 1.13.2
+- Biotite 1.7.1
+- FAISS 1.15.1 (the `faiss-cpu` wheel)
 - igraph 1.0.0
-- leidenalg 0.11.0
 - PyTorch with CUDA support (recommended for GPU acceleration)
+- A C compiler (GCC 12 or later, or Clang 14 or later) when FoldMatch is built from source (an install from the
+  sdist, `pip install -e .`): it compiles the native Smith-Waterman kernel of the sequence search's Stage 2. The
+  platform wheels (Linux x86_64 and aarch64, macOS arm64 and x86_64) include it. Without a compiler the install
+  still succeeds, with a warning, as a pure-Python package in which Stage 2 refuses to run and prints the reinstall
+  command; everything else works.
 
 **Optional Dependencies:**
 
 - `faiss-gpu` for GPU-accelerated similarity search (instead of `faiss-cpu`)
+- a FAISS built on MKL, for faster `ivf_pq` builds of large databases on Linux x86_64 with Python 3.12 (see *FAISS
+  threads* below)
+
+### FAISS threads
+
+FoldMatch installs the `faiss-cpu` 1.15.1 wheel. On Linux the wheel bundles an OpenMP build of OpenBLAS
+(`faiss_cpu.libs/libopenblaso-*.so`) and its own `libgomp`. FAISS's BLAS work therefore runs on FAISS's OpenMP
+threads: the k-means and OPQ steps of an `ivf_pq` training, the IVF assignment of its adds, and batched flat searches.
+Earlier FoldMatch versions pinned `faiss-cpu` 1.13.2, whose OpenBLAS is single-threaded. With it, a 30-million-entry
+`ivf_pq` index took about 7 hours on any node.
+
+- **Choosing the threads.** Export `OMP_NUM_THREADS` to set FAISS's threads. It also sets the threads of FAISS's
+  OpenBLAS. `OPENBLAS_NUM_THREADS` has no effect on FAISS's OpenBLAS; it changes only the OpenBLAS copies of numpy
+  and scipy. When `OMP_NUM_THREADS` is unset, `fm-search build sequences-index` gives FAISS the physical cores it may
+  use and logs the count.
+- **Build times.** On NERSC Perlmutter, `fm-search build sequences-index --residue-codes` over 30.4 million sequences
+  built the `ivf_pq` index in 1 h 45 min on a GPU node (one 64-core AMD EPYC 7763, 64 threads; 2 h 47 min for the
+  whole command) and in 2 h 37 min on a CPU node (two 64-core EPYC 7763, 128 threads; 3 h 33 min). Most of the
+  difference is the training, 40 min against 1 h 16 min: the OPQ step of the wheel's training does not gain from
+  more threads. In a benchmark on the CPU node, two OPQ iterations took 66 to 70 s at 4 to 16 threads and 173 s at
+  128, while 10 iterations of the IVF k-means gained up to about 32 threads.
+- **Recommended on large nodes.** With the wheel, run `build sequences-index` with `OMP_NUM_THREADS=64` on a node
+  with more than 64 physical cores, such as a 128-core CPU node. The setting applies to the whole command. This
+  advice rests on the 64-thread GPU-node build above and on the OPQ benchmark (121 s at 64 threads against 173 s at
+  128); a full build at 64 threads on a 128-core node was not timed. With it, `build sequences-index` warns that FAISS
+  has fewer threads than physical cores; with the wheel that warning is expected. With the MKL build below, leave
+  `OMP_NUM_THREADS` unset: it built a 30-million-entry index in 43 minutes at 128 threads.
+- **128 BLAS threads at most.** The x86_64 wheel's OpenBLAS is built with `MAX_THREADS=128`, so FAISS's BLAS work
+  runs on at most 128 threads. That OpenBLAS also lowers a higher OpenMP thread count to 128 when FAISS calls it. On
+  a node with more than 128 physical cores, FAISS therefore runs 128 threads, and `build sequences-index` warns that
+  FAISS has fewer threads than physical cores.
+- **Reproducibility.** Two `hnsw` or `ivf_pq` builds are byte-identical only at `OMP_NUM_THREADS=1`. The wheel's
+  k-means results also change with the thread count. `OPENBLAS_NUM_THREADS=1` alone does not make FAISS
+  single-threaded. With the wheel, search results can change with FAISS's thread count too, in the last digits of
+  the scores and so in the order of tied hits: between 32 and 256 threads, about a quarter of 1,000 batched flat
+  searches and 3 to 5 `ivf_pq` searches were reordered. For bit-identical reruns, set `OMP_NUM_THREADS` to the same
+  value (unset, FAISS gets each node's core count).
+- **Existing databases.** FAISS 1.13.2 and 1.15.1 read each other's index files. Searching one database with either
+  version gives the same hits up to float rounding (flat and `ivf_pq` scores within about 3e-7), which can reorder
+  tied hits and swap hits tied at the cut-off; with `hnsw`, 5 to 7% of 1,000 searches changed at least one hit. A
+  rebuilt `ivf_pq` index is a different, equally valid index: at 30 million entries, rebuilds shared 57 to 59% of
+  their top-100 hits with each other (1.13.2 against the MKL build below, the wheel against the MKL build, and two
+  wheel builds at 64 and 128 threads), with about the same self-hit rates. Searches whose results you compare should
+  all use the same database.
+- **Start-up log.** On Linux x86_64, `import faiss` logs at INFO `Could not load library with AVX2 support due to:
+  ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")`, then `Successfully loaded faiss.`. This is
+  expected: the 1.15.1 wheel has one library, which picks the CPU's instructions at run time (its compile options
+  include `DD`).
+- **macOS.** The macOS wheel uses Apple Accelerate for BLAS and bundles its own `libomp`, so FoldMatch keeps
+  `OMP_NUM_THREADS=1` there by default (see *macOS notes*).
+
+**Optional: FAISS with MKL.** For Linux x86_64 and Python 3.12 only, the official FAISS conda channel, `pytorch`,
+publishes a `faiss-cpu` 1.15.1 build on MKL. It builds large `ivf_pq` indexes faster than the wheel, mostly because
+its OPQ training is faster. On one NERSC Perlmutter GPU node (64 cores), `build sequences-index --residue-codes` over
+30.4 million sequences took 2 h 02 min with it, of which 59 min was the index (the wheel: 2 h 47 min and 1 h 45 min).
+In a FAISS-only script on one CPU node (2× AMD EPYC 7763), with 128 threads bound to cores (`OMP_PROC_BIND=spread
+OMP_PLACES=cores`; FoldMatch does not bind threads), it built a 30-million-entry `ivf_pq` index in 43 minutes. The
+commands below replace the wheel with the conda build. They were tested on NERSC, in a conda env (Python 3.12) in
+which FoldMatch and its dependencies had been installed with `pip`:
+
+```bash
+python -m pip uninstall -y faiss-cpu
+conda install -y --no-deps --override-channels -c pytorch -c conda-forge \
+  "pytorch::faiss-cpu=1.15.1=py3.12_hf65b397_0_cpu" "pytorch::libfaiss=1.15.1=py3.12_hf65b397_0_cpu" \
+  "conda-forge::mkl=2025.3.1=h0e700b2_12" "conda-forge::onemkl-license=2025.3.1=hf2ce2f3_12" \
+  "conda-forge::tbb=2023.1.0=haa8c3ee_2" "conda-forge::libhwloc=2.15.0=default_hd7c4d0c_1001" \
+  "conda-forge::libxml2=2.15.4=h7df9aa5_1" "conda-forge::libxml2-16=2.15.4=hf3af7cc_1" \
+  "conda-forge::libiconv=1.18=h0cb94f2_3" "conda-forge::llvm-openmp=23.1.4=h7148c6a_0" \
+  "conda-forge::_openmp_mutex=4.5=8_kmp_llvm" "conda-forge::libsvs-runtime=0.4.0=g7f7c639_0_0" \
+  "conda-forge::python_abi=3.12=9_cp312" "conda-forge::libgcc=16.2.0=ha9f2e26_7" \
+  "conda-forge::libgcc-ng=16.2.0=h69a702a_7" "conda-forge::libgomp=16.2.0=he0feb66_7" \
+  "conda-forge::libstdcxx=16.2.0=h934c35e_7"
+python -c "import faiss; print(faiss.__version__, faiss.get_compile_options())"   # 1.15.1 OPTIMIZE AVX2 ...
+```
+
+- **Why `--no-deps`.** It keeps conda from replacing pip's numpy and its BLAS, but conda then checks nothing. The
+  listed packages are what `libfaiss` and MKL needed in that env, which had the rest; `libfaiss` needs `libgcc` 16 or
+  later. In another env, a library still missing makes `import faiss` fail with an `ImportError` that names it.
+- **Reinstalling FoldMatch.** The conda package registers as the distribution `faiss`, not `faiss-cpu`, so `pip check`
+  reports `foldmatch ... requires faiss-cpu, which is not installed`. That is expected. Reinstall or upgrade FoldMatch
+  in this env only with `pip install --no-deps ...`. Without `--no-deps`, pip installs the `faiss-cpu` wheel over the
+  conda FAISS.
+- **Updating the env.** Never run `conda update`, or a `conda install` without `--no-deps`, in this env: conda's view
+  of it is inconsistent on purpose. Repeat the `--no-deps` form instead.
+- **OpenMP runtime.** It depends on the import order. FoldMatch's commands load torch first, so torch's `libgomp`
+  serves FAISS and MKL. A script that imports `faiss` first gets LLVM's `libomp`. Both work.
+- **Thread logs.** threadpoolctl 3.6.0 does not list this MKL, so the index phase's `Thread pool:` lines do not show
+  FAISS's BLAS.
 
 
 
@@ -72,27 +164,32 @@ The package provides two main interfaces:
 
 ## Command-Line Interface (CLI)
 
-The toolkit ships three CLIs. Each is invoked with `--help` for full option documentation; the canonical examples below are enough to get started.
+The toolkit ships two CLIs, `fm-embedding` and `fm-search`. Each is invoked with `--help` for full option documentation; the canonical examples below are enough to get started.
 
 ### `fm-embedding` — compute embeddings
 
 Two subcommand groups reflect input modality:
 
 ```bash
+# Output folders must exist; give each kind of embedding its own (residue and chain files share names)
+mkdir -p out/residue out/chain out/assembly out/seq-residue out/seq-chain
+
 # Residue / chain / assembly embeddings from a folder of 3D structures
-fm-embedding from-structures residue  --src-folder data/pdb --output-path out --structure-format mmcif
-fm-embedding from-structures chain    --src-folder data/pdb --output-path out --structure-format mmcif
-fm-embedding from-structures assembly --src-folder data/pdb --output-path out --structure-format mmcif
+fm-embedding from-structures residue  --src-folder data/pdb --output-folder out/residue  --structure-format mmcif
+fm-embedding from-structures chain    --src-folder data/pdb --output-folder out/chain    --structure-format mmcif
+fm-embedding from-structures assembly --src-folder data/pdb --output-folder out/assembly --structure-format mmcif
 
 # Residue / chain embeddings from protein sequences in a FASTA file (no 3D required)
-fm-embedding from-sequences  residue  --fasta-file seqs.fasta --output-path out
-fm-embedding from-sequences  chain    --fasta-file seqs.fasta --output-path out
+fm-embedding from-sequences  residue  --fasta-file seqs.fasta --output-folder out/seq-residue
+fm-embedding from-sequences  chain    --fasta-file seqs.fasta --output-folder out/seq-chain
 
 # One-shot model download
 fm-embedding download-models
 ```
 
 Assembly-level embeddings are only available under `from-structures` — there is no assembly concept for a bare sequence.
+
+Each FASTA record's embedding is stored under its id, the first word of its header, so `from-sequences` refuses a repeated id before ESM3 is loaded. With `--output-format csv` or `pt` (one file per record or chain), an id is a file name: one that holds `/` or cannot name a file, ids that the output folder takes for one file (`abc` and `ABC` on macOS's default file system), and a `--fasta-file` named like an output are refused too, and a run stops at a second write of one file (chains `A` and `a` of one structure on macOS). Parquet and JSON keep any id. A rerun into the same folder replaces its own files, as before.
 
 Run `fm-embedding [from-structures|from-sequences] [command] --help` for full options (batch size, accelerator, devices, output format, distributed settings, etc.).
 
@@ -102,25 +199,32 @@ Run `fm-embedding [from-structures|from-sequences] [command] --help` for full op
 # Build a similarity-search database from structures, FASTA, or pre-computed embeddings
 fm-search build structures  --structure-folder data/pdb --output-db dbs/my_db --tmp-embedding-folder tmp
 fm-search build sequences   --fasta-file seqs.fasta     --output-db dbs/my_db --tmp-embedding-folder tmp
-fm-search build embeddings  --embedding-folder out      --output-db dbs/my_db
+fm-search build embeddings  --embedding-folder out/chain --output-db dbs/my_db
 
 # Query the database (--output-file is required)
 fm-search query structure   --db-path dbs/my_db --query-structure q.cif --output-file hits.tsv
 fm-search query sequences   --db-path dbs/my_db --fasta-file q.fasta --tmp-embedding-folder tmp --output-file hits.tsv
-fm-search query embedding   --db-path dbs/my_db --embedding-folder out --output-file hits.tsv
+fm-search query embedding   --db-path dbs/my_db --embedding-folder out/chain --output-file hits.tsv
 fm-search query db          --query-db-path dbs/queries --subject-db-path dbs/my_db --output-file hits.tsv
 
 # Inspect, cluster, export
 fm-search stats             --db-path dbs/my_db
 fm-search cluster           --db-path dbs/my_db --output-file clusters.tsv
+fm-search cluster           --db-path dbs/my_db --output-file clusters.tsv --method greedy
 fm-search similarity-graph  --db-path dbs/my_db --output-file graph.graphml
 ```
 
 All `build` commands accept `--index-type [auto|flat|hnsw|ivf_pq]` and IVF-PQ tuning flags (`--ivf-nlist`, `--ivf-nprobe`). See `fm-search <subcommand> --help` for the full surface.
 
+`cluster` and `similarity-graph` work on every database type. On `ivf_pq` a score is estimated from the PQ codes (the chain's decoded embedding, normalised, against each stored code, as in `query db`), so two identical chains score close to, but not exactly, 1. With `--method leiden` (the default) the k-NN search takes time in proportion to the number of chains and `--max-neighbors`, whatever `--threshold`; `--method greedy` searches only chains no representative has taken, so its time also depends on `--threshold` and on database order. The graph's memory grows with the number of edges, which `--threshold` and `--max-neighbors` bound (at most `--max-neighbors` edges from each chain's search), and the Leiden step's memory also grows with the number of chains. The Leiden step of `cluster` runs on one CPU thread. It runs a fixed number of iterations of python-igraph's Leiden (modularity at `--resolution`), 10 unless `--leiden-iterations` says otherwise; `--seed` makes it repeatable.
+
+`cluster --method greedy` clusters collections whose similarity graph does not fit in memory. When most chains have `--max-neighbors` neighbours above `--threshold`, the Leiden route keeps about `n x --max-neighbors / 2` edges for `n` chains: 447,547,205 edges for 1,000,000 chains in an `ivf_pq` database (`--max-neighbors 1000`, `--threshold 0.8`), about 15.1e9 for 30.4M chains (`ivf_pq`); with fewer neighbours above the threshold, fewer (219,292,519 for the same 1,000,000 chains on `hnsw`, where few chains reach `--max-neighbors`). Leiden's memory grows with the edges (on that 1M-chain `ivf_pq` database, `cluster` peaked at 28.16 GiB, about 66 bytes an edge above the memory before the load, on Linux x86_64 at 128 threads), greedy's with the chains: it picks representatives in one streamed pass over the database, dropping each block's search results once used. A cluster is a representative and the still-unclustered chains among its `--max-neighbors` nearest that score at least `--threshold` (MMseqs2/CD-HIT style): chains are taken in database order, and a chain in no cluster yet becomes a representative. When most representatives have `--max-neighbors` neighbours above the threshold (the statistics report the share; 98.96% of rows in the first 10 blocks of a 30.4M-chain `ivf_pq` database), clusters are bounded by `--max-neighbors`, and a representative or singleton can score above the threshold with an earlier representative. Greedy clusters are smaller and tighter than Leiden's few large communities at 0.8: higher family purity, lower completeness and family ARI (measured at 100k and 1M chains). Results depend on database order (the order chains were added), as CD-HIT's depend on length order. `--max-neighbors` caps cluster size at `--max-neighbors` + 1 chains (on `hnsw`, FAISS's `efSearch` of 16 returns fewer: 481.7 of 1000 on average on a 100k-chain database, so a larger value adds few). Greedy needs no graph and computes no modularity; it has no resolution or iteration count and is deterministic, so `--resolution`, `--leiden-iterations` and `--seed` are refused with it.
+
 #### Output format
 
 Every command writes **tab-separated rows** to `--output-file` — one record per line. `query` results are ordered best-first per query, so rank is simply the row order.
+
+`--output-file` cannot be one of the command's inputs: a file of a database it reads (`<db path>.index`, `.metadata`, `.invlists`, `.sequences` or `.rescodes.*`), the query FASTA or structure file, or a query embedding file; such a run is refused before any work. A file written by an earlier command is replaced. `query embedding` refuses query embeddings that share an id (results are kept by query id).
 
 `--format-mode` selects the file layout:
 
@@ -153,11 +257,21 @@ A **sequence-identity** search (Stage 2, below) emits the columns chosen with `-
 chain_id   cluster_id   cluster_size
 ```
 
+and, with `--method greedy`, a fourth column, the representative's chain id (equal to `chain_id` on the representative's own row):
+
+```
+chain_id   cluster_id   cluster_size   representative
+```
+
+`cluster_id` 0 is the largest cluster, under both methods (ties under greedy in representative order). Rows are in database order; `--min-cluster-size` drops the rows of smaller clusters.
+
 (`similarity-graph` is the one exception: GraphML is a graph format, not tabular.)
 
 #### Two-stage sequence search (exact identity)
 
-`build sequences` also writes a sidecar `{db}.sequences` store next to the FAISS index. This lets sequence-built databases report **exact** sequence identity, not just embedding similarity: when you run `query sequences` (or `query db`) against such a database, a second stage pairwise-aligns each embedding hit (local Smith-Waterman, BLOSUM62) and re-ranks the surviving hits by identity.
+`build sequences` also writes a sidecar `{db}.sequences` store next to the FAISS index. This lets sequence-built databases report **exact** sequence identity, not just embedding similarity: when you run `query sequences` (or `query db`) against such a database, a second stage pairwise-aligns each embedding hit (local Smith-Waterman, BLOSUM62) and re-ranks the surviving hits by bitscore.
+
+Stage 2 aligns on FoldMatch's native SIMD Smith-Waterman kernel, a compiled library (see *Requirements*). It reproduces biotite 1.7.1's `align_optimal` (local, affine gaps), ties included, which Stage 2 used before: the same scores, coordinates and alignments, so the same output. Without the kernel, `query sequences` and `query db` refuse to run Stage 2 before the queries are embedded or the database is searched, and print the command that rebuilds it; `--no-seq-identity` still runs an embedding-only search.
 
 Stage-2 hits use the same **tab-separated, no-header** format as every other query output. Pick the columns with `--format-output`:
 
@@ -192,19 +306,15 @@ Supported `--format-output` fields:
 
 - **Auto by default**: Stage 2 runs when the database(s) carry a sequence store and falls back to embedding-only otherwise. Force it with `--seq-identity` (errors if no store is present) or disable with `--no-seq-identity`. `query db` requires **both** databases to have sequence stores.
 - Hits below `--min-seq-identity` (default `0.3`) or `--min-coverage` (default `0.8`) are dropped, as are hits above `--max-evalue` (default `1e-3`; pass `inf` to keep every hit). `--max-evalue` turns the significance pass on even when neither `evalue` nor `bits` is in `--format-output`.
-- Tuning: `--gap-open`, `--gap-extend`, and `--align-workers` (defaults to all CPUs on the node).
+- Tuning: `--gap-open` (default `11`) and `--gap-extend` (default `1`), where a gap of length L costs gap-open + (L − 1) × gap-extend, and `--align-workers` (defaults to all CPUs on the node). `--gap-open` must be at least 1 and `--gap-extend` at least 0, both at most 1,048,576; the sign is ignored. With `--significance-mode default`, a run that needs significance (an `evalue` or `bits` column, or a finite `--max-evalue`, which the default `1e-3` is) needs the gap costs 11/1: for other gap costs use `--significance-mode sampled`, or `--max-evalue inf` with neither column in `--format-output`. Both rules are checked before the queries are embedded (`query sequences`) or the database is searched (`query db`).
 - Compositional bias correction: off by default, so alignments are scored with plain BLOSUM62. `--comp-bias-corr` (scaled by `--comp-bias-corr-scale`, default `1`) applies mmseqs's correction for locally biased amino-acid composition, which mmseqs enables by default; use it when comparing with `mmseqs search`. With the same setting on both tools, raw scores, bit scores and E-values match `mmseqs search` (18-8cc5c) on the same pairs, except for alignments containing a non-standard residue (`X`, `B`, `Z`, `J`, `U`, `O`, `*`), which the two tools score differently. The correction can shorten alignments over biased regions, so coordinates, identity and coverage change too.
 - `evalue`/`bits` use calibrated Karlin–Altschul statistics by default (`--significance-mode default`). `--significance-mode sampled` estimates λ/K by sampling for other gap penalties, but its absolute magnitudes are relative-only. The significance pass is skipped automatically when neither `evalue` nor `bits` is in `--format-output`.
-
-### `inference` — low-level inference subcommands
-
-Lower-level entry point exposing individual inference passes (`residue-embedding`, `structure-embedding`, `chain-embedding`, `assembly-embedding`, `complete-embedding`). Mostly useful for advanced workflows that compose inference stages explicitly. Run `inference --help` for the command list.
 
 ---
 
 ## Python API
 
-The `RcsbStructureEmbedding` class provides methods for computing embeddings programmatically.
+The `FoldMatch` class provides methods for computing embeddings programmatically.
 
 ### Basic Usage
 
@@ -220,6 +330,8 @@ model.load_models()  # Auto-detects CUDA
 # import torch
 # model.load_models(device=torch.device("cuda:0"))
 ```
+
+A protein chain is embedded only if it has at least `min_res` residues (default 10), counted as polymer amino-acid residues: free amino acids are not counted. With `max_res` (default `None`, no limit), a structure method raises `ValueError`, before any ESM3 pass, when the protein chains it is about to embed have more than `max_res` residues together, counted the same way: the chains with `chain_id` (in an assembly, one per copy), else every protein chain of the structure or assembly. `sequence_embedding` raises `ValueError` when the sequence is shorter than `min_res` or longer than `max_res`.
 
 ### Methods
 
@@ -261,10 +373,10 @@ Compute per-residue embeddings for a structure.
 **Parameters:**
 - `src_structure`: File path, URL, or file-like object
 - `structure_format`: `'mmcif'`, `'binarycif'`, or `'pdb'`
-- `chain_id`: Specific chain ID (optional, uses all chains if None)
+- `chain_id`: Chain ID (optional): the protein chains with this ID (in an assembly, one per copy); every protein chain if None
 - `assembly_id`: Assembly ID for biological assembly (optional)
 
-**Returns:** `torch.Tensor` of shape `[num_residues, embedding_dim]`
+**Returns:** `torch.Tensor` of shape `[L + 2, 1536]` for one chain of `L` residues: one row per residue, between ESM3's BOS and EOS rows. Several chains give their tensors one after another, each with its BOS and EOS rows. Raises `ValueError` when no protein chain qualifies, or when `max_res` is exceeded.
 
 ```python
 # Single chain
@@ -294,7 +406,7 @@ assembly_residues = model.residue_embedding(
 
 Compute per-residue embeddings separately for each chain.
 
-**Returns:** `dict[str, torch.Tensor]` mapping chain IDs to embeddings
+**Returns:** `dict[str, torch.Tensor]` mapping each chain ID to its embeddings, of shape `[L + 2, 1536]`; `{}` when no chain qualifies
 
 ```python
 chain_embeddings = model.residue_embedding_by_chain(
@@ -316,7 +428,7 @@ chain_a = model.residue_embedding_by_chain(
 
 Compute residue embeddings for an assembly.
 
-**Returns:** `dict[str, torch.Tensor]` mapping assembly ID to concatenated embeddings
+**Returns:** `dict[str, torch.Tensor]` mapping the assembly ID (`'0'` for the asymmetric unit when `assembly_id` is None) to the tensors of its protein chains (one per copy) one after another, each with its BOS and EOS rows; `{}` when no chain qualifies
 
 ```python
 assembly_emb = model.residue_embedding_by_assembly(
@@ -336,7 +448,7 @@ Compute residue embeddings from amino acid sequence (no structural information).
 **Parameters:**
 - `sequence`: Amino acid sequence string (plain or FASTA format)
 
-**Returns:** `torch.Tensor` of shape `[sequence_length, embedding_dim]`
+**Returns:** `torch.Tensor` of shape `[L + 2, 1536]` for a sequence of `L` residues (ESM3's BOS and EOS rows included)
 
 ```python
 # Plain sequence
@@ -356,7 +468,7 @@ seq_emb = model.sequence_embedding(fasta)
 Aggregate residue embeddings into a single structure-level vector.
 
 **Parameters:**
-- `residue_embedding`: `torch.Tensor` from residue embedding methods
+- `residue_embedding`: `torch.Tensor` from any of the residue embedding methods (for `residue_embedding_by_chain` and `residue_embedding_by_assembly`, a value of their dict)
 
 **Returns:** `torch.Tensor` of shape `[1536]`
 
@@ -451,7 +563,7 @@ pytest
 
 ### macOS notes
 
-**The problem.** PyPI wheels for `faiss-cpu` and `torch` (pulled in via `lightning`) each bundle their own copy of `libomp.dylib`. On macOS, both copies get loaded into the same Python process. Whenever FAISS enters an OpenMP-parallel section (batched search with more than one query vector, `IndexHNSWFlat` graph construction, IVF-PQ training) the second OpenMP runtime fails to `pthread_mutex_init` and the call deadlocks — the CLI appears to hang indefinitely. Linux installs are unaffected because both libraries share a single OpenMP runtime.
+**The problem.** PyPI wheels for `faiss-cpu` and `torch` (pulled in via `lightning`) each bundle their own copy of `libomp.dylib`. On macOS, both copies get loaded into the same Python process. Whenever FAISS enters an OpenMP-parallel section (batched search with more than one query vector, `IndexHNSWFlat` graph construction, IVF-PQ training) the second OpenMP runtime fails to `pthread_mutex_init` and the call deadlocks — the CLI appears to hang indefinitely — or the process crashes (a segmentation fault at `OMP_NUM_THREADS=4` on an M1 Max, with torch 2.11 and `faiss-cpu` 1.13.2 or 1.15.1). Linux installs are unaffected: there the copies are GNU `libgomp` builds, which can be loaded together, and FoldMatch's commands, which load torch first, run FAISS on torch's copy.
 
 **Affected commands** on macOS without mitigation:
 
@@ -459,6 +571,7 @@ pytest
 - `fm-search query embedding` with a multi-row `.parquet` file.
 - `fm-search query sequences` with more than one input sequence.
 - `fm-search query db` (database-to-database).
+- `fm-search cluster` and `fm-search similarity-graph`, which search many chains per FAISS call (safe at the default `OMP_NUM_THREADS=1` pin).
 
 Single-query paths (`fm-search query structure`, small `--index-type flat` builds) are unaffected.
 

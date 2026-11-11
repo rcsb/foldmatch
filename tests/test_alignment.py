@@ -1,15 +1,26 @@
+import contextlib
 import csv
 import math
+import multiprocessing
+import multiprocessing.pool
+import random
 import re
+import signal
+import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
+import pytest
 
-from foldmatch.search import alignment, output
+import blosum62_reference as ref
+from foldmatch.search import alignment, output, swint, swkern
 from foldmatch.search.alignment import _chunk_candidate_tasks
-from foldmatch.types.api_types import FormatMode
+from foldmatch.types.api_types import FormatMode, SignificanceMode
 from foldmatch.search.output import (
     DEFAULT_OUTPUT_FIELDS,
     SUPPORTED_OUTPUT_FIELDS,
@@ -54,15 +65,19 @@ def _signature(results):
 
 
 class TestChunkCandidateTasks(unittest.TestCase):
+    """The cell dispatch: contiguous candidate slices of about equal DP cells."""
+
     def test_preserves_all_pairs_in_order(self):
         q1 = [(f"a{i}", "SEQ", float(i)) for i in range(10)]
         q2 = [(f"b{i}", "SEQ", float(i)) for i in range(3)]
         tasks = [("q1", "AAAA", q1), ("q2", "BBBB", q2)]
 
-        chunks = _chunk_candidate_tasks(tasks, worker_budget=2)  # -> chunk_size 2
+        # 13 pairs of 12 cells: budget ceil(156 / (4 * 1)) = 39 cells, 3 pairs.
+        chunks, cells = _chunk_candidate_tasks(tasks, worker_budget=1, floor_cells=1)
 
-        # No chunk mixes queries and none exceeds the computed chunk size.
-        self.assertTrue(all(len(c) <= 2 for _, _, c in chunks))
+        # No chunk mixes queries and none exceeds the budget.
+        self.assertTrue(all(len(c) <= 3 for _, _, c in chunks))
+        self.assertEqual(cells, [12 * len(c) for _, _, c in chunks])
         # Concatenating each query's chunks reproduces its candidate list in order.
         regrouped = {}
         for qid, _, cand in chunks:
@@ -73,18 +88,44 @@ class TestChunkCandidateTasks(unittest.TestCase):
     def test_single_query_is_split_across_many_chunks(self):
         cand = [(f"s{i}", "SEQ", float(i)) for i in range(64)]
         tasks = [("q", "AAAA", cand)]
-        chunks = _chunk_candidate_tasks(tasks, worker_budget=8)
+        chunks, _ = _chunk_candidate_tasks(tasks, worker_budget=8, floor_cells=1)
         # A lone query must fan out to more than one chunk so the pool can spread
         # it — this is the whole point of the change.
         self.assertGreater(len(chunks), 1)
 
+    def test_the_floor_keeps_small_work_together(self):
+        cand = [(f"s{i}", "SEQ", float(i)) for i in range(64)]
+        chunks, cells = _chunk_candidate_tasks([("q", "AAAA", cand)], worker_budget=8)
+        self.assertEqual((len(chunks), cells), (1, [64 * 12]))
+        with mock.patch.object(alignment, "_TASK_CELLS_FLOOR", 1):
+            self.assertGreater(len(_chunk_candidate_tasks([("q", "AAAA", cand)], worker_budget=8)[0]), 1)
+
     def test_empty_and_no_pairs(self):
-        self.assertEqual(_chunk_candidate_tasks([], worker_budget=4), [])
-        tasks = [("q", "AAAA", [])]
-        # No pairs to align: returned as-is (caller re-seeds it to []).
-        self.assertEqual(_chunk_candidate_tasks(tasks, worker_budget=4), tasks)
+        self.assertEqual(_chunk_candidate_tasks([], worker_budget=4), ([], []))
+        # No pairs to align: no task (the caller re-seeds the query to []).
+        self.assertEqual(_chunk_candidate_tasks([("q", "AAAA", [])], worker_budget=4), ([], []))
+
+    def test_slices_are_contiguous_within_budget_and_cover_every_candidate(self):
+        rng = random.Random(2)
+        tasks = []
+        for q in range(30):
+            n = rng.randint(1, 3000)
+            cands = [(f"q{q}t{i}", "A" * rng.randint(1, 3000), 0.5) for i in range(rng.randint(0, 200))]
+            tasks.append((f"q{q}", "M" * n, cands))
+        chunks, cells = _chunk_candidate_tasks(tasks, worker_budget=8)
+        total = sum(len(q) * len(s) for _, q, c in tasks for _, s, _ in c)
+        budget = max(alignment._TASK_CELLS_FLOOR, -(-total // (4 * 8)))
+        rebuilt = {}
+        for (qid, qseq, cands), c in zip(chunks, cells):
+            self.assertTrue(cands)
+            self.assertEqual(c, sum(len(qseq) * len(s) for _, s, _ in cands))
+            self.assertTrue(c <= budget or len(cands) == 1)
+            rebuilt.setdefault(qid, []).extend(cands)
+        self.assertEqual(rebuilt, {q: c for q, _, c in tasks if c})
+        self.assertEqual([q for q, _, _ in chunks], sorted([q for q, _, _ in chunks], key=lambda x: int(x[1:])))
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestAlignCandidatesParallelism(unittest.TestCase):
     def _run(self, prefilter, queries, num_workers):
         return alignment.align_candidates(
@@ -107,7 +148,12 @@ class TestAlignCandidatesParallelism(unittest.TestCase):
         prefilter = {"q1": (sids, [1.0 / i for i in range(1, 9)])}
 
         serial = self._run(prefilter, queries, num_workers=1)
-        parallel = self._run(prefilter, queries, num_workers=2)
+        # These pairs are far below the slice floor: without it the query is cut
+        # into slices, queued longest first.
+        with mock.patch.object(alignment, "_TASK_CELLS_FLOOR", 1), \
+                self.assertLogs(alignment.logger, "INFO") as logs:
+            parallel = self._run(prefilter, queries, num_workers=2)
+        self.assertTrue(any("across 2 CPU workers" in line for line in logs.output), logs.output)
 
         self.assertEqual(_signature(serial), _signature(parallel))
         # All eight candidates survive the (disabled) filters.
@@ -136,6 +182,68 @@ class TestAlignCandidatesParallelism(unittest.TestCase):
         self.assertIn("q2", res)
         self.assertEqual(res["q2"], [])
         self.assertEqual(len(res["q1"]), 2)
+
+
+class StartMethodTest(unittest.TestCase):
+    """The Stage-2 pool's start method is pinned to the pre-3.14 platform default (G12).
+
+    ``mp.Pool`` follows the interpreter's global default, which Python 3.14 changes
+    to 'forkserver' on Linux and which an embedding application can change with
+    ``set_start_method``. The pool goes through ``mp.get_context`` with the method
+    that was the default before ('fork' on Linux, 'spawn' on macOS), so neither
+    changes how the workers start.
+    """
+
+    def _run(self, num_workers):
+        return alignment.align_candidates(
+            query_sequences={"q1": _STORE["s1"], "q2": _STORE["s5"]},
+            prefilter_results={
+                "q1": (["s1", "s2", "s3", "s6", "s8"], [0.9, 0.8, 0.7, 0.6, 0.5]),
+                "q2": (["s5", "s7", "s4"], [0.95, 0.55, 0.2]),
+            },
+            fetch_subject_sequences=_fetch,
+            min_seq_identity=0.0,
+            min_coverage=0.0,
+            max_evalue=None,
+            num_workers=num_workers,
+            compute_significance=False,
+        )
+
+    def test_platform_defaults(self):
+        for platform, method in (("linux", "fork"), ("darwin", "spawn"),
+                                 ("win32", "spawn"), ("freebsd14", "fork")):
+            with self.subTest(platform=platform), mock.patch.object(alignment.sys, "platform", platform):
+                self.assertEqual(alignment._pool_start_method(), method)
+
+    @unittest.skipIf(sys.version_info >= (3, 14), "Python 3.14 changed the POSIX default")
+    def test_is_the_interpreter_default_before_3_14(self):
+        # A fresh interpreter, so nothing in this process can have set the method.
+        default = subprocess.run(
+            [sys.executable, "-c", "import multiprocessing; print(multiprocessing.get_start_method())"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(alignment._pool_start_method(), default)
+
+    @unittest.skipIf(sys.platform == "win32", "no forkserver on Windows")
+    @pytest.mark.usefixtures("fmsw_libs")
+    def test_pool_ignores_the_global_default(self):
+        recorded = []
+
+        class SpyPool(multiprocessing.pool.Pool):
+            def __init__(self, *args, context=None, **kwargs):
+                recorded.append(context.get_start_method())
+                super().__init__(*args, context=context, **kwargs)
+
+        saved = multiprocessing.get_start_method(allow_none=True)
+        # Python 3.14's POSIX default, and never the pinned method.
+        multiprocessing.set_start_method("forkserver", force=True)
+        try:
+            with mock.patch("multiprocessing.pool.Pool", SpyPool):
+                pooled = self._run(num_workers=2)
+        finally:
+            multiprocessing.set_start_method(saved, force=True)
+        self.assertEqual(recorded, [alignment._pool_start_method()])
+        self.assertEqual(_signature(pooled), _signature(self._run(num_workers=1)))
 
 
 class TestParseFormatOutput(unittest.TestCase):
@@ -170,6 +278,7 @@ class TestParseFormatOutput(unittest.TestCase):
             set(output._FIELD_RENDERERS),
         )
 
+    @pytest.mark.usefixtures("fmsw_libs")
     def test_every_supported_field_materializes_when_requested_alone(self):
         """Guard the registry (output.py) against the compute gate (alignment.py).
 
@@ -180,6 +289,10 @@ class TestParseFormatOutput(unittest.TestCase):
         never be materialized and would silently render as an empty string in
         every output file. Requesting each field *on its own* is what exercises
         the gate; asking for them all at once would mask a missing entry.
+
+        The esm-codes-only fields (``rawrev``, ``q90``, ``rawadj``, ``ecal``) are
+        the exception: BLOSUM62 never computes them, so they render empty here
+        (tests/test_code_alignment.py covers them under esm-codes).
         """
         for field in SUPPORTED_OUTPUT_FIELDS:
             with self.subTest(field=field):
@@ -196,6 +309,9 @@ class TestParseFormatOutput(unittest.TestCase):
                     output_fields=[field],
                 )
                 hit = res["q1"][0]
+                if field in output.ESM_CODES_OUTPUT_FIELDS:
+                    self.assertEqual(output.format_row("q1", hit, [field]), "")
+                    continue
                 self.assertNotEqual(
                     output.format_row("q1", hit, [field]), "",
                     f"column '{field}' rendered empty when requested alone — "
@@ -216,6 +332,7 @@ def _gap_runs(gapped):
     return len(re.findall(r"-+", gapped))
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestOutputFieldComputation(unittest.TestCase):
     """The mmseqs-style columns must satisfy their defining invariants."""
 
@@ -302,6 +419,7 @@ class TestOutputFieldComputation(unittest.TestCase):
         )
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestDefaultFormatGating(unittest.TestCase):
     def test_heavy_fields_not_materialized_by_default(self):
         res = alignment.align_candidates(
@@ -324,10 +442,11 @@ class TestDefaultFormatGating(unittest.TestCase):
         self.assertEqual(m.q_start, 1)
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestNoAlignmentCandidateDropped(unittest.TestCase):
     def test_empty_alignment_is_not_reported_even_at_zero_thresholds(self):
         # Two sequences that share no positive-scoring local alignment produce an
-        # empty biotite trace (aln_len == 0). Such a candidate is not a hit and
+        # empty alignment (aln_len == 0). Such a candidate is not a hit and
         # must be dropped rather than emitted as a malformed position-0 row —
         # even with the identity/coverage thresholds relaxed all the way to 0.
         store = {"far": "PPPPPPPPPP"}
@@ -345,6 +464,7 @@ class TestNoAlignmentCandidateDropped(unittest.TestCase):
         self.assertEqual(res["q"], [])
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestMaxEvalueFilter(unittest.TestCase):
     """The E-value threshold drops weak hits and self-enables significance."""
 
@@ -394,6 +514,76 @@ class TestMaxEvalueFilter(unittest.TestCase):
             )
 
 
+@pytest.mark.usefixtures("fmsw_libs")
+class EmptyDatabaseTest(unittest.TestCase):
+    """An empty or unbuilt sequence store must say so, not raise a TypeError.
+
+    ``SequenceStore.total_residues()`` is ``COALESCE(SUM(length), 0)``, so an empty
+    store arrives here as ``0`` rather than ``None``. That slipped past the ``is None``
+    guard, left the database E-value unset, and surfaced as ``'<=' not supported
+    between instances of 'NoneType' and 'float'`` from inside the result loop.
+    """
+
+    COMMON = dict(
+        query_sequences={"q1": _STORE["s1"]},
+        prefilter_results={"q1": (["s1"], [0.9])},
+        fetch_subject_sequences=_fetch,
+        num_workers=1,
+    )
+
+    def test_empty_database_with_evalue_filter_is_explained(self):
+        for size in (0, -1):
+            with self.subTest(size=size):
+                with self.assertRaises(ValueError) as caught:
+                    alignment.align_candidates(max_evalue=1e-3, subject_db_size=size, **self.COMMON)
+                message = str(caught.exception)
+                self.assertIn("non-empty database", message)
+                self.assertIn(f"subject_db_size is {size}", message)
+                self.assertIn("max_evalue=None", message)
+                self.assertIn("--max-evalue inf", message)
+                # A build refuses an existing database, so the advice says to delete it first.
+                self.assertIn("Delete the database's files and rebuild it", message)
+
+    def test_refused_before_any_work(self):
+        """The check runs up front, before the subject sequences are even fetched."""
+        def fetch(ids):
+            raise AssertionError("subject sequences fetched before the size check")
+        common = dict(self.COMMON, fetch_subject_sequences=fetch)
+        with self.assertRaisesRegex(ValueError, "non-empty database"):
+            alignment.align_candidates(max_evalue=1e-3, subject_db_size=0, **common)
+
+    def test_missing_database_size_still_explained(self):
+        with self.assertRaisesRegex(ValueError, "requires subject_db_size"):
+            alignment.align_candidates(max_evalue=1e-3, subject_db_size=None, **self.COMMON)
+
+    def test_empty_database_without_evalue_filter_still_works(self):
+        """Ranking without E-values is legitimate on an empty search space."""
+        hits = alignment.align_candidates(max_evalue=None, subject_db_size=0,
+                                          compute_significance=True, **self.COMMON)["q1"]
+        self.assertEqual(len(hits), 1)
+        self.assertIsNone(hits[0].metrics.evalue)
+        self.assertIsNotNone(hits[0].metrics.bit_score)
+
+    def test_check_evalue_search_space(self):
+        """The check align_candidates runs, callable on its own (the CLI runs it before ESM3)."""
+        check = alignment.check_evalue_search_space
+        for no_filter in (None, float("inf"), float("nan")):
+            with self.subTest(max_evalue=no_filter):
+                self.assertIsNone(check(no_filter, 0))
+                self.assertIsNone(check(no_filter, None))
+        self.assertEqual(check(1e-3, 10), 1e-3)
+        with self.assertRaisesRegex(ValueError, "non-empty database"):
+            check(1e-3, 0)
+        with self.assertRaisesRegex(ValueError, "requires subject_db_size"):
+            check(1e-3, None)
+
+    def test_normal_database_size_is_unaffected(self):
+        hits = alignment.align_candidates(max_evalue=1e-3, subject_db_size=len(_STORE["s1"]),
+                                          **self.COMMON)["q1"]
+        self.assertEqual(len(hits), 1)
+        self.assertIsNotNone(hits[0].metrics.evalue)
+
+
 class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
     """The library's Stage-2 thresholds are the CLI's documented defaults.
 
@@ -409,6 +599,8 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
     )
 
     def test_defaults_are_in_step(self):
+        """``query sequences`` resolves these defaults per ``--scoring`` (its typer default is None): its BLOSUM62
+        defaults are the ones that must equal the library's."""
         import inspect
 
         from foldmatch.cli import search as cli
@@ -418,11 +610,15 @@ class TestThresholdDefaultsMatchTheCli(unittest.TestCase):
             cmd = inspect.signature(command).parameters
             for name in self.SHARED_DEFAULTS:
                 with self.subTest(command=command.__name__, threshold=name):
+                    default = cmd[name].default
+                    if command is cli.query_database_from_fasta and name in cli.BLOSUM62_QUERY_DEFAULTS:
+                        self.assertIsNone(default)
+                        default = cli.BLOSUM62_QUERY_DEFAULTS[name]
                     self.assertEqual(
-                        lib[name].default, cmd[name].default,
+                        lib[name].default, default,
                         f"align_candidates {name}={lib[name].default!r} but "
                         f"--{name.replace('_', '-')} defaults to "
-                        f"{cmd[name].default!r}; update both (and the README).",
+                        f"{default!r}; update both (and the README).",
                     )
 
 
@@ -508,6 +704,7 @@ class TestLocalCompositionBias(unittest.TestCase):
         self.assertFalse(alignment.local_composition_bias(_STORE["s1"], 0.0).any())
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestCompBiasMatchesMmseqs(unittest.TestCase):
     """Stage-2 scores against real mmseqs 18-8cc5c on the same pairs.
 
@@ -599,6 +796,283 @@ class TestCompBiasMatchesMmseqs(unittest.TestCase):
         )
 
 
+@pytest.mark.usefixtures("fmsw_libs")
+class IdentityVectorisedTest(unittest.TestCase):
+    """``identity_aln``/``identity_shorter`` come from the kernel's column tally (G3).
+
+    They once came from biotite's ``get_sequence_identity``, which loops over
+    every alignment column in Python; the kernel counts the same matches, so the
+    two must give the same floats, not merely close ones. Checked against
+    biotite's alignment of the pair and against a naive per-column loop on the
+    mmseqs fixture pairs (with and without the compositional bias correction,
+    whose position-specific profile changes the alignment) and on 1,000 random
+    alignments.
+    """
+
+    ALL_NEEDS = alignment._FieldNeeds(True, True, True, True, True)
+
+    def tearDown(self):
+        alignment._worker_init(11, 1, None, None, None)
+
+    @staticmethod
+    def _naive_identity(trace, query, subject):
+        matches = 0
+        for i, j in trace.tolist():
+            if i != -1 and j != -1 and query[i] == subject[j]:
+                matches += 1
+        return matches / len(trace), matches / min(len(query), len(subject))
+
+    def _check(self, query, subject, comp_bias_scale=None):
+        """Align one pair through the Stage-2 task and directly with biotite, and compare.
+
+        Returns the metrics, or ``None`` for an empty alignment.
+        """
+        import biotite.sequence.align as align
+        alignment._worker_init(11, 1, None, None, None, needs=self.ALL_NEEDS,
+                               comp_bias_scale=comp_bias_scale)
+        _, hits = alignment._align_query(("q", query, [("s", subject, 0.5)]))
+        metrics = hits[0].metrics
+        q_clean, s_clean = alignment.sanitize_sequence(query), alignment.sanitize_sequence(subject)
+
+        # The same alignment, built directly with biotite (the oracle).
+        bias = None if comp_bias_scale is None else alignment.local_composition_bias(query, comp_bias_scale)
+        aln = ref.biotite_alignment(q_clean, s_clean, (11, 1), bias)
+        trace = aln.trace
+        self.assertEqual(metrics.score, int(aln.score))
+        self.assertEqual(metrics.aln_len, len(trace))
+        if len(trace) == 0:
+            self.assertEqual((metrics.identity_aln, metrics.identity_shorter), (0.0, 0.0))
+            return None
+        # Same trace, column for column.
+        self.assertEqual(metrics.q_aln, "".join(q_clean[i] if i != -1 else "-" for i in trace[:, 0]))
+        self.assertEqual(metrics.t_aln, "".join(s_clean[j] if j != -1 else "-" for j in trace[:, 1]))
+
+        expected = (align.get_sequence_identity(aln, mode="all"),
+                    align.get_sequence_identity(aln, mode="shortest"))
+        got = (metrics.identity_aln, metrics.identity_shorter)
+        # Exact float equality on purpose: the output must not move by one ulp.
+        self.assertEqual(got, expected)
+        self.assertEqual(got, self._naive_identity(trace, q_clean, s_clean))
+        return metrics
+
+    def test_mmseqs_pairs(self):
+        with open(_RESOURCES / "alignment" / "mmseqs_comp_bias_pairs.tsv") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+        for scale in (None, 1.0, 0.5):
+            for r in rows:
+                with self.subTest(query=r["query"], target=r["target"], comp_bias_scale=scale):
+                    self.assertIsNotNone(self._check(r["query_sequence"], r["target_sequence"], scale))
+
+    def test_random_alignments(self):
+        rng = np.random.default_rng(20261012)
+        standard = list("ACDEFGHIKLMNPQRSTVWY")
+        alphabets = (
+            standard,
+            standard + list("BZX*"),            # the rest of biotite's protein alphabet
+            standard + list("UOJBZX*-.0acdy"),  # letters sanitize_sequence uppercases or maps to X
+        )
+        found = []
+        for case in range(1000):
+            alphabet = alphabets[case % 3]
+            query = "".join(rng.choice(alphabet, int(rng.integers(1, 150))))
+            if case % 3 == 2:
+                subject = "".join(rng.choice(alphabet, int(rng.integers(1, 150))))
+            else:
+                # A mutated copy: substitutions at a random rate, then a few indels.
+                rate = rng.random()
+                chars = [str(rng.choice(alphabet)) if rng.random() < rate else c for c in query]
+                for _ in range(int(rng.integers(0, 5))):
+                    p = int(rng.integers(0, len(chars) + 1))
+                    if rng.random() < 0.5:
+                        del chars[p:p + int(rng.integers(1, 6))]
+                    else:
+                        chars[p:p] = list(rng.choice(alphabet, int(rng.integers(1, 6))))
+                subject = "".join(chars) or "A"
+            with self.subTest(case=case):
+                metrics = self._check(query, subject, (None, None, None, 1.0)[case % 4])
+                if metrics is not None:
+                    found.append(metrics)
+        # The set has to exercise the computation, not just empty alignments.
+        self.assertGreater(len(found), 800)
+        self.assertTrue(any(m.identity_aln == 1.0 for m in found))
+        self.assertTrue(any(m.identity_aln < 0.3 for m in found))
+        self.assertTrue(any(m.gap_open > 0 for m in found))
+        self.assertTrue(any(m.identity_shorter != m.identity_aln for m in found))
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class NativeKernelOnlyTest(unittest.TestCase):
+    """Stage 2 aligns on the native kernel only (P9.S3): biotite's aligner is never called, a kernel that cannot be
+    loaded is an error (no fallback), and a worker whose initializer fails fails Stage 2 instead of hanging it."""
+
+    COMMON = dict(
+        query_sequences={"q1": _STORE["s1"], "q2": _STORE["s5"]},
+        prefilter_results={"q1": (["s1", "s2", "s3"], [0.9, 0.8, 0.7]), "q2": (["s5", "s7"], [0.9, 0.5])},
+        fetch_subject_sequences=_fetch,
+        min_seq_identity=0.0,
+        min_coverage=0.0,
+        max_evalue=None,
+    )
+
+    def tearDown(self):
+        alignment._worker_init(11, 1, None, None, None)
+
+    def test_biotite_aligns_nothing(self):
+        import biotite.sequence.align as align
+        with mock.patch.object(align, "align_optimal", side_effect=AssertionError("biotite align_optimal")), \
+                mock.patch.object(align, "get_sequence_identity",
+                                  side_effect=AssertionError("biotite get_sequence_identity")):
+            for kw in ({}, {"comp_bias_corr": True}, {"output_fields": list(output.SUPPORTED_OUTPUT_FIELDS),
+                                                        "subject_db_size": 1000}):
+                with self.subTest(**{k: str(v)[:20] for k, v in kw.items()}):
+                    res = alignment.align_candidates(num_workers=1, **{**self.COMMON, **kw})
+                    self.assertEqual(len(res["q1"]), 3)
+
+    def test_a_kernel_that_cannot_be_loaded_is_an_error(self):
+        def fetch(ids):
+            raise AssertionError("subject sequences fetched before the kernel was loaded")
+        missing = swkern.KernelError("native kernel library _fmsw_x not found; build the native kernel with "
+                                     "`python -m foldmatch._native.build`")
+        for kw in ({"num_workers": 1}, {"num_workers": 2}, {"prefilter_results": {}}):
+            with self.subTest(**kw), mock.patch.object(swint, "load", side_effect=missing):
+                with self.assertRaises(swkern.KernelError) as ctx:
+                    alignment.align_candidates(**{**self.COMMON, "fetch_subject_sequences": fetch, **kw})
+                self.assertIs(ctx.exception, missing)
+
+    def test_initializer_errors_are_raised_by_tasks(self):
+        task = ("q", "MKTAYIAKQRQ", [("s", "MKTAYIAKQRQ", 0.5)])
+        alignment._pool_worker_init(11, 1, None, None, None, None, None, None, "bogus")
+        with self.assertRaisesRegex(swkern.KernelError, "bogus"):
+            alignment._align_query(task)
+        with self.assertRaisesRegex(swkern.KernelError, "bogus"):
+            alignment._align_indexed((0, task))
+        alignment._worker_init(11, 1, None, None, None)              # a good initialisation clears it
+        self.assertEqual(len(alignment._align_query(task)[1]), 1)
+        with self.assertRaisesRegex(swkern.KernelError, "bogus"):  # in-process: raised at once
+            alignment._worker_init(11, 1, None, None, None, None, None, None, "bogus")
+
+    @unittest.skipIf(sys.platform == "win32", "no SIGALRM")
+    def test_a_worker_that_cannot_start_fails_stage2(self):
+        """The workers load the ISA the parent loaded; here they are told one that does not exist, so their
+        initializer fails. multiprocessing.Pool would start new workers for ever; the tasks raise the error."""
+        real_load = swint.load
+
+        def load(isa=None, **kw):
+            # the parent's call (no ISA) gets a kernel the workers cannot load; theirs (fork) go to the real one
+            return types.SimpleNamespace(isa="bogus") if isa is None else real_load(isa, **kw)
+
+        with mock.patch.object(swint, "load", load), _deadline(120):
+            with self.assertRaisesRegex(swkern.KernelError, "bogus"):
+                alignment.align_candidates(num_workers=2, **self.COMMON)
+
+
+@contextlib.contextmanager
+def _deadline(seconds: float):
+    """TimeoutError in this (the main) thread after ``seconds``: a wait that must end fails instead."""
+    def expired(*_):
+        raise TimeoutError(f"still waiting after {seconds} s")
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+class GapCostsTest(unittest.TestCase):
+    """The gap costs of the BLOSUM62 Stage 2 (P9.S3): what the kernel accepts, and 11/1 for calibrated
+    significance, checked by check_gap_costs and by align_candidates before any sequence is read."""
+
+    def test_the_kernel_range(self):
+        check = alignment.check_gap_costs
+        self.assertEqual(check(11, 1), (11, 1))
+        self.assertEqual(check(-11, -1), (11, 1))                   # the sign is ignored, as it always was
+        self.assertEqual(check(np.int64(5), 0), (5, 0))
+        self.assertEqual(check(1, swint.MAX_GAP), (1, swint.MAX_GAP))
+        self.assertEqual(check(swint.MAX_GAP, 1), (swint.MAX_GAP, 1))
+        # whole floats are their integers, as biotite took them (the release accepted 11.0)
+        self.assertEqual(check(11.0, 1.0), (11, 1))
+        self.assertEqual(check(np.float64(-11.0), np.float32(0.0)), (11, 0))
+        for go, ge, name in ((0, 1, "gap_open"), (swint.MAX_GAP + 1, 1, "gap_open"),
+                             (-swint.MAX_GAP - 1, 1, "gap_open"), (11, swint.MAX_GAP + 1, "gap_extend"),
+                             (0.0, 1, "gap_open")):
+            with self.subTest(gap_open=go, gap_extend=ge), self.assertRaisesRegex(ValueError, f"^{name} must be"):
+                check(go, ge)
+        for go, ge, name in ((11.5, 1, "gap_open"), (11, 0.5, "gap_extend"), (float("nan"), 1, "gap_open"),
+                             (float("inf"), 1, "gap_open"), (True, 1, "gap_open"), (11, "1", "gap_extend"),
+                             (None, 1, "gap_open"), (11, np.bool_(True), "gap_extend")):
+            with self.subTest(gap_open=go, gap_extend=ge), \
+                    self.assertRaisesRegex(TypeError, f"^{name} must be a whole number"):
+                check(go, ge)
+        # each bound gives its own reason
+        with self.assertRaisesRegex(ValueError, r"between 1 and 1048576 \(its sign is ignored\), got 0: .*"
+                                                r"end-cell rule needs a gap to cost at least 1 to open"):
+            check(0, 1)
+        for go, ge in ((swint.MAX_GAP + 1, 1), (11, swint.MAX_GAP + 1)):
+            with self.subTest(gap_open=go, gap_extend=ge), \
+                    self.assertRaisesRegex(ValueError, r"got 1048577: 1048576 is the most the Smith-Waterman "
+                                                       r"kernel takes \(FMSWI_MAX_GAP\)\.$"):
+                check(go, ge)
+
+    def test_calibrated_significance_needs_11_1(self):
+        check = alignment.check_gap_costs
+        for mode in (SignificanceMode.default, "default"):
+            with self.assertRaisesRegex(ValueError, "No calibrated statistics for BLOSUM62 with gaps 5/2") as ctx:
+                check(5, 2, mode, significance=True)
+            self.assertNotIn("E-value filtering", str(ctx.exception))
+        with self.assertRaisesRegex(ValueError, r"gaps 10/1.*E-value filtering \(max_evalue=0.001\) requires"):
+            check(10, 1, max_evalue=1e-3)
+        self.assertEqual(check(-11, -1, significance=True, max_evalue=1e-3), (11, 1))
+        self.assertEqual(check(11.0, 1.0, significance=True, max_evalue=1e-3), (11, 1))
+        # Fine without significance, or with the sampled statistics.
+        for kw in ({}, {"max_evalue": float("inf")}, {"max_evalue": None}, {"max_evalue": float("nan")},
+                   {"significance_mode": SignificanceMode.sampled, "significance": True, "max_evalue": 1e-3}):
+            with self.subTest(**{k: str(v) for k, v in kw.items()}):
+                self.assertEqual(check(5, 2, **kw), (5, 2))
+
+    def test_align_candidates_checks_before_any_work(self):
+        def fetch(ids):
+            raise AssertionError("subject sequences fetched before the gap check")
+        common = dict(query_sequences={"q1": _STORE["s1"]}, prefilter_results={"q1": (["s1"], [0.9])},
+                      fetch_subject_sequences=fetch, subject_db_size=1000, num_workers=1)
+        cases = [  # (options, exception, message)
+            (dict(gap_open=0, max_evalue=None, compute_significance=False), ValueError,
+             "gap_open must be between 1 and"),
+            (dict(gap_extend=swint.MAX_GAP + 1, max_evalue=None), ValueError, "gap_extend must be between 0 and"),
+            (dict(gap_open=10.5, max_evalue=None, compute_significance=False), TypeError,
+             "gap_open must be a whole number"),
+            (dict(gap_open=5, gap_extend=2, max_evalue=None), ValueError, "No calibrated statistics"),
+            (dict(gap_open=5, gap_extend=2, compute_significance=False), ValueError, "E-value filtering"),
+        ]
+        for options, exception, message in cases:
+            for prefilter in (common["prefilter_results"], {}):
+                for workers in (1, 4, None):                        # serial, a pool, the default pool
+                    with self.subTest(**options, queries=len(prefilter), workers=workers), \
+                            mock.patch.object(swint, "load", side_effect=AssertionError("kernel loaded")), \
+                            mock.patch.object(alignment, "_expand_cpu_affinity",
+                                              side_effect=AssertionError("worker pool set up")), \
+                            mock.patch.object(multiprocessing, "get_context",
+                                              side_effect=AssertionError("worker pool started")):
+                        with self.assertRaisesRegex(exception, message):
+                            alignment.align_candidates(**{**common, "prefilter_results": prefilter, **options,
+                                                          "num_workers": workers})
+
+    @pytest.mark.usefixtures("fmsw_libs")
+    def test_align_candidates_aligns_with_the_absolute_costs(self):
+        common = dict(query_sequences={"q1": _STORE["s1"]},
+                      prefilter_results={"q1": (["s1", "s5", "s7"], [0.9, 0.8, 0.7])},
+                      fetch_subject_sequences=_fetch, min_seq_identity=0.0, min_coverage=0.0, max_evalue=None,
+                      num_workers=1, output_fields=["cigar", "raw"], compute_significance=False)
+        for go, ge in ((11, 1), (3, 3), (1, 0)):
+            pos = alignment.align_candidates(gap_open=go, gap_extend=ge, **common)
+            neg = alignment.align_candidates(gap_open=-go, gap_extend=-ge, **common)
+            self.assertEqual(pos, neg)
+            # whole floats, which the release (biotite) accepted, are their integers
+            self.assertEqual(alignment.align_candidates(gap_open=float(go), gap_extend=np.float64(ge), **common), pos)
+
+
+@pytest.mark.usefixtures("fmsw_libs")
 class TestWriteAlignedResults(unittest.TestCase):
     def test_tsv_no_header(self):
         fields = ["query", "target", "fident", "alnlen", "cigar"]
@@ -660,6 +1134,7 @@ class TestWriteAlignedResults(unittest.TestCase):
         )
 
 
+@pytest.mark.usefixtures("fmsw_libs")
 class TestFormatMode(unittest.TestCase):
     """--format-mode selects the file layout; the column set is chosen elsewhere."""
 

@@ -113,6 +113,9 @@ class TestSequenceInference(unittest.TestCase):
 
     def test_sequence_chain_inference_from_parquet(self):
         _remove_files_in_directory(self.__tmp_path)
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
         from foldmatch.inference.sequence_inference import predict as sequence_predict
         from foldmatch.inference.chain_inference import predict as chain_predict
 
@@ -127,6 +130,10 @@ class TestSequenceInference(unittest.TestCase):
             out_name="residue-embeddings"
         )
         self.assertTrue(os.path.exists(parquet_path))
+        # One row per sequence, one list of 1536 values per residue, BOS and EOS included (245 + 2 and 58 + 2).
+        embedding = pq.read_table(parquet_path).column("embedding")
+        self.assertEqual(embedding.type, pa.list_(pa.list_(pa.float32(), 1536)))
+        self.assertEqual(pc.list_value_length(embedding).to_pylist(), [247, 60])
 
         chain_embeddings = chain_predict(
             src_stream=parquet_path,

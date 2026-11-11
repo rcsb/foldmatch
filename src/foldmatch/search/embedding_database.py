@@ -5,6 +5,7 @@ from tqdm import tqdm
 import numpy as np
 import time
 
+from foldmatch.search.db_path import parse_db_path as _parse_db_path
 from foldmatch.search.faiss_database import FaissEmbeddingDatabase
 
 logger = logging.getLogger(__name__)
@@ -164,14 +165,3 @@ class EmbeddingDatabase:
     def get_db_statistics(self) -> Dict:
         """Get database statistics."""
         return self.db.get_statistics()
-
-
-def _parse_db_path(output_db: str) -> tuple[Path, str, str]:
-    """Split a database path into (directory, index name, resolved path)."""
-    output_db_path = Path(output_db)
-    db_dir = output_db_path.parent
-    index_name = output_db_path.name or "embeddings"
-    if db_dir == Path('.'):
-        db_dir = Path.cwd()
-    return db_dir, index_name, str(db_dir / index_name)
-

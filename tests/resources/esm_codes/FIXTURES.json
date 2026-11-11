@@ -1,0 +1,1163 @@
+{
+ "fixture_set": "FoldMatch esm-codes-v1 test fixtures v1 (PLAN P0.8)",
+ "created_utc": "2026-09-28T02:35:33Z",
+ "system": "esm-codes-v1",
+ "calibration_version": "foldmatch-evalue-M8_s0-D_fmr-pnlU50s1000-M3t999-v1",
+ "table_key": "D_fmr/pnl_uniref50/M3t999",
+ "setting": {
+  "offset": 1.0,
+  "gap_open": 5.0,
+  "gap_extend": 0.5,
+  "s7_eps": 1e-06,
+  "qprep_eps": 1e-12
+ },
+ "generator": {
+  "path": "/Users/joan/devel/rcsb-embedding-search/src/scripts/esm_codes/make_foldmatch_fixtures.py",
+  "md5": "5f047ac6e5356da40ce4c0bde63cd89b",
+  "sha256": "bd1e5f414864e24938bee6e0d4924e9b31ccbe8926fe6c2b6f47e29a6a027636",
+  "stages": [
+   "esm3 (foldmatch env)",
+   "encode --tag ref (research env)",
+   "encode --tag fm (foldmatch env, cross-check)",
+   "build (research env)"
+  ]
+ },
+ "environments": {
+  "esm3": {
+   "python": "3.12.13",
+   "executable": "/Users/joan/app/miniconda3/envs/foldmatch/bin/python",
+   "numpy": "2.4.4",
+   "platform": "macOS-26.6.2-arm64-arm-64bit",
+   "machine": "arm64",
+   "threads_env": {
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": null
+   },
+   "torch": "2.11.0",
+   "esm": "3.2.3",
+   "foldmatch_dist_version": "0.8.0",
+   "foldmatch_imported_from": "/Users/joan/devel/rcsb-embedding-model/src/foldmatch",
+   "foldmatch_git": {
+    "head": "3c3625c83f8ec84adb71948ce9c4f040094814ee",
+    "branch": "js/dev-esm-code-alignments",
+    "dirty_files": [
+     "?? tests/resources/esm_codes/"
+    ]
+   },
+   "hf_hub_offline": "1"
+  },
+  "encode_ref": {
+   "python": "3.12.12",
+   "executable": "/Users/joan/app/miniconda3/envs/rcsb-embedding-search/bin/python",
+   "numpy": "2.4.4",
+   "platform": "macOS-26.6.2-arm64-arm-64bit",
+   "machine": "arm64",
+   "threads_env": {
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1"
+   },
+   "torch": "2.9.0",
+   "torch_threads": 4,
+   "repeat_threads": 1
+  },
+  "encode_fm": {
+   "python": "3.12.13",
+   "executable": "/Users/joan/app/miniconda3/envs/foldmatch/bin/python",
+   "numpy": "2.4.4",
+   "platform": "macOS-26.6.2-arm64-arm-64bit",
+   "machine": "arm64",
+   "threads_env": {
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1"
+   },
+   "torch": "2.11.0",
+   "torch_threads": 4,
+   "repeat_threads": 1
+  },
+  "build": {
+   "python": "3.12.12",
+   "executable": "/Users/joan/app/miniconda3/envs/rcsb-embedding-search/bin/python",
+   "numpy": "2.4.4",
+   "platform": "macOS-26.6.2-arm64-arm-64bit",
+   "machine": "arm64",
+   "threads_env": {
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1"
+   },
+   "research_modules": {
+    "harness": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/harness/harness.py",
+    "cath_score": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/scripts/cath_score.py",
+    "swfast": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/swfast.py",
+    "bench_validate": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/scripts/bench_validate.py",
+    "libswkern": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/libswkern.dylib",
+    "libswmulti": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/libswmulti.so"
+   },
+   "vector_lanes": 4
+  }
+ },
+ "esm3": {
+  "snapshot_path": "/Users/joan/.cache/huggingface/hub/models--rcsb--rcsb-esm/snapshots/636acb420daf674df37ab0220f56061a5de2f169",
+  "snapshot_revision": "636acb420daf674df37ab0220f56061a5de2f169",
+  "weights_file": "/Users/joan/.cache/huggingface/hub/models--rcsb--rcsb-esm/snapshots/636acb420daf674df37ab0220f56061a5de2f169/data/weights/esm3_sm_open_v1.pth",
+  "weights_blob_sha256": "5ead5a135c658068db6a4f1b933e72d6110992c4668822e1c0e2dcc53e38acd9",
+  "param_dtypes": [
+   "torch.float32"
+  ],
+  "device": "cpu",
+  "autocast": false,
+  "precision": "fp32 weights, fp32 compute (CPU)",
+  "default_torch_threads": 1,
+  "repeat_torch_threads": 4,
+  "load_s": 4.6,
+  "pass_s_default": 3.6,
+  "pass_s_repeat": 3.4,
+  "call": "foldmatch.modules.esm_module.EsmModule(get_residue_model(cpu)).predict_step(items, 0) under torch.inference_mode(); per_residue_embedding [L+2, 1536] fp32 -> stored fp16",
+  "fasta_reader": "foldmatch.dataset.esm_prot_from_fasta.EsmProtFromFasta(test_sequences.fasta)"
+ },
+ "reference_code": {
+  "oracle": "harness.py normalize_scores + smith_waterman (verbatim copy of esm3_needleman_wunsch.py, check_verbatim=True) + S5 zero-row and S7 degenerate wrappers in this script",
+  "kernel": "research swkern.c via swfast.swz_ad_batch (probe.py kernel)",
+  "q90": "cath_score.query_scores (swmulti.c) + np.quantile(f64 S, 0.9) (panel_local.py)",
+  "evalue": "bench_validate.tabp + lnE = (lnK + ln m + ln N) - lam S'",
+  "encoders": "sw_common.Whitener + Model (L2m_B8_s0.pt), CPU fp32 torch, each item alone"
+ },
+ "inputs": {
+  "fixture_candidate": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/inventory_probe/fixture_candidate.npz",
+   "md5": "d724b769bcf26178cc20a3bf157a64bf",
+   "expected_md5": "d724b769bcf26178cc20a3bf157a64bf",
+   "bytes": 892791
+  },
+  "probe_report": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/inventory_probe/probe_report.json",
+   "md5": "c35ed1589908808e31afe3dfd562f776",
+   "expected_md5": "c35ed1589908808e31afe3dfd562f776",
+   "bytes": 35632
+  },
+  "probe_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/inventory_probe/probe.py",
+   "md5": "d286e8ce440bb8aa42f00e00fd410c04",
+   "expected_md5": null,
+   "bytes": 8126
+  },
+  "enc_val": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/throughput/build/data/L2m_B8_s0.val.npz",
+   "md5": "5aebc14942665748313f22ca737ca26d",
+   "expected_md5": "5aebc14942665748313f22ca737ca26d",
+   "bytes": 58436408
+  },
+  "enc_test": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/throughput/build/data/L2m_B8_s0.test.npz",
+   "md5": "e570bc26e1a142183aaf85e9a7a57df7",
+   "expected_md5": "e570bc26e1a142183aaf85e9a7a57df7",
+   "bytes": 58333080
+  },
+  "f1_settings_val": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/evalue/f1_settings/results/dom/M8_s0.val.npz",
+   "md5": "67a6ee1d9d9825978c8cd7a25869c8a9",
+   "expected_md5": null,
+   "bytes": 4070309
+  },
+  "f1_settings_test": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/evalue/f1_settings/results/dom/M8_s0.test.npz",
+   "md5": "f4225dd075ef82288748749dcbb016ef",
+   "expected_md5": null,
+   "bytes": 2562417
+  },
+  "cath_set": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/data/cath_set.npz",
+   "md5": "78b6c3fcf64d1ffcc9aa98d81c04c81c",
+   "expected_md5": "78b6c3fcf64d1ffcc9aa98d81c04c81c",
+   "bytes": 113054112
+  },
+  "cath_q90_local": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/results/cath_q90_shipped_local.npy",
+   "md5": "8d78e468a8922c9a3e60e7801c7c287f",
+   "expected_md5": null,
+   "bytes": 46488
+  },
+  "enc_check": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/sw_mlp/enc_check/L2m_B8_s0.npz",
+   "md5": "5e646fb02d0161733379a261b47c20ec",
+   "expected_md5": null,
+   "bytes": 1267884
+  },
+  "enc_check_items": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/sw_mlp/enc_check/check_items.json",
+   "md5": "7015c0081284aa6c53a2cef24ebb2734",
+   "expected_md5": null,
+   "bytes": 996
+  },
+  "encoders": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/sw_mlp/models/L2m_B8_s0.pt",
+   "md5": "85fdd985087d6813e9994274d4fca6ab",
+   "expected_md5": "85fdd985087d6813e9994274d4fca6ab",
+   "bytes": 13891299
+  },
+  "sw_common": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/sw_mlp/sw_common.py",
+   "md5": "b8dab0a03907c9b7ed67663d96c55561",
+   "expected_md5": "b8dab0a03907c9b7ed67663d96c55561",
+   "bytes": 12622
+  },
+  "zcw50_clean": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/clean_pairs/zcw50_clean.npz",
+   "md5": "4c7692ed66e599aca906b41ec7c13f04",
+   "expected_md5": "4c7692ed66e599aca906b41ec7c13f04",
+   "bytes": 37689630
+  },
+  "ship_final": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/results/ship_final.json",
+   "md5": "c51735f962c04bd8c441b9625c4cf30a",
+   "expected_md5": "c51735f962c04bd8c441b9625c4cf30a",
+   "bytes": 36685
+  },
+  "panel_codes": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/results/shipped_panel_codes.npz",
+   "md5": "15cc1c7b2d1dd488a5f9b742365ccb13",
+   "expected_md5": "15cc1c7b2d1dd488a5f9b742365ccb13",
+   "bytes": 8020960
+  },
+  "harness": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/harness/harness.py",
+   "md5": "05f387cb400cc85dbacaef771a275eeb",
+   "expected_md5": "05f387cb400cc85dbacaef771a275eeb",
+   "bytes": 55693
+  },
+  "oracle_script": {
+   "path": "/Users/joan/devel/rcsb-embedding-search/src/scripts/esm3_needleman_wunsch.py",
+   "md5": "7ec19b7e5ff89dc7b44d2512aed3997e",
+   "expected_md5": "7ec19b7e5ff89dc7b44d2512aed3997e",
+   "bytes": 19740
+  },
+  "swkern_c": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/throughput/build/swkern.c",
+   "md5": "438d5a9811153f61e66cee845f1ed037",
+   "expected_md5": "438d5a9811153f61e66cee845f1ed037",
+   "bytes": 30590
+  },
+  "swfast_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/throughput/build/swfast.py",
+   "md5": "80a813553d42801fce6b77462c5e1d0a",
+   "expected_md5": "80a813553d42801fce6b77462c5e1d0a",
+   "bytes": 15466
+  },
+  "libswkern": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/throughput/build/libswkern.dylib",
+   "md5": "4f292c5eec269bed401103cd3e5b1cf0",
+   "expected_md5": null,
+   "bytes": 50768
+  },
+  "kdir_swkern_c": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/swkern.c",
+   "md5": "438d5a9811153f61e66cee845f1ed037",
+   "expected_md5": "438d5a9811153f61e66cee845f1ed037",
+   "bytes": 30590
+  },
+  "kdir_swfast_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/swfast.py",
+   "md5": "80a813553d42801fce6b77462c5e1d0a",
+   "expected_md5": "80a813553d42801fce6b77462c5e1d0a",
+   "bytes": 15466
+  },
+  "kdir_swmulti_c": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/swmulti.c",
+   "md5": "b12fbc2c03638659440b12282a4d8670",
+   "expected_md5": "b12fbc2c03638659440b12282a4d8670",
+   "bytes": 1951
+  },
+  "kdir_libswkern": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/libswkern.dylib",
+   "md5": "4f292c5eec269bed401103cd3e5b1cf0",
+   "expected_md5": null,
+   "bytes": 50768
+  },
+  "kdir_libswmulti": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/kernel/libswmulti.so",
+   "md5": "d13b12390bc0e82c90e7d0776be77b7e",
+   "expected_md5": null,
+   "bytes": 50816
+  },
+  "cath_score_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit/scripts/cath_score.py",
+   "md5": "b3a072d44fd59c86e17a250e8891b931",
+   "expected_md5": null,
+   "bytes": 13543
+  },
+  "panel_local_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/scripts/panel_local.py",
+   "md5": "300be017eabae269186d6f45e8e5625f",
+   "expected_md5": null,
+   "bytes": 4400
+  },
+  "bench_validate_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/scripts/bench_validate.py",
+   "md5": "60f0977e37a5bd5c2477a26039dcac77",
+   "expected_md5": null,
+   "bytes": 10883
+  },
+  "rlib_py": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/evalue/reconcile/rlib.py",
+   "md5": "6bf2586b154391a9cdb9e9c5b2a280bc",
+   "expected_md5": null,
+   "bytes": 9363
+  },
+  "bench_queries": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/evalue/encode/out/queries.L2m_B8_s0.npz",
+   "md5": "e821497f59dda06a3899c18dce37286c",
+   "expected_md5": "e821497f59dda06a3899c18dce37286c",
+   "bytes": 26590375
+  },
+  "bench_q90_local": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/results/bench_q90_shipped_local.npy",
+   "md5": "8666161687ac6fc6b82f41bf8ee6eb2b",
+   "expected_md5": null,
+   "bytes": 11848
+  },
+  "bench_q90_nersc": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/panel/fit2/results/bench_q90_shipped.npy",
+   "md5": "4969b813673919047431f7550c1fd82e",
+   "expected_md5": null,
+   "bytes": 11848
+  },
+  "test_fasta": {
+   "path": "/Users/joan/devel/rcsb-embedding-model/tests/resources/fasta/test_sequences.fasta",
+   "md5": "0e874a7584d82ba93af9a9cb8df0b227",
+   "expected_md5": null,
+   "bytes": 325
+  },
+  "pt_1acb_A": {
+   "path": "/Users/joan/devel/rcsb-embedding-model/tests/resources/embeddings/1acb.A.pt",
+   "md5": "d3c93088f2048a2e83869133d6a0238e",
+   "expected_md5": null,
+   "bytes": 1494103
+  },
+  "pt_2uzi_A": {
+   "path": "/Users/joan/devel/rcsb-embedding-model/tests/resources/embeddings/2uzi.A.pt",
+   "md5": "fe5006f58f4f61331d9b3a481aed76d9",
+   "expected_md5": null,
+   "bytes": 713815
+  },
+  "val_emb": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/embcomp/val.npz",
+   "md5": "9d56740364d2306d64dab46c285cbf05",
+   "note": "md5 recorded by the encode stage"
+  },
+  "work/stage_esm3.npz": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_esm3.npz",
+   "md5": "eeb5bacce47a1586a28477d6c22657a4",
+   "bytes": 1188265
+  },
+  "work/stage_esm3.json": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_esm3.json",
+   "md5": "9a848f1bcc991c6e5aa0cb1b51ffced9",
+   "bytes": 21507
+  },
+  "work/stage_encode_ref.npz": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_encode_ref.npz",
+   "md5": "a4b85796f7ab2b1cc003d2e765f0967a",
+   "bytes": 219952
+  },
+  "work/stage_encode_ref.json": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_encode_ref.json",
+   "md5": "5c698e1705c0ff85655b4fdd049d06d1",
+   "bytes": 5999
+  },
+  "work/stage_encode_fm.npz": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_encode_fm.npz",
+   "md5": "c30aed4b018eb8f1a6b361bb39220ae7",
+   "bytes": 219956
+  },
+  "work/stage_encode_fm.json": {
+   "path": "/private/tmp/claude-501/-Users-joan-devel-rcsb-embedding-search/d9266e69-77ea-4121-a428-2e6f3bcc4ca2/scratchpad/p0/fixtures/work/stage_encode_fm.json",
+   "md5": "d4fff87a16ed9e84948dad61d747fc7a",
+   "bytes": 5986
+  }
+ },
+ "outputs": {
+  "pairs_v1.npz": {
+   "fixture": "F1",
+   "content": "50 CATH pairs: q fp16, codes, sequences, S_f, S_r, forward paths, Q90, lnE at N=1e9",
+   "bytes": 911304,
+   "sha256": "9ccf7f840e11ff612359896a4e3b73d43f0192578dfbbdea0f4d54fd9042c48e",
+   "arrays": {
+    "pair_ids": [
+     [
+      50,
+      2
+     ],
+     "<U7"
+    ],
+    "pair_split": [
+     [
+      50
+     ],
+     "<U4"
+    ],
+    "pair_stratum": [
+     [
+      50
+     ],
+     "<U9"
+    ],
+    "pair_q": [
+     [
+      50
+     ],
+     "int32"
+    ],
+    "pair_t": [
+     [
+      50
+     ],
+     "int32"
+    ],
+    "q_ids": [
+     [
+      50
+     ],
+     "<U7"
+    ],
+    "q_offsets": [
+     [
+      51
+     ],
+     "int64"
+    ],
+    "q": [
+     [
+      7025,
+      64
+     ],
+     "float16"
+    ],
+    "q_sequences": [
+     [
+      50
+     ],
+     "<U298"
+    ],
+    "t_ids": [
+     [
+      50
+     ],
+     "<U7"
+    ],
+    "t_offsets": [
+     [
+      51
+     ],
+     "int64"
+    ],
+    "codes": [
+     [
+      6181,
+      8
+     ],
+     "uint8"
+    ],
+    "t_sequences": [
+     [
+      50
+     ],
+     "<U275"
+    ],
+    "S_f": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "S_r": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "S": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "S_f_f64": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "S_r_f64": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "end_1based": [
+     [
+      50,
+      2
+     ],
+     "int32"
+    ],
+    "path_flat": [
+     [
+      3101,
+      2
+     ],
+     "int32"
+    ],
+    "path_off": [
+     [
+      51
+     ],
+     "int64"
+    ],
+    "n_aligned": [
+     [
+      50
+     ],
+     "int32"
+    ],
+    "aln_cols": [
+     [
+      50
+     ],
+     "int32"
+    ],
+    "n_ident": [
+     [
+      50
+     ],
+     "int32"
+    ],
+    "q90": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "q90_f64": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "S_prime": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "lnE_N1e9": [
+     [
+      50
+     ],
+     "float64"
+    ],
+    "meta_json": [
+     [],
+     "<U2574"
+    ]
+   }
+  },
+  "encoder_rows_v1.npz": {
+   "fixture": "F2",
+   "content": "raw fp16 rows of 5 val domains + reference and NERSC codes / q",
+   "bytes": 861424,
+   "sha256": "3197bbbbadc12c033d8aa54f7f13efcc72390a6bf4eedf45ccd83c25d69df657",
+   "arrays": {
+    "ids": [
+     [
+      5
+     ],
+     "<U7"
+    ],
+    "sequences": [
+     [
+      5
+     ],
+     "<U67"
+    ],
+    "offsets": [
+     [
+      6
+     ],
+     "int64"
+    ],
+    "rows": [
+     [
+      319,
+      1536
+     ],
+     "float16"
+    ],
+    "codes": [
+     [
+      319,
+      8
+     ],
+     "uint8"
+    ],
+    "q": [
+     [
+      319,
+      64
+     ],
+     "float16"
+    ],
+    "codes_nersc": [
+     [
+      319,
+      8
+     ],
+     "uint8"
+    ],
+    "q_nersc": [
+     [
+      319,
+      64
+     ],
+     "float16"
+    ],
+    "margin_t": [
+     [
+      319
+     ],
+     "float32"
+    ],
+    "head_xw": [
+     [
+      8,
+      1534
+     ],
+     "float16"
+    ],
+    "head_h_q": [
+     [
+      8,
+      64
+     ],
+     "float32"
+    ],
+    "head_h_t": [
+     [
+      8,
+      64
+     ],
+     "float32"
+    ],
+    "meta_json": [
+     [],
+     "<U1667"
+    ]
+   }
+  },
+  "ood_rows_codes_v1.npz": {
+   "fixture": "F2b",
+   "content": "arithmetic-only OOD: reference codes / q of tests/resources/embeddings/{1acb.A,2uzi.A}.pt rows (rows not stored)",
+   "bytes": 49385,
+   "sha256": "36f092dbb906f7cf679079b93173b5ab8216e7c90b7552f43aec2a779fab748e",
+   "arrays": {
+    "ids": [
+     [
+      2
+     ],
+     "<U6"
+    ],
+    "source_files": [
+     [
+      2
+     ],
+     "<U36"
+    ],
+    "source_md5": [
+     [
+      2
+     ],
+     "<U32"
+    ],
+    "offsets": [
+     [
+      3
+     ],
+     "int64"
+    ],
+    "codes": [
+     [
+      359,
+      8
+     ],
+     "uint8"
+    ],
+    "q": [
+     [
+      359,
+      64
+     ],
+     "float16"
+    ],
+    "margin_t": [
+     [
+      359
+     ],
+     "float32"
+    ],
+    "meta_json": [
+     [],
+     "<U1452"
+    ]
+   }
+  },
+  "fasta_rows_codes_v1.npz": {
+   "fixture": "F2c",
+   "content": "FoldMatch CPU fp32 ESM3 rows [L+2,1536] fp16 of test_sequences.fasta + reference codes / q",
+   "bytes": 914334,
+   "sha256": "f40f7a22b8e8736b4be89d2392f26da18aec65da7783afe02a755ee87f6fc497",
+   "arrays": {
+    "ids": [
+     [
+      2
+     ],
+     "<U12"
+    ],
+    "sequences": [
+     [
+      2
+     ],
+     "<U245"
+    ],
+    "lengths": [
+     [
+      2
+     ],
+     "int64"
+    ],
+    "rows_offsets": [
+     [
+      3
+     ],
+     "int64"
+    ],
+    "rows": [
+     [
+      307,
+      1536
+     ],
+     "float16"
+    ],
+    "offsets": [
+     [
+      3
+     ],
+     "int64"
+    ],
+    "codes": [
+     [
+      303,
+      8
+     ],
+     "uint8"
+    ],
+    "q": [
+     [
+      303,
+      64
+     ],
+     "float16"
+    ],
+    "margin_t": [
+     [
+      303
+     ],
+     "float32"
+    ],
+    "meta_json": [
+     [],
+     "<U2843"
+    ]
+   }
+  },
+  "q90_queries_v1.npz": {
+   "fixture": "F3",
+   "content": "20 benchmark queries q fp16 + expected Q90 vs the shipped panel",
+   "bytes": 481673,
+   "sha256": "3ab44ad70d930b664899ad3294180f1af5af354670ebb30fddb0ee95bc1d96f5",
+   "arrays": {
+    "ids": [
+     [
+      20
+     ],
+     "<U12"
+    ],
+    "bench_index": [
+     [
+      20
+     ],
+     "int32"
+    ],
+    "lengths": [
+     [
+      20
+     ],
+     "int64"
+    ],
+    "sequences": [
+     [
+      20
+     ],
+     "<U966"
+    ],
+    "offsets": [
+     [
+      21
+     ],
+     "int64"
+    ],
+    "q": [
+     [
+      4003,
+      64
+     ],
+     "float16"
+    ],
+    "q90": [
+     [
+      20
+     ],
+     "float64"
+    ],
+    "q90_stored_local": [
+     [
+      20
+     ],
+     "float64"
+    ],
+    "q90_nersc": [
+     [
+      20
+     ],
+     "float64"
+    ],
+    "q90_f64": [
+     [
+      20
+     ],
+     "float64"
+    ],
+    "meta_json": [
+     [],
+     "<U1283"
+    ]
+   }
+  },
+  "evalue_grid_v1.json": {
+   "fixture": "F4",
+   "content": "E arithmetic grid (lnE, bits) from ship_final.json",
+   "bytes": 71728,
+   "sha256": "4dffd04c17c6a7a0ccf8bfbda915d055ad1c6febe3092c8db6c02a46e02ef563"
+  },
+  "degenerate_v1.npz": {
+   "fixture": "F-deg",
+   "content": "synthetic degenerate cases + real ESM3 degenerate / tiny inputs",
+   "bytes": 379314,
+   "sha256": "7a0c95f95dc21ab740080eeae003b84a035ad55fe1839d67da32cd65a7bd905f",
+   "arrays": {
+    "syn_ids": [
+     [
+      12
+     ],
+     "<U18"
+    ],
+    "syn_expect_error": [
+     [
+      12
+     ],
+     "bool"
+    ],
+    "syn_q_offsets": [
+     [
+      13
+     ],
+     "int64"
+    ],
+    "syn_q": [
+     [
+      1197,
+      64
+     ],
+     "float16"
+    ],
+    "syn_t_offsets": [
+     [
+      13
+     ],
+     "int64"
+    ],
+    "syn_codes": [
+     [
+      1249,
+      8
+     ],
+     "uint8"
+    ],
+    "syn_S_f": [
+     [
+      12
+     ],
+     "float64"
+    ],
+    "syn_S_r": [
+     [
+      12
+     ],
+     "float64"
+    ],
+    "syn_ndeg": [
+     [
+      12,
+      4
+     ],
+     "int32"
+    ],
+    "syn_path_flat": [
+     [
+      329,
+      2
+     ],
+     "int32"
+    ],
+    "syn_path_off": [
+     [
+      13
+     ],
+     "int64"
+    ],
+    "real_ids": [
+     [
+      6
+     ],
+     "<U12"
+    ],
+    "real_sequences": [
+     [
+      6
+     ],
+     "<U50"
+    ],
+    "real_rows_offsets": [
+     [
+      7
+     ],
+     "int64"
+    ],
+    "real_rows": [
+     [
+      111,
+      1536
+     ],
+     "float16"
+    ],
+    "real_offsets": [
+     [
+      7
+     ],
+     "int64"
+    ],
+    "real_codes": [
+     [
+      99,
+      8
+     ],
+     "uint8"
+    ],
+    "real_q": [
+     [
+      99,
+      64
+     ],
+     "float16"
+    ],
+    "real_margin_t": [
+     [
+      99
+     ],
+     "float32"
+    ],
+    "real_n_distinct_codes": [
+     [
+      6
+     ],
+     "int32"
+    ],
+    "real_n_distinct_q_rows": [
+     [
+      6
+     ],
+     "int32"
+    ],
+    "real_nonstandard_frac": [
+     [
+      6
+     ],
+     "float64"
+    ],
+    "real_q90": [
+     [
+      6
+     ],
+     "float64"
+    ],
+    "real_q90_kernel_noS7": [
+     [
+      6
+     ],
+     "float64"
+    ],
+    "base_q": [
+     [
+      155,
+      64
+     ],
+     "float16"
+    ],
+    "base_codes": [
+     [
+      161,
+      8
+     ],
+     "uint8"
+    ],
+    "base_ids": [
+     [
+      2
+     ],
+     "<U7"
+    ],
+    "base_q90": [
+     [],
+     "float64"
+    ],
+    "pair_q": [
+     [
+      48
+     ],
+     "int32"
+    ],
+    "pair_t": [
+     [
+      48
+     ],
+     "int32"
+    ],
+    "pair_S_f": [
+     [
+      48
+     ],
+     "float64"
+    ],
+    "pair_S_r": [
+     [
+      48
+     ],
+     "float64"
+    ],
+    "pair_q90": [
+     [
+      48
+     ],
+     "float64"
+    ],
+    "pair_lnE_N1e9": [
+     [
+      48
+     ],
+     "float64"
+    ],
+    "pair_ndeg": [
+     [
+      48,
+      4
+     ],
+     "int32"
+    ],
+    "pair_path_flat": [
+     [
+      58,
+      2
+     ],
+     "int32"
+    ],
+    "pair_path_off": [
+     [
+      49
+     ],
+     "int64"
+    ],
+    "pair_ecal_provisional": [
+     [
+      48
+     ],
+     "int8"
+    ],
+    "meta_json": [
+     [],
+     "<U2474"
+    ]
+   }
+  },
+  "tokenizer_cases_v1.json": {
+   "fixture": "F-tok",
+   "content": "tokenizer / normalisation cases",
+   "bytes": 16742,
+   "sha256": "375962d79ff8b554050a10d435105b943005d0dbe49b35084ab5189a02413393"
+  }
+ },
+ "total_bytes": 3685904,
+ "notes": [
+  "Every npz carries meta_json (0-d str): json.loads(str(z['meta_json'])) documents each array and the checks.",
+  "Paths (F1 path_flat, F-deg *_path_flat) are [k, 2] (query i, target j), 0-based, -1 = gap, FORWARD order.",
+  "F2/F2b/F2c q: per-element fp16 ulp counts are misleading near 0 (F2 reference vs NERSC: max 9 element ulps, 6 elements > 1 ulp) while every difference is <= 0.5 ulp of the ROW's max |q| (q_diff_stats).",
+  "margin_t = per residue min_k |h_t,k| (float64 re-evaluation). Bits with |h_t| < 1e-4: F2 3, F2b 1, F2c 1, Fdeg 0; an encoder with a different fp32 summation order may flip exactly those.",
+  "F-deg expected values come from the float64 oracle WITH S5/S7. The research fp32 kernel (no S7) is wrong on degenerate rows/columns (affine-coefficient cancellation): e.g. case n1 kernel 0.5 vs oracle 0.776228; kept only as a diagnostic (real_q90_kernel_noS7).",
+  "Real ESM3 distinct codes per item (length): allX30 28/30, His6 6/6, polyA50 38/50, Met1 1/1, GS 2/2, angiotensinI 10/10.",
+  "F-tok: S15 upper-cases '<mask>' to '<MASK>', which ESM3 does not treat as special, so every normalised case is length-preserving; the multi-character collapse only happens on raw (un-normalised) input.",
+  "F4: m = 32.58 and 594.92 lie just outside the table (centres 32.5844 / 594.9176). High-m rows carry both the research clamp and an UNCAPPED ln-m extrapolation; D15 decides.",
+  "F2b rows are not stored: load tests/resources/embeddings/{1acb.A,2uzi.A}.pt with map_location='cpu'."
+ ],
+ "plan_tolerances": {
+  "F1": "paths 50/50 identical; S_f/S_r rel <= 1e-5; Q90 abs <= 1e-3; lnE abs <= 1e-3 at N=1e9; 3 pairs survive E <= 1e-3",
+  "F2": "code bits >= 0.99999; q within 1 fp16 ulp",
+  "F2b/F2c": "codes identical to the reference encoder",
+  "F3": "Q90 abs <= 1e-3",
+  "F4": "rel <= 1e-12",
+  "F-deg": "synthetic: abs <= 1e-5 vs reference with S7; no NaN; NaN q raises"
+ },
+ "summary": {
+  "F1": {
+   "path_eq_f64": 50,
+   "cand_path_equal": 50,
+   "max_rel_Sf_kernel_vs_f64": 2.433880152048529e-06,
+   "max_rel_Sr_kernel_vs_f64": 5.932650543868647e-07,
+   "n_lnE_le_ln_1e_3": 3,
+   "max_abs_q90_research_vs_f64": 2.7822562529422612e-05
+  },
+  "F2": {
+   "bits": 20416,
+   "bits_equal_ref_vs_nersc": 20416,
+   "q_ref_vs_nersc": {
+    "n": 20416,
+    "bit_equal": 20353,
+    "max_elem_ulp": 9,
+    "n_elem_ulp_gt1": 6,
+    "max_abs": 0.0078125,
+    "max_abs_over_row_ulp": 0.5,
+    "n_abs_gt_elem_ulp": 6
+   }
+  },
+  "F3": {
+   "q90_bit_equal_stored_local": 20,
+   "max_abs_q90_vs_nersc_score2": 9.441375738106217e-06,
+   "max_abs_q90_research_vs_f64": 2.340890854668487e-05
+  }
+ }
+}

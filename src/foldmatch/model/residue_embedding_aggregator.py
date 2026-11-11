@@ -46,8 +46,20 @@ class ResidueEmbeddingAggregator(nn.Module):
             self.embedding = nn.Sequential(res_block)
 
     def forward(self, x, x_mask=None):
-        if x.dim() == 2:
-            return self.embedding(self.transformer(x, src_key_padding_mask=x_mask).sum(dim=0))
-        if x.dim() == 3:
-            return self.embedding(self.transformer(x, src_key_padding_mask=x_mask).sum(dim=1))
-        raise RuntimeError("Tensor dimension error. Allowed shapes (batch, sequence, residue_embeddings) or (sequence, residue_embeddings)")
+        if x.dim() not in (2, 3):
+            raise RuntimeError("Tensor dimension error. Allowed shapes (batch, sequence, residue_embeddings) or (sequence, residue_embeddings)")
+        # PyTorch's nested-tensor fast path exists only on CPU and CUDA; elsewhere (Apple GPU)
+        # its mask check calls aten::_nested_tensor_from_mask_left_aligned, which is not
+        # implemented there, before the device is even checked. Skip it for the call.
+        use_nested_tensor = self.transformer.use_nested_tensor
+        if x.device.type not in ("cpu", "cuda"):
+            self.transformer.use_nested_tensor = False
+        try:
+            x = self.transformer(x, src_key_padding_mask=x_mask)
+        finally:
+            self.transformer.use_nested_tensor = use_nested_tensor
+        # The fast path returns padded rows as zeros; any other path leaves values there.
+        # Zero them so every path sums the same rows (a no-op after the fast path).
+        if x_mask is not None:
+            x = x.masked_fill(x_mask.unsqueeze(-1), 0.0)
+        return self.embedding(x.sum(dim=x.dim() - 2))

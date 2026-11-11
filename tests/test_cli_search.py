@@ -5,6 +5,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, DEFAULT_OUTPUT_FIELDS
 from foldmatch.types.api_types import StructureFormat, Accelerator, Granularity, FormatMode
 
@@ -342,10 +344,10 @@ class TestCliSearch(unittest.TestCase):
 
 
     def test_17_build_database_from_embeddings(self):
-        """Test building a database from pre-computed embedding .pt files."""
+        """Test building a database from pre-computed chain embedding .pt files."""
         from foldmatch.cli.search import build_database_from_embeddings
 
-        embedding_dir = Path(f"{self.__test_path}/resources/embeddings")
+        embedding_dir = Path(f"{self.__test_path}/resources/chain_embeddings")
         output_db = os.path.join(self.__temp_dir, "test_from_embeddings")
 
         build_database_from_embeddings(
@@ -391,10 +393,10 @@ class TestCliSearch(unittest.TestCase):
         self.assertEqual(len(db.chain_ids), 2)
 
     def test_21_query_database_from_embedding(self):
-        """Test querying the database with a pre-computed embedding file."""
+        """Test querying the database with pre-computed chain embedding files: each query finds itself first."""
         from foldmatch.cli.search import build_database_from_embeddings, query_database_from_embedding
 
-        embedding_dir = Path(f"{self.__test_path}/resources/embeddings")
+        embedding_dir = Path(f"{self.__test_path}/resources/chain_embeddings")
         subject_db = os.path.join(self.__temp_dir, "test_query_from_emb_db")
         build_database_from_embeddings(
             embedding_folder=embedding_dir,
@@ -403,8 +405,8 @@ class TestCliSearch(unittest.TestCase):
             use_gpu_index=False
         )
 
-        # Use one of the pre-computed .pt chain embedding files as the query
-        embedding_folder = Path(f"{self.__test_path}/resources/embeddings")
+        # The same pre-computed .pt chain embedding files as the queries
+        embedding_folder = Path(f"{self.__test_path}/resources/chain_embeddings")
         output_file = os.path.join(self.__temp_dir, "query_from_embedding_results.csv")
 
         query_database_from_embedding(
@@ -420,16 +422,22 @@ class TestCliSearch(unittest.TestCase):
         self.assertTrue(os.path.exists(output_file))
         with open(output_file, 'r') as f:
             lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-        # No header: every row is a result, query id in the first column.
-        self.assertGreater(len(lines), 0)
-        query_ids = {ln.split("\t")[0] for ln in lines}
-        self.assertIn("1acb.A", query_ids)
+        # No header: every row is a result (query, hit, score), each query's best hit first.
+        top_hits = {}
+        for ln in lines:
+            query_id, hit_id, score = ln.split("\t")
+            top_hits.setdefault(query_id, (hit_id, float(score)))
+        self.assertEqual(sorted(top_hits), ["1acb.A", "1acb.B", "2uzi.A", "2uzi.B", "2uzi.C"])
+        for query_id, (hit_id, score) in top_hits.items():
+            with self.subTest(query=query_id):
+                self.assertEqual(hit_id, query_id)
+                self.assertGreater(score, 0.9999)
 
     def test_22_query_database_from_fasta(self):
         """Test querying the database with sequences from a FASTA file."""
         from foldmatch.cli.search import build_database_from_embeddings, query_database_from_fasta
 
-        embedding_dir = Path(f"{self.__test_path}/resources/embeddings")
+        embedding_dir = Path(f"{self.__test_path}/resources/chain_embeddings")
         subject_db = os.path.join(self.__temp_dir, "test_query_from_fasta_db")
         build_database_from_embeddings(
             embedding_folder=embedding_dir,
@@ -547,6 +555,7 @@ class TestCliSearch(unittest.TestCase):
         nodes = root.findall('.//g:node', ns)
         self.assertGreater(len(nodes), 0)
 
+    @pytest.mark.usefixtures("fmsw_libs")    # Stage 2 runs on the native kernel
     def test_25_stage2_format_output_tsv(self):
         """Stage-2 sequence-identity search emits mmseqs-style TSV columns.
 
@@ -629,7 +638,10 @@ class TestCliSearch(unittest.TestCase):
             self.assertEqual(cigar_len, int(alnlen))
 
     def test_26_stage2_rejects_unknown_format_field(self):
-        """An unknown --format-output field fails with a clear error."""
+        """An unknown --format-output field fails with a clear error (a usage error, exit status 2), before the
+        query's ESM3 pass (P7.0c)."""
+        from unittest import mock
+        import typer
         from foldmatch.cli.search import (
             build_database_from_fasta,
             query_database_from_fasta,
@@ -644,7 +656,9 @@ class TestCliSearch(unittest.TestCase):
             accelerator=Accelerator.cpu,
             use_gpu_index=False,
         )
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(typer.BadParameter) as ctx, \
+                mock.patch("foldmatch.search.embedding_computer.chain_predict",
+                           side_effect=AssertionError("the query's ESM3 pass was reached")):
             query_database_from_fasta(
                 db_path=subject_db,
                 fasta_file=fasta_file,
@@ -658,6 +672,7 @@ class TestCliSearch(unittest.TestCase):
             )
         self.assertIn("not_a_field", str(ctx.exception))
 
+    @pytest.mark.usefixtures("fmsw_libs")    # Stage 2 runs on the native kernel
     def test_27_fasta_min_res_n_filters_index_store_and_queries(self):
         """--min-res-n drops short sequences from the index, the sequence store
         and the embedded queries alike.

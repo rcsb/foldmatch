@@ -1,11 +1,11 @@
 import sys
 from pathlib import Path
 
-import pandas as pd
 from tqdm import tqdm
 
 from foldmatch.dataset.residue_assembly_embedding_from_tensor_file import ResidueAssemblyEmbeddingFromTensorFile
-from foldmatch.dataset.utils import get_structure_location
+from foldmatch.dataset.utils import STRUCTURE_LIST_DEFAULT_NAME, get_structure_location, list_source, \
+    read_structure_list, refuse_repeated_names, refuse_shared_names
 from foldmatch.types.api_types import SrcLocation, StructureLocation, StructureFormat, ResEmbeddingFormat, \
     FileOrStreamTuple
 from foldmatch.utils.data import stringio_from_url
@@ -30,7 +30,7 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
             min_res_n: int = 0,
             max_res_n: int = sys.maxsize,
             res_embedding_format: ResEmbeddingFormat = ResEmbeddingFormat.pt,
-            structure_provider: StructureProvider = StructureProvider()
+            structure_provider: StructureProvider = None
     ):
         self.src_location = src_location
         self.structure_format = structure_format
@@ -49,18 +49,14 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
 
     def __get_assemblies(self, src_stream):
         assemblies = []
-        data = pd.DataFrame(
-            src_stream,
-            dtype=str,
-            columns=ResidueAssemblyDatasetFromStructure.COLUMNS
-        ) if self.src_location == SrcLocation.stream else pd.read_csv(
-            src_stream,
-            header=None,
-            index_col=None,
-            dtype=str,
-            names=ResidueAssemblyDatasetFromStructure.COLUMNS
-        )
+        # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
+        # embedding name is the structure name, and an embedding name given to more than one row is refused
+        data = read_structure_list(src_stream, self.src_location)
         data = data.sort_values(by=data.columns[0])
+        refuse_shared_names(data, ResidueAssemblyDatasetFromStructure.STREAM_NAME_ATTR,
+                            ResidueAssemblyDatasetFromStructure.STREAM_ATTR)
+        refuse_repeated_names(data, list_source(src_stream, self.src_location, "structure list"),
+                              STRUCTURE_LIST_DEFAULT_NAME)
         progress = tqdm(data.iterrows(), total=len(data), desc="Loading structures")
         for idx, row in progress:
             src_name = row[ResidueAssemblyDatasetFromStructure.STREAM_NAME_ATTR]

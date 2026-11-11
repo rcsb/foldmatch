@@ -83,6 +83,12 @@ class IndexType(str, Enum):
     ivf_pq = "ivf_pq"    # OPQ + IVF-PQ with OnDiskInvertedLists — approximate, on-disk
 
 
+class ClusterMethod(str, Enum):
+    """Clustering method of ``fm-search cluster``."""
+    leiden = "leiden"    # Leiden on the similarity graph: memory grows with the edges (the default)
+    greedy = "greedy"    # greedy representatives in one streamed pass: memory grows with the chains
+
+
 class FormatMode(str, Enum):
     """How a result file is laid out.
 
@@ -93,6 +99,16 @@ class FormatMode(str, Enum):
     """
     headless_tsv = "headless_tsv"  # tab-separated, no header row (default)
     tsv = "tsv"                    # tab-separated with a header row
+
+
+class ScoringChoice(str, Enum):
+    """Stage-2 scoring of ``fm-search query sequences``: one scoring per query run, never both (D7, user
+    2026-10-13). ``blosum62`` is the default for now; which one becomes the default is decided before the release."""
+    blosum62 = "blosum62"    # BLOSUM62 Smith-Waterman (native kernel), BLAST-style statistics (the existing path)
+    esm_codes = "esm-codes"  # ESM3 residue codes, the system named in the database manifest (S1-S16)
+
+
+DEFAULT_SCORING = ScoringChoice.blosum62
 
 
 class SignificanceMode(str, Enum):
