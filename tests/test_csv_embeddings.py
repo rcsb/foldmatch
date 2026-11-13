@@ -211,13 +211,22 @@ class CsvEmbeddingsTest(unittest.TestCase):
                 self.assertLess(len(message), len(str(folder)) + 400)
 
     def test_a_csv_that_cannot_be_read_is_named(self):
-        """A folder named NAME.csv in an embedding folder, which the glob of .csv files matches, is refused with its
-        name, as a .pt that cannot be read is, not with a traceback."""
+        """A .csv that cannot be read is refused with its name, as a .pt that cannot be read is, not with a traceback:
+        here a folder named NAME.csv given to the reader itself. In an embedding folder, such a folder, which the glob
+        of .csv files matches, is skipped with a WARNING (P9.X1, tests/test_embedding_folders.py), and the folder's
+        files are read."""
+        from foldmatch.utils import data
         folder = self.tmp / "folder"
         (folder / "x.A.csv").mkdir(parents=True)
-        message = self.refusal(folder)
+        with self.assertRaises(RefusalError) as refused:
+            data._file_vector(folder / "x.A.csv")
+        message = str(refused.exception)
         self.assertTrue(message.startswith(f"{folder / 'x.A.csv'} could not be read ("), message)
         self.assertIn("Is a directory", message)
+        CsvBatchWriter(str(folder))._write_embedding(_vectors()["1abc-1"], "1abc-1")
+        with self.assertLogs("foldmatch.utils.data", "WARNING") as logs:
+            self.assertEqual(list(_read(folder)), ["1abc-1"])
+        self.assertIn(f"{folder}: 1 folder(s) named like embedding files skipped, not read: x.A.csv.", logs.output[0])
 
     def test_pandas_header_and_index_layouts_are_refused(self):
         """Files written with pandas' default header line (0,1,...,D-1) or index column are tables, refused with what

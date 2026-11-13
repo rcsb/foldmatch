@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Changed
+
+- **`fm-search build embeddings` and `fm-search query embedding` skip
+  folders in `--embedding-folder`.** They read the files of the folder named
+  `*.parquet`, `*.pt` or `*.csv`, and listed a folder so named too (the
+  dataset folder `x.parquet` that Spark writes, say), which they then refused
+  (`... is a folder, not a Parquet file`), so the whole embedding folder was
+  refused. Such a folder, or a symbolic link to one, is now skipped, not read,
+  with one WARNING that names the skipped folders (the first five, and how
+  many more); a symbolic link to a file is read as before. To read the files
+  of such a folder, give that folder itself. A folder that then holds no
+  embedding file is refused as before (`No embedding files found ...`), its
+  message naming the skipped folders. `--help` of both says that subfolders
+  are not read.
+
 ## [0.11.0] - 2026-11-12
 
 ### Added

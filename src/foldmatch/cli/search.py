@@ -382,7 +382,8 @@ def build_database_from_embeddings(
             dir_okay=True,
             resolve_path=True,
             help='Folder of pre-computed chain or assembly embeddings: .pt or .csv files of one vector each, or '
-                 '.parquet files (columns id and embedding). Residue embeddings are refused.'
+                 '.parquet files (columns id and embedding). Residue embeddings are refused. Subfolders are not '
+                 'read (one named like an embedding file is skipped with a warning).'
         )],
         output_db: Annotated[str, typer.Option(
             help='Path to save the FAISS database.'
@@ -1009,7 +1010,8 @@ def query_database_from_embedding(
             dir_okay=True,
             resolve_path=True,
             help='Directory of pre-computed chain or assembly embeddings: .pt or .csv files of one vector each, or '
-                 '.parquet files (columns id and embedding). Residue embeddings are refused.'
+                 '.parquet files (columns id and embedding). Residue embeddings are refused. Subfolders are not '
+                 'read (one named like an embedding file is skipped with a warning).'
         )],
         output_file: Annotated[str, typer.Option(
             help=_OUTPUT_FILE_HELP
@@ -1044,6 +1046,7 @@ def query_database_from_embedding(
     set_log_level(log_level)
     # The embedding files it reads are inputs (P9.N D6), and one query per id: the results are kept by query id (D7)
     from foldmatch.utils.data import embedding_files, refuse_repeated_query_ids
+    # (this listing reports the folders that the embedding listings skip, once: stream_embeddings below does not)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)],
                                files=[("the query embedding file", f)
                                       for kind in embedding_files(embedding_folder, file_extension) for f in kind])
@@ -1062,6 +1065,7 @@ def query_database_from_embedding(
             path=embedding_folder,
             file_extension=file_extension,
             expected_dim=embedding_db.db.dimension,
+            warn_folders=False,
         ),
         top_k=top_k
     )

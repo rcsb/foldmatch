@@ -488,6 +488,8 @@ def stream_embeddings(
         file_extension: Optional[str] = None,
         batch_size: int = 32768,
         expected_dim: Optional[int] = None,
+        *,
+        warn_folders: bool = True,
 ) -> Iterator[tuple[list[str], np.ndarray]]:
     """Yield (ids, [B, D] float32) batches from a file or directory of .pt / .csv / .parquet.
 
@@ -503,9 +505,11 @@ def stream_embeddings(
     infinite values (:func:`_file_vector`), and a .pt and a .csv of one stem (one id twice).
     Every embedding has one dimension: ``expected_dim`` (a query's database's) when given,
     else the first one's (Parquet files are read first, then .pt, then .csv). A single file is
-    handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case.
+    handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case. A
+    folder's subfolders are not read, not even one named like an embedding file, which is
+    skipped with a WARNING unless ``warn_folders`` is False (:func:`embedding_files`).
     """
-    parquet_files, point_files = embedding_files(path, file_extension)
+    parquet_files, point_files = embedding_files(path, file_extension, warn_folders=warn_folders)
 
     by_id = {}
     for f in point_files:
@@ -538,9 +542,16 @@ def stream_embeddings(
         yield ids_buf, np.ascontiguousarray(np.stack(emb_buf))
 
 
-def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[List[Path], List[Path]]:
+def embedding_files(path: Path, file_extension: Optional[str] = None, *,
+                    warn_folders: bool = True) -> Tuple[List[Path], List[Path]]:
     """The (Parquet files, .pt and .csv files) that stream_embeddings reads from a file or a folder, each list sorted
-    by extension then name; a ValueError for a missing path, an unsupported extension or a folder without them."""
+    by extension then name; a ValueError for a missing path, an unsupported extension or a folder without them.
+
+    A folder is read one level deep: its files named ``*.parquet``, ``*.pt`` or ``*.csv`` (a symbolic link to a file
+    is a file). An entry so named that is a folder (``x.parquet``, the dataset folder that Spark writes, say, or a
+    symbolic link to a folder) is not an embedding file: it is skipped, with a WARNING that names the skipped folders
+    (:func:`skipped_folders_message`; not with ``warn_folders=False``, for a listing whose folder another one reports),
+    and a folder that holds no embedding file but such folders is refused as a folder without embedding files."""
     p = Path(path)
     if not p.exists():
         raise ValueError(f"Embeddings path does not exist: {path}")
@@ -560,12 +571,17 @@ def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[L
         files = [p]
     else:
         extensions = (file_extension,) if file_extension is not None else _SUPPORTED_EXTS
-        files = []
+        files, folders = [], []
         for ext in extensions:
-            files.extend(sorted(p.glob(f"*{ext}")))
+            for entry in sorted(p.glob(f"*{ext}")):
+                (folders if entry.is_dir() else files).append(entry)
+        if folders and warn_folders:
+            logging.getLogger(__name__).warning(skipped_folders_message(path, folders))
         if not files:
+            skipped = (f" ({len(folders)} folder(s) named like embedding files skipped: "
+                       f"{_shown_names(folders)})" if folders else "")
             raise ValueError(
-                f"No embedding files found with extensions {list(extensions)} in {path}"
+                f"No embedding files found with extensions {list(extensions)} in {path}{skipped}"
             )
 
     parquet_files = [f for f in files if f.suffix in _BATCH_EXTS]
@@ -573,12 +589,30 @@ def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[L
     return parquet_files, point_files
 
 
+#: The skipped folders that a message names, the rest counted.
+_SHOWN_FOLDERS = 5
+
+
+def _shown_names(paths: List[Path]) -> str:
+    shown = ", ".join(path.name for path in paths[:_SHOWN_FOLDERS])
+    return shown + (f" and {len(paths) - _SHOWN_FOLDERS} more" if len(paths) > _SHOWN_FOLDERS else "")
+
+
+def skipped_folders_message(path, folders: List[Path]) -> str:
+    """The WARNING of :func:`embedding_files` for the folders of ``path`` named like embedding files, which it skips."""
+    return (f"{path}: {len(folders)} folder(s) named like embedding files skipped, not read: {_shown_names(folders)}. "
+            f"The embedding files of a folder are read, not those of its subfolders; to read the files of such a "
+            f"folder (the parts of a Parquet dataset that Spark writes, say), give that folder itself.")
+
+
 def refuse_repeated_query_ids(path: Path, file_extension: Optional[str] = None):
     """Refuse (RefusalError) query embeddings in which two vectors share an id (P9.N D7), read before any search as
     stream_embeddings would read them: the ids of the Parquet files (their id column only) and the stems of the .pt and
     .csv files. A search's results are kept by query id, so a repeated id kept one vector's hits and dropped the
-    others' without notice. A Parquet file whose ids cannot be read is left to stream_embeddings, which refuses it."""
-    parquet_files, point_files = embedding_files(path, file_extension)
+    others' without notice. A Parquet file whose ids cannot be read is left to stream_embeddings, which refuses it.
+    The folders it skips (:func:`embedding_files`) are not reported here: stream_embeddings, or the caller's own
+    listing, reports them."""
+    parquet_files, point_files = embedding_files(path, file_extension, warn_folders=False)
     where = {}
     for f in parquet_files:
         try:
