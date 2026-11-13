@@ -947,7 +947,8 @@ class LinkedInputTest(_Case):
 
     def test_no_link_among_the_output_files(self):
         """Where no output's file that exists is a link, an input that is not a link is not looked up beyond its
-        lstat: one lstat per output file and per input, and a stat per folder."""
+        lstat: one lstat per output file and per input, and a stat per folder (and a stat per output file that exists,
+        to tell its kind once: refuse_other_kind)."""
         of = _output_files()
         out, inputs, n = self.folder(), self.folder("in"), 200
         for k in range(n):
@@ -958,7 +959,7 @@ class LinkedInputTest(_Case):
                 mock.patch.object(of.os, "lstat", wraps=os.lstat) as lstat:
             of.check_outputs(out, OutFormat.pt, None, names=[f"s{k}" for k in range(n)], folding=folding,
                              inputs=[("the structure file", inputs / f"s{k}.cif") for k in range(n)])
-        self.assertLessEqual(stat.call_count + lstat.call_count, 2 * n + 4)
+        self.assertLessEqual(stat.call_count + lstat.call_count, 3 * n + 4)
 
     def test_chain_embedding_into_links_to_its_residues(self):
         """chain-embedding into a folder whose 1acb.A.pt is a symbolic link to the residue embedding it reads
