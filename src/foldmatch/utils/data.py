@@ -279,10 +279,11 @@ def _file_vector(f: Path) -> np.ndarray:
     The file holds one vector: a dense tensor, or a CSV of numbers, with at most one axis longer than 1 ([D], [1, D],
     [D, 1]; a .csv of one column, as CsvBatchWriter writes a chain or assembly embedding, or of one line). Anything
     else is refused with a :class:`RefusalError` that names the file: a file that cannot be read, no values, NaN or
-    infinite values (such an embedding is never found, and as a query it finds nothing) and a table, such as residue
-    embeddings ([L, D], one row per residue), whose mean is not a chain embedding. Non-finite values are reported
-    before the shape in a CSV, where a line cut short reads as NaN (as does the empty field above the index column of
-    pandas' to_csv layout), and after it in a .pt.
+    infinite values (such an embedding is never found, and as a query it finds nothing), a table, such as residue
+    embeddings ([L, D], one row per residue), whose mean is not a chain embedding, and fm-embedding's residue codes in
+    a .pt (``--output-codes-folder``: a ``uint8 [L, 8]`` tensor, refused by its type whatever L). Non-finite values are
+    reported before the shape in a CSV, where a line cut short reads as NaN (as does the empty field above the index
+    column of pandas' to_csv layout), and after it in a .pt.
     """
     ext = f.suffix[1:]
     if ext == 'pt':
@@ -300,6 +301,14 @@ def _file_vector(f: Path) -> np.ndarray:
             raise RefusalError(
                 f"{f} holds a {type(emb).__name__}, not a tensor. A .pt embedding holds one vector: a tensor of D "
                 f"values saved with torch.save."
+            )
+        if emb.dtype == torch.uint8 and emb.dim() == 2 and emb.shape[1] == 8:
+            # fm-embedding's <codes folder>/<id>.pt (--output-codes-folder), which a one-residue sequence would make a
+            # vector
+            raise RefusalError(
+                f"{f} holds residue codes (a uint8 tensor of {emb.shape[0]} x 8), as 'fm-embedding from-sequences ... "
+                f"--output-codes-folder' writes them, not an embedding vector: residue codes belong in a folder of "
+                f"their own (--output-codes-folder); move them out of the embedding folder."
             )
         try:
             values = emb.detach().float().numpy()
@@ -353,6 +362,11 @@ def _table_message(f: Path, values: np.ndarray, axes: List[int]) -> str:
         f"NAME.CHAIN.{ext} with 'inference chain-embedding --src-file LIST --res-embedding-location DIR "
         f"--res-embedding-format {ext} --output-folder OUT', LIST holding one line NAME,,CHAIN per file."
     )
+    if (values.ndim == 2 and values.shape[1] == 8 and np.all(values == np.round(values))
+            and values.min() >= 0 and values.max() <= 255):
+        text += (f" A table of 8 columns of integers 0-255 may be residue codes, as 'fm-embedding from-sequences ... "
+                 f"--output-codes-folder' writes them (<id>.{ext}): they are not embeddings either; residue codes "
+                 f"belong in a folder of their own (--output-codes-folder): move them out of the embedding folder.")
     if ext == 'csv':  # pandas' layouts: a header line 0,1,...,C-1 (unless header=False), an index column
         rows, columns = values.shape
         if np.array_equal(values[0], np.arange(columns)):
@@ -404,11 +418,24 @@ def _parquet_file(f: Path) -> pq.ParquetFile:
             f"leaves an unreadable file."
         ) from exc
     missing = [f"'{name}'" for name in ('id', 'embedding') if name not in pf.schema_arrow.names]
+    if missing and _is_code_table(pf.schema_arrow):
+        raise RefusalError(
+            f"{f} holds residue codes, as 'fm-embedding from-sequences ... --output-codes-folder' writes them (one "
+            f"table of 8-byte codes per sequence), not embeddings: residue codes belong in a folder of their own "
+            f"(--output-codes-folder); move them out of the embedding folder."
+        )
     if missing:
         raise RefusalError(
             f"{f} has no {' or '.join(missing)} column: a Parquet embedding file holds the columns id and embedding."
         )
     return pf
+
+
+def _is_code_table(schema: pa.Schema) -> bool:
+    """Whether a Parquet schema is that of fm-embedding's residue-code files (--output-codes-folder), which are not
+    embeddings."""
+    from foldmatch.search.residue_shards import META_RESIDUE_OUTPUT, RESIDUE_CODE_TABLE
+    return (schema.metadata or {}).get(META_RESIDUE_OUTPUT) == RESIDUE_CODE_TABLE.encode("ascii")
 
 
 def _read_batches(f: Path, batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -488,6 +515,8 @@ def stream_embeddings(
         file_extension: Optional[str] = None,
         batch_size: int = 32768,
         expected_dim: Optional[int] = None,
+        *,
+        warn_folders: bool = True,
 ) -> Iterator[tuple[list[str], np.ndarray]]:
     """Yield (ids, [B, D] float32) batches from a file or directory of .pt / .csv / .parquet.
 
@@ -503,9 +532,11 @@ def stream_embeddings(
     infinite values (:func:`_file_vector`), and a .pt and a .csv of one stem (one id twice).
     Every embedding has one dimension: ``expected_dim`` (a query's database's) when given,
     else the first one's (Parquet files are read first, then .pt, then .csv). A single file is
-    handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case.
+    handled as a degenerate directory-of-one; ``file_extension`` is ignored in that case. A
+    folder's subfolders are not read, not even one named like an embedding file, which is
+    skipped with a WARNING unless ``warn_folders`` is False (:func:`embedding_files`).
     """
-    parquet_files, point_files = embedding_files(path, file_extension)
+    parquet_files, point_files = embedding_files(path, file_extension, warn_folders=warn_folders)
 
     by_id = {}
     for f in point_files:
@@ -538,9 +569,16 @@ def stream_embeddings(
         yield ids_buf, np.ascontiguousarray(np.stack(emb_buf))
 
 
-def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[List[Path], List[Path]]:
+def embedding_files(path: Path, file_extension: Optional[str] = None, *,
+                    warn_folders: bool = True) -> Tuple[List[Path], List[Path]]:
     """The (Parquet files, .pt and .csv files) that stream_embeddings reads from a file or a folder, each list sorted
-    by extension then name; a ValueError for a missing path, an unsupported extension or a folder without them."""
+    by extension then name; a ValueError for a missing path, an unsupported extension or a folder without them.
+
+    A folder is read one level deep: its files named ``*.parquet``, ``*.pt`` or ``*.csv`` (a symbolic link to a file
+    is a file). An entry so named that is a folder (``x.parquet``, the dataset folder that Spark writes, say, or a
+    symbolic link to a folder) is not an embedding file: it is skipped, with a WARNING that names the skipped folders
+    (:func:`skipped_folders_message`; not with ``warn_folders=False``, for a listing whose folder another one reports),
+    and a folder that holds no embedding file but such folders is refused as a folder without embedding files."""
     p = Path(path)
     if not p.exists():
         raise ValueError(f"Embeddings path does not exist: {path}")
@@ -560,12 +598,17 @@ def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[L
         files = [p]
     else:
         extensions = (file_extension,) if file_extension is not None else _SUPPORTED_EXTS
-        files = []
+        files, folders = [], []
         for ext in extensions:
-            files.extend(sorted(p.glob(f"*{ext}")))
+            for entry in sorted(p.glob(f"*{ext}")):
+                (folders if entry.is_dir() else files).append(entry)
+        if folders and warn_folders:
+            logging.getLogger(__name__).warning(skipped_folders_message(path, folders))
         if not files:
+            skipped = (f" ({len(folders)} folder(s) named like embedding files skipped: "
+                       f"{_shown_names(folders)})" if folders else "")
             raise ValueError(
-                f"No embedding files found with extensions {list(extensions)} in {path}"
+                f"No embedding files found with extensions {list(extensions)} in {path}{skipped}"
             )
 
     parquet_files = [f for f in files if f.suffix in _BATCH_EXTS]
@@ -573,15 +616,35 @@ def embedding_files(path: Path, file_extension: Optional[str] = None) -> Tuple[L
     return parquet_files, point_files
 
 
+#: The skipped folders that a message names, the rest counted.
+_SHOWN_FOLDERS = 5
+
+
+def _shown_names(paths: List[Path]) -> str:
+    shown = ", ".join(path.name for path in paths[:_SHOWN_FOLDERS])
+    return shown + (f" and {len(paths) - _SHOWN_FOLDERS} more" if len(paths) > _SHOWN_FOLDERS else "")
+
+
+def skipped_folders_message(path, folders: List[Path]) -> str:
+    """The WARNING of :func:`embedding_files` for the folders of ``path`` named like embedding files, which it skips."""
+    return (f"{path}: {len(folders)} folder(s) named like embedding files skipped, not read: {_shown_names(folders)}. "
+            f"The embedding files of a folder are read, not those of its subfolders; to read the files of such a "
+            f"folder (the parts of a Parquet dataset that Spark writes, say), give that folder itself.")
+
+
 def refuse_repeated_query_ids(path: Path, file_extension: Optional[str] = None):
     """Refuse (RefusalError) query embeddings in which two vectors share an id (P9.N D7), read before any search as
     stream_embeddings would read them: the ids of the Parquet files (their id column only) and the stems of the .pt and
     .csv files. A search's results are kept by query id, so a repeated id kept one vector's hits and dropped the
-    others' without notice. A Parquet file whose ids cannot be read is left to stream_embeddings, which refuses it."""
-    parquet_files, point_files = embedding_files(path, file_extension)
+    others' without notice. A Parquet file whose ids cannot be read, or without embeddings (fm-embedding's residue
+    codes), is left to stream_embeddings, which refuses it. The folders it skips (:func:`embedding_files`) are not
+    reported here: stream_embeddings, or the caller's own listing, reports them."""
+    parquet_files, point_files = embedding_files(path, file_extension, warn_folders=False)
     where = {}
     for f in parquet_files:
         try:
+            if 'embedding' not in pq.read_schema(f).names:
+                continue    # not embeddings (fm-embedding's residue codes, say): stream_embeddings refuses it
             ids = pq.read_table(f, columns=["id"]).column("id").to_pylist()
         except Exception:
             continue

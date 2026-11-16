@@ -12,6 +12,10 @@ Unicode-normalised (canonical caseless matching) on a folder that takes 'A' and 
 which :func:`probe_folding` finds out per folder. Folders are compared as files (device and inode), never as strings:
 a symbolic link and, on macOS, ``SHARED`` and ``shared`` are one folder; and an input and an output's file that
 exists are one file when either is a link to the other from another folder.
+
+Nor does a run replace a file of the other kind (:func:`refuse_other_kind`): residue codes in a folder of embeddings,
+or embeddings in the folder of fm-embedding's residue codes (``--output-codes-folder``), told by their first bytes
+(:mod:`foldmatch.utils.file_kinds`).
 """
 import glob
 import os
@@ -22,6 +26,7 @@ import unicodedata
 from typing import Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from foldmatch.errors import RefusalError
+from foldmatch.utils.file_kinds import EMBEDDINGS, RESIDUE_CODES, describe, file_kind
 
 #: The longest file name, in bytes of UTF-8, that the usual file systems take (ext4, XFS, APFS, Lustre, GPFS).
 MAX_FILE_NAME_BYTES = 255
@@ -89,10 +94,11 @@ def _usable_rule(suffix: str) -> str:
 
 
 def refuse_unusable_names(names: Sequence, suffix: str, *, source: str, labels: Optional[Sequence] = None,
-                          what: str = "embedding name", given: str = "those rows", pattern: Optional[str] = None):
+                          what: str = "embedding name", given: str = "those rows", pattern: Optional[str] = None,
+                          folder: str = "output folder"):
     """Refuse (RefusalError) names that cannot name the file ``<name><suffix>`` in the output folder (name_problem),
     naming the first ones (with their label, "row 3", say, when given); ``pattern`` is the file as the message names
-    it, ``<name><suffix>`` by default."""
+    it, ``<name><suffix>`` by default, and ``folder`` the folder ("codes folder", say)."""
     bad = []
     for k, name in enumerate(names):
         problem = name_problem(name, suffix)
@@ -103,13 +109,13 @@ def refuse_unusable_names(names: Sequence, suffix: str, *, source: str, labels: 
             name, problem, label = item
             return f"{name!r}{'' if label is None else f' ({label})'} {problem}"
         raise RefusalError(
-            f"{source}: {len(bad)} {what}(s) that cannot name a file {pattern or '<name>' + suffix} in the output "
-            f"folder: {shown(bad, describe)}. Each {what} names its own file there: give {given} "
+            f"{source}: {len(bad)} {what}(s) that cannot name a file {pattern or '<name>' + suffix} in the {folder}: "
+            f"{shown(bad, describe)}. Each {what} names its own file there: give {given} "
             f"{'an' if what[0] in 'aeiou' else 'a'} {what} {_usable_rule(suffix)}."
         )
 
 
-def refuse_unusable_stem(stem, what: str = "The output name"):
+def refuse_unusable_stem(stem, what: str = "The output name", folder: str = "output folder"):
     """Refuse (RefusalError) a name that cannot name the files ``<stem>-<rank>.parquet`` and ``<stem>-<rank>.json.gz``
     of the output folder (a 6-digit rank reserved), whatever the format: name_problem's rules."""
     suffix = "-" + "0" * RANK_DIGITS + max(STEM_SUFFIXES.values(), key=len)
@@ -122,7 +128,7 @@ def refuse_unusable_stem(stem, what: str = "The output name"):
     if problem is not None:
         raise RefusalError(
             f"{what} {stem!r} {problem}: it names the files <name>-<rank>.parquet or <name>-<rank>.json.gz of the "
-            f"output folder. Give a name {_usable_rule(suffix)}."
+            f"{folder}. Give a name {_usable_rule(suffix)}."
         )
 
 
@@ -431,7 +437,8 @@ def _folded_by(names: Sequence[str], folding: Folding) -> List[str]:
 
 
 def repeated_files_message(source: str, repeats: List[tuple], folding: Folding, what: str = "embedding name",
-                           given: str = "those rows", folded_advice: Optional[str] = None) -> str:
+                           given: str = "those rows", folded_advice: Optional[str] = None,
+                           folder: str = "output folder") -> str:
     """The refusal of names that give one file twice (OutputFiles.add_files' and add_prefixes' repeats). Names that
     differ, and that the folder only takes for one, are told so, with what can keep them apart: ``folded_advice``,
     whose ``{apart}`` is what the folder does not tell apart, or by default another folder, Parquet or JSON, or other
@@ -447,8 +454,8 @@ def repeated_files_message(source: str, repeats: List[tuple], folding: Folding, 
             folded += [part for part in _folded_by(names, folding) if part not in folded]
     folded.sort(key=lambda part: part.startswith("Unicode"))
     apart = " or ".join(folded)
-    note = f" (the output folder does not tell {apart} apart)" if folded else ""
-    found = (f"{source}: {len(repeats)} file(s) of the output folder would each be written for more than one "
+    note = f" (the {folder} does not tell {apart} apart)" if folded else ""
+    found = (f"{source}: {len(repeats)} file(s) of the {folder} would each be written for more than one "
              f"{what}{note}: {shown(repeats, describe)}. Each one would replace the one before")
     if not folded:
         return f"{found}: give each its own {what}."
@@ -469,7 +476,8 @@ def _linked_id(path) -> Optional[Tuple[int, int]]:
     return (link.st_dev, link.st_ino) if link.st_nlink > 1 else None
 
 
-def refuse_outputs_over_inputs(outputs: OutputFiles, inputs: Iterable[Tuple[str, object]], *, what: str = "run"):
+def refuse_outputs_over_inputs(outputs: OutputFiles, inputs: Iterable[Tuple[str, object]], *, what: str = "run",
+                               folder: str = "output folder"):
     """Refuse (RefusalError) an input of the run (described, path) that is in the output folder under the name of one
     of its outputs, or, from another folder, one file with a file of the output folder that one of its outputs would
     write, through a symbolic or hard link either way (compared as files, with the files that exist: an input
@@ -495,7 +503,7 @@ def refuse_outputs_over_inputs(outputs: OutputFiles, inputs: Iterable[Tuple[str,
                 found.append((described, f"{os.fspath(path)} (which is {file[0]})", file[1]))
     if found:
         raise RefusalError(
-            f"{len(found)} input(s) of this {what} would be replaced by its output, in the output folder "
+            f"{len(found)} input(s) of this {what} would be replaced by its output, in the {folder} "
             f"{outputs.folder}: {shown(found, lambda f: f'{f[0]} {f[1]} by {f[2]}')}. An output never replaces an "
             f"input of its run: write the output to another folder or under other names, or move the input."
         )
@@ -506,37 +514,157 @@ def check_outputs(out_folder, out_format, out_name, *, names: Optional[Sequence]
                   separator: str = ".", inputs: Iterable[Tuple[str, object]] = (),
                   folding: Optional[Folding] = None, stem_what: str = "The output name",
                   what: str = "embedding name", given: str = "those rows",
-                  folded_advice: Optional[str] = None) -> Optional[OutputFiles]:
+                  folded_advice: Optional[str] = None, folder: str = "output folder",
+                  writes: str = EMBEDDINGS, replaced_names: Optional[Sequence] = None) -> Optional[OutputFiles]:
     """The checks of one output of a run, before any model is built (RefusalError): the output name ``out_name`` names
     files of the folder, whatever the format (D1); for csv and pt, each of ``names`` names one file ``<name>.<format>``
     (D1) of its own, as the folder compares names (D3), and each of ``prefixes`` names the files
     ``<prefix><separator><ID>.<format>`` of items known only once their structure is read, prefixes that the folder
-    takes for one refused too; and no input (described, path) is one of the output files (D2). ``stem_what`` names the
-    output name in a refusal, ``what`` a name and ``given`` what holds them, ``folded_advice`` what keeps names apart
-    that the folder takes for one (repeated_files_message); ``folding`` is the folder's, when known. The output's
-    files, or None without ``out_folder``."""
+    takes for one refused too; no input (described, path) is one of the output files (D2); and no file that the
+    output would replace holds the other kind of data than it ``writes`` (:data:`EMBEDDINGS`, or the
+    :data:`RESIDUE_CODES` of fm-embedding's codes folder; :func:`refuse_other_kind`). ``replaced_names``, with csv and
+    pt, are names whose files ``<name>.<format>`` the output writes, whose checks are the caller's (fm-embedding's, for
+    the ids of a FASTA file): they only tell the files that the output would replace. ``stem_what`` names the output
+    name in a refusal, ``what`` a name and ``given`` what holds them, ``folded_advice`` what keeps names apart that
+    the folder takes for one (repeated_files_message); ``folding`` is the folder's, when known, and ``folder`` what the
+    refusals call it ("codes folder", say). The output's files, or None without ``out_folder``."""
     if out_folder is None:
         return None
     fmt = format_value(out_format)
     outputs = OutputFiles(out_folder, folding)
     if out_name is not None:
-        refuse_unusable_stem(out_name, stem_what)
+        refuse_unusable_stem(out_name, stem_what, folder)
         if fmt in STEM_SUFFIXES:
             outputs.add_stem(out_name, STEM_SUFFIXES[fmt])
     if fmt in ITEM_FORMATS:
         suffix = f".{fmt}"
         repeats = []
         if names is not None:
-            refuse_unusable_names(names, suffix, source=source, labels=labels, what=what, given=given)
+            refuse_unusable_names(names, suffix, source=source, labels=labels, what=what, given=given,
+                                  folder=folder)
             repeats = outputs.add_files(names, suffix, labels)
         if prefixes is not None and not repeats:
             refuse_unusable_names(prefixes, separator + suffix, source=source, labels=labels,
-                                  pattern=f"<name>{separator}<ID>{suffix}")
+                                  pattern=f"<name>{separator}<ID>{suffix}", folder=folder)
             repeats = outputs.add_prefixes(prefixes, separator, suffix, labels)
         if repeats:
-            raise RefusalError(repeated_files_message(source, repeats, outputs.folding, what, given, folded_advice))
-    refuse_outputs_over_inputs(outputs, inputs)
+            raise RefusalError(repeated_files_message(source, repeats, outputs.folding, what, given, folded_advice,
+                                                      folder))
+        if replaced_names is not None:
+            outputs.add_files(replaced_names, suffix)
+    refuse_outputs_over_inputs(outputs, inputs, folder=folder)
+    refuse_other_kind(outputs, writes, folder)
     return outputs
+
+
+def refuse_other_kind(outputs: OutputFiles, writes: str = EMBEDDINGS, folder: str = "output folder"):
+    """Refuse (RefusalError) a run that would replace, in the folder of ``outputs``, a file of the other kind than it
+    ``writes``: residue codes where it writes embeddings (any fm-embedding command, any format), embeddings where it
+    writes fm-embedding's residue codes (``--output-codes-folder``). Only the files that the output would replace are
+    read (:meth:`OutputFiles.existing`), every one of them, each as little as tells its kind
+    (:func:`~foldmatch.utils.file_kinds.file_kind`). Positively only: a file of no kind (empty, cut short, being
+    written by another rank of the run, corrupt, foreign) is replaced as before; a file that the run itself writes is
+    of the kind it writes, so a rerun into the same folders replaces its own files. A folder that also holds other
+    files of the other kind is not refused: nothing of them is lost."""
+    other = RESIDUE_CODES if writes == EMBEDDINGS else EMBEDDINGS
+    found = sorted(path for path, _ in outputs.existing().values() if file_kind(path) == other)
+    if not found:
+        return
+    listed = shown(found, lambda path: f"{path} ({describe(path, other)})")
+    if writes == EMBEDDINGS:
+        raise RefusalError(
+            f"{len(found)} file(s) of the {folder} {outputs.folder} that this run would replace hold residue codes, as "
+            f"'fm-embedding from-sequences ... --output-codes-folder' writes them, not embeddings: {listed}. The "
+            f"embeddings and the residue codes go to folders of their own: give an output folder without those "
+            f"residue-code files, or move them out of it."
+        )
+    raise RefusalError(
+        f"{len(found)} file(s) of the {folder} {outputs.folder} that this run would replace hold embeddings, not "
+        f"residue codes: {listed}. The residue codes go to a folder of their own: give a codes folder for the codes "
+        f"only, without those embedding files, or move them out of it."
+    )
+
+
+# =====================================================================================================================
+# Residue codes in their own folder (fm-embedding from-sequences residue|chain --output-codes-folder)
+# =====================================================================================================================
+def default_codes_name(out_name: str) -> str:
+    """The name of the residue-code files when none is given: ``<out_name>-codes`` (the files
+    ``<out_name>-codes-<rank>.parquet`` or ``.json.gz``; it names no file in csv and pt, as ``out_name`` does not)."""
+    return f"{out_name}-codes"
+
+
+def same_folder_problem(out_folder, codes_folder,
+                        options: Tuple[str, str] = ("out_folder", "out_codes_folder")) -> Optional[str]:
+    """Why ``codes_folder`` cannot hold the residue codes of a run whose embeddings go to ``out_folder``, or None: it
+    is ``out_folder`` itself, compared as files (device and inode: a symbolic link, '.' and its absolute path, or a
+    case variant on a case-insensitive volume, are one folder); ``options`` name the two folders in the message
+    (fm-embedding's ``--output-folder`` and ``--output-codes-folder``). One folder inside the other is allowed:
+    fm-search reads the files of a folder, not its subfolders (``utils.data.embedding_files`` skips them)."""
+    if out_folder is None or codes_folder is None or not same_folder(out_folder, codes_folder):
+        return None
+    first, second = options
+    return (f"{first} and {second} are one folder ({os.fspath(codes_folder)}): the residue codes go to a folder of "
+            f"their own, so that the embedding folder holds embeddings only ('fm-search build embeddings' and "
+            f"'fm-search query embedding' read every .parquet, .pt and .csv file of it). Give {second} another folder "
+            f"(a subfolder of {first} will do).")
+
+
+def refuse_same_folder(out_folder, codes_folder, options: Tuple[str, str] = ("out_folder", "out_codes_folder")):
+    """Refuse a codes folder that is the output folder (:func:`same_folder_problem`) with a ValueError, as the library
+    refuses its other argument values; fm-embedding checks it first, as a usage error (typer.BadParameter, exit
+    status 2)."""
+    problem = same_folder_problem(out_folder, codes_folder, options)
+    if problem is not None:
+        raise ValueError(problem)
+
+
+def check_code_outputs(out_codes_folder, out_format, out_codes_name: str, *, out_folder=None,
+                       names: Optional[Sequence] = None, labels: Optional[Sequence] = None, source: str = "The input",
+                       inputs: Iterable[Tuple[str, object]] = (), what: str = "embedding name",
+                       given: str = "those rows", outputs: Optional[OutputFiles] = None,
+                       options: Tuple[str, str] = ("out_folder", "out_codes_folder"),
+                       replaced_names: Optional[Sequence] = None) -> Optional[OutputFiles]:
+    """The checks of the residue-code files of an fm-embedding pass (``--output-codes-folder``), before any model is
+    built: ``out_codes_folder`` is not ``out_folder`` (:func:`refuse_same_folder`, ``options`` naming them; a
+    ValueError) and is an existing folder (a RefusalError; the CLI's typer checks it; a library caller would otherwise
+    learn it only when the first code file is written, after ESM3); then those of :func:`check_outputs` in the codes
+    folder, as for the embeddings in theirs: ``out_codes_name`` names files of the folder, whatever the format
+    (``<out_codes_name>-<rank>.parquet`` or ``.json.gz``); with csv and pt, each of ``names`` (the ids) names one file
+    ``<name>.<format>`` of its own, as the codes folder compares names (``replaced_names`` only tell the files it
+    would replace, as there); no input (described, path) is a code file; and no file that the codes would replace
+    holds embeddings (:func:`refuse_other_kind`) (RefusalError). Last, one folder inside the other is not at the path
+    of a file that the other's output writes
+    (:func:`refuse_folder_at_output`, RefusalError): the codes folder is no file of ``outputs`` (the embedding files,
+    :func:`check_outputs` of ``out_folder``), and ``out_folder`` no code file. The code files, or None without
+    ``out_codes_folder``."""
+    if out_codes_folder is None:
+        return None
+    refuse_same_folder(out_folder, out_codes_folder, options)
+    if not os.path.isdir(out_codes_folder):
+        raise RefusalError(f"{options[1]} {os.fspath(out_codes_folder)} is not a folder: give an existing folder.")
+    code_outputs = check_outputs(out_codes_folder, out_format, out_codes_name, names=names, labels=labels,
+                                 source=source, inputs=inputs, stem_what="The codes name", what=what, given=given,
+                                 folder="codes folder", writes=RESIDUE_CODES, replaced_names=replaced_names)
+    refuse_folder_at_output(out_codes_folder, outputs, "The codes folder", "the embedding files of the output folder")
+    refuse_folder_at_output(out_folder, code_outputs, "The output folder", "the code files of the codes folder")
+    return code_outputs
+
+
+def refuse_folder_at_output(folder, outputs: Optional[OutputFiles], what: str, files: str):
+    """Refuse (RefusalError) a folder (``what``) that is in the folder of ``outputs`` (compared as files) under the
+    name of one of their files (as that folder compares names), by its path as given or by its real path: the writer
+    of that file would meet a folder, after the model has run. ``files`` says whose files they are."""
+    if folder is None or outputs is None:
+        return
+    in_folder = InFolder(outputs.folder)
+    for path in dict.fromkeys((os.path.abspath(os.fspath(folder)), os.path.realpath(folder))):
+        output = outputs.holds(os.path.basename(path)) if in_folder(path) else None
+        if output is not None:
+            raise RefusalError(
+                f"{what} {os.fspath(folder)} is named as one of {files} {outputs.folder} ({output}), which could not "
+                f"be written over a folder: give a folder of another name, or one outside {outputs.folder}."
+            )
 
 
 def refuse_assemblies_over_residues(names: Sequence, structure_names: Iterable, *, out_folder, out_format,

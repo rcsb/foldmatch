@@ -13,11 +13,12 @@ the notion of an assembly is intrinsic to 3D structures.
 """
 import os
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import typer
 
-from typing import Annotated, Optional, List
+from typing import Annotated, Optional, List, Tuple
 
 from foldmatch import __version__
 from foldmatch.cli.args_utils import DOWNLOAD_MODELS_HELP, DOWNLOAD_MODELS_SYSTEM_HELP, arg_devices, \
@@ -34,6 +35,28 @@ from foldmatch.types.api_types import (
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+_OUTPUT_FOLDER_HELP = (
+    "Output folder to store predictions. A run that would replace a file of residue codes there (as 'fm-embedding "
+    "from-sequences ... --output-codes-folder' writes them) is refused."
+)
+_OUTPUT_CODES_FOLDER_HELP = (
+    "Also compute each sequence's residue codes in the same ESM3 pass and write them to this folder, which must exist "
+    "and must not be --output-folder (a subfolder of it will do): the 8-byte per-residue ESM3 codes that 'fm-search "
+    "build sequences --residue-codes' stores, 8 integers (0-255) per residue. They are written in --output-format, as "
+    "the embeddings are: <id>.csv or <id>.pt per sequence, or <output-codes-name>-<rank>.parquet or .json.gz. The "
+    "embedding files are those of a run without it, and --output-folder holds them only ('fm-search build embeddings' "
+    "and 'query embedding' read it as before). Row i of a sequence's codes is its residue i, which is row i + 1 of the "
+    "residue embeddings that 'from-sequences residue' writes (ESM3's BOS and EOS rows included). Refuses FASTA "
+    "records whose sequence holds '<', '>' or non-ASCII characters. A sequence whose codes cannot be computed gets an "
+    "empty table, and the run exits with status 1 once every file is written. A run that would replace an embedding "
+    "file there is refused. The esm-codes bundle (~26 MB) is "
+    "downloaded once; on several nodes, or under srun or torchrun, run 'fm-embedding download-models' first."
+)
+_OUTPUT_CODES_NAME_HELP = (
+    "File name for storing residue codes, with --output-codes-folder. Used when output-format is parquet or json: "
+    "<name>-<rank>.parquet or <name>-<rank>.json.gz (default <output-name>-codes)."
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -75,7 +98,7 @@ def from_structures_residue(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output folder to store predictions.'
+            help=_OUTPUT_FOLDER_HELP
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per chain, with one list of D values per residue.'
@@ -155,7 +178,7 @@ def from_structures_chain(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output folder to store predictions.'
+            help=_OUTPUT_FOLDER_HELP
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json.'
@@ -235,7 +258,7 @@ def from_structures_assembly(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output folder to store predictions.'
+            help=_OUTPUT_FOLDER_HELP
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json.'
@@ -322,7 +345,7 @@ def from_sequences_residue(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output folder to store predictions.'
+            help=_OUTPUT_FOLDER_HELP
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json. Parquet holds one row per sequence, with one list of D values per residue.'
@@ -330,6 +353,16 @@ def from_sequences_residue(
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
         )] = 'inference',
+        output_codes_folder: Annotated[Optional[Path], typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_OUTPUT_CODES_FOLDER_HELP
+        )] = None,
+        output_codes_name: Annotated[Optional[str], typer.Option(
+            help=_OUTPUT_CODES_NAME_HELP
+        )] = None,
         min_res_n: Annotated[int, typer.Option(
             help='Consider only sequences with at least <min_res_n> residues.'
         )] = 0,
@@ -355,24 +388,27 @@ def from_sequences_residue(
             help='Logging level.'
         )] = LogLevel.info
 ):
+    codes = _codes_options(output_codes_folder, output_codes_name, output_folder, output_name)
     from foldmatch.inference.sequence_inference import predict
     set_log_level(log_level)
 
-    predict(
-        # Its pre-flight, which the dataset reads its records' offsets from
-        fasta_file=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n),
-        min_res_n=min_res_n,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_nodes=num_nodes,
-        accelerator=accelerator,
-        devices=arg_devices(devices),
-        out_format=output_format,
-        out_name=output_name,
-        out_folder=output_folder,
-        strategy=strategy,
-        return_predictions=False,
-    )
+    with _refusals(codes is not None):
+        predict(
+            # Its pre-flight, which the dataset reads its records' offsets from
+            fasta_file=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n, codes=codes),
+            min_res_n=min_res_n,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            num_nodes=num_nodes,
+            accelerator=accelerator,
+            devices=arg_devices(devices),
+            out_format=output_format,
+            out_name=output_name,
+            out_folder=output_folder,
+            strategy=strategy,
+            return_predictions=False,
+            **_codes_keywords(codes),
+        )
 
 
 @from_sequences_app.command(
@@ -392,7 +428,7 @@ def from_sequences_chain(
             file_okay=False,
             dir_okay=True,
             resolve_path=True,
-            help='Output folder to store predictions.'
+            help=_OUTPUT_FOLDER_HELP
         )],
         output_format: Annotated[OutFormat, typer.Option(
             help='Format of the output. Options: csv, pt, parquet, json.'
@@ -400,6 +436,16 @@ def from_sequences_chain(
         output_name: Annotated[str, typer.Option(
             help='File name for storing embeddings. Used when output-format is parquet or json.'
         )] = 'inference',
+        output_codes_folder: Annotated[Optional[Path], typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help=_OUTPUT_CODES_FOLDER_HELP
+        )] = None,
+        output_codes_name: Annotated[Optional[str], typer.Option(
+            help=_OUTPUT_CODES_NAME_HELP
+        )] = None,
         min_res_n: Annotated[int, typer.Option(
             help='Consider only sequences with at least <min_res_n> residues.'
         )] = 0,
@@ -425,36 +471,90 @@ def from_sequences_chain(
             help='Logging level.'
         )] = LogLevel.info
 ):
+    codes = _codes_options(output_codes_folder, output_codes_name, output_folder, output_name)
     set_log_level(log_level)
 
     from foldmatch.inference.chain_complete_inference import predict
-    predict(
-        # Its pre-flight, which the dataset reads its records' offsets from
-        src_stream=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n),
-        src_location=SrcLocation.file,
-        src_from=SrcEsmFrom.fasta,
-        min_res_n=min_res_n,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_nodes=num_nodes,
-        accelerator=accelerator,
-        devices=arg_devices(devices),
-        out_format=output_format,
-        out_folder=output_folder,
-        out_name=output_name,
-        strategy=strategy,
-        return_predictions=False,
-    )
+    with _refusals(codes is not None):
+        predict(
+            # Its pre-flight, which the dataset reads its records' offsets from
+            src_stream=_refuse_fasta_conflicts(fasta_file, output_folder, output_format, min_res_n, codes=codes),
+            src_location=SrcLocation.file,
+            src_from=SrcEsmFrom.fasta,
+            min_res_n=min_res_n,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            num_nodes=num_nodes,
+            accelerator=accelerator,
+            devices=arg_devices(devices),
+            out_format=output_format,
+            out_folder=output_folder,
+            out_name=output_name,
+            strategy=strategy,
+            return_predictions=False,
+            **_codes_keywords(codes),
+        )
 
 
-def _refuse_fasta_conflicts(fasta_file: Path, output_folder: Path, output_format: OutFormat, min_res_n: int):
+def _codes_options(output_codes_folder: Optional[Path], output_codes_name: Optional[str], output_folder: Path,
+                   output_name: str) -> Optional[Tuple[Path, str]]:
+    """The codes folder and the codes name (--output-codes-name, else default_codes_name) of a run with residue codes,
+    None without --output-codes-folder. Before anything is imported, usage errors (typer.BadParameter, exit status 2,
+    D20): --output-codes-name without --output-codes-folder, and --output-codes-folder that is --output-folder,
+    compared as files (same_folder_problem; the library raises the same message as a ValueError)."""
+    if output_codes_folder is None:
+        if output_codes_name is not None:
+            raise typer.BadParameter("names the residue-code files of --output-codes-folder, which is not given.",
+                                     param_hint="--output-codes-name")
+        return None
+    from foldmatch.utils.output_files import default_codes_name, same_folder_problem
+    problem = same_folder_problem(output_folder, output_codes_folder, _CODES_OPTIONS)
+    if problem is not None:
+        raise typer.BadParameter(problem, param_hint="--output-codes-folder")
+    return output_codes_folder, default_codes_name(output_name) if output_codes_name is None else output_codes_name
+
+
+#: The folders of a run with residue codes, as its refusals name them.
+_CODES_OPTIONS = ("--output-folder", "--output-codes-folder")
+
+
+def _codes_keywords(codes: Optional[Tuple[Path, str]]) -> dict:
+    """The residue-code keywords of predict: none without --output-codes-folder, so a plain run calls it as before."""
+    return {} if codes is None else {"out_codes_folder": codes[0], "out_codes_name": codes[1]}
+
+
+def _refusals(codes: bool):
+    """A run with residue codes (--output-codes-folder) reports every refusal of its checks as a RefusalError (D20:
+    exit status 1), as 'fm-search build sequences --residue-codes' does; a plain run raises exactly what it raised
+    before."""
+    return _as_refusals() if codes else nullcontext()
+
+
+@contextmanager
+def _as_refusals():
+    from foldmatch.errors import RefusalError
+    try:
+        yield
+    except RefusalError:
+        raise
+    except (ValueError, OSError) as exc:
+        raise RefusalError(str(exc)) from exc
+
+
+def _refuse_fasta_conflicts(fasta_file: Path, output_folder: Path, output_format: OutFormat, min_res_n: int,
+                            codes: Optional[Tuple[Path, str]] = None):
     """The FASTA checks of from-sequences, before ESM3 (P9.N), on every rank alike: a record id repeated among the
     records kept (at least min_res_n residues), in every format, found by the residue pass's pre-flight
     (preflight_fasta, its duplicates); with csv and pt, ids that cannot name a file <id>.<format> of the output folder,
-    or that the folder takes for one file (abc and ABC on APFS), and the FASTA file among the output files. The
-    pre-flight, whose offsets the dataset reads."""
+    or that the folder takes for one file (abc and ABC on APFS), the FASTA file among the output files, and residue
+    codes in the files that the run would replace (refuse_other_kind). With ``codes`` (--output-codes-folder, the
+    codes name) and csv or pt, the same of the code files <id>.<format> of the codes folder, as that folder compares
+    names (embeddings in the files that the run would replace there), and neither folder inside the other named as
+    one of the other's files (check_code_outputs). The files read are remembered for the library's check of the same
+    folders (file_kinds.remembering). The pre-flight, whose offsets the dataset reads."""
     from foldmatch.errors import RefusalError
-    from foldmatch.utils.output_files import ITEM_FORMATS, check_outputs
+    from foldmatch.utils.file_kinds import remembering
+    from foldmatch.utils.output_files import ITEM_FORMATS, check_code_outputs, check_outputs
     from foldmatch.utils.sequence import preflight_fasta, scan_fasta
     preflight = preflight_fasta(fasta_file, min_res_n)
     if preflight.duplicates:
@@ -469,8 +569,14 @@ def _refuse_fasta_conflicts(fasta_file: Path, output_folder: Path, output_format
             if min_res_n <= 0 or length >= min_res_n:
                 ids.append(name)
                 labels.append(f"record {k}")
-        check_outputs(output_folder, output_format, None, names=ids, labels=labels, source=str(fasta_file),
-                      inputs=[("the FASTA file", fasta_file)], what="FASTA id", given="those records")
+        inputs = [("the FASTA file", fasta_file)]
+        with remembering():
+            outputs = check_outputs(output_folder, output_format, None, names=ids, labels=labels,
+                                    source=str(fasta_file), inputs=inputs, what="FASTA id", given="those records")
+            if codes is not None:
+                check_code_outputs(codes[0], output_format, codes[1], out_folder=output_folder, names=ids,
+                                   labels=labels, source=str(fasta_file), inputs=inputs, what="FASTA id",
+                                   given="those records", outputs=outputs, options=_CODES_OPTIONS)
     return preflight
 
 

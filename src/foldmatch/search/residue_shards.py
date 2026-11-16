@@ -34,6 +34,12 @@ A plain pass (no residue output) keeps the legacy schema ``id | embedding`` with
 A run's shards are ``emb_<run id>-<rank>.parquet`` (:func:`run_shard_files`, :func:`shard_run_ids`; also imported
 from ``foldmatch.search.embedding_computer``).
 
+``fm-embedding from-sequences residue|chain --output-codes-folder`` writes the same residue codes to Parquet files of
+another kind, which are not shards (:func:`code_table_schema`): one ``uint8 [L, 8]`` table per sequence, columns
+``id: string | residue_codes: list<fixed_size_list<uint8, 8>> | seq_sha1: fixed_size_binary(20)``, with the metadata
+of a shard but ``foldmatch.residue_output`` = ``residue_code_table`` (:data:`RESIDUE_CODE_TABLE`), so every shard
+reader refuses such a file (it holds neither ``residue_codes`` nor ``query_encoding``).
+
 pyarrow and numpy only: no torch, so Stage-2 code (and ``foldmatch.search.split_run``) can import it.
 """
 from __future__ import annotations
@@ -57,6 +63,9 @@ from foldmatch.utils.dist import is_run_id
 RESIDUE_CODES = "residue_codes"
 QUERY_ENCODING = "query_encoding"
 RESIDUE_OUTPUTS = (RESIDUE_CODES, QUERY_ENCODING)
+#: The kind (``foldmatch.residue_output``) of fm-embedding's residue-code Parquet files: one ``[L, 8]`` table per
+#: sequence, not a payload column beside an embedding. Not a residue output of a shard: the shard readers refuse it.
+RESIDUE_CODE_TABLE = "residue_code_table"
 
 ID = "id"
 EMBEDDING = "embedding"
@@ -118,8 +127,12 @@ def payload_row_bytes(residue_output: str, system) -> int:
 
 
 def shard_metadata(residue_output: str, system) -> dict:
+    return _system_metadata(check_residue_output(residue_output), system)
+
+
+def _system_metadata(kind: str, system) -> dict:
     return {
-        META_RESIDUE_OUTPUT: check_residue_output(residue_output).encode("ascii"),
+        META_RESIDUE_OUTPUT: kind.encode("ascii"),
         META_SYSTEM: system.name.encode("ascii"),
         META_ENCODING_DIGEST: system.encoding_digest().encode("ascii"),
         META_SYSTEM_DIGEST: system.digest().encode("ascii"),
@@ -182,6 +195,24 @@ def shard_schema(residue_output: Optional[str] = None, system=None, record: Opti
     metadata = shard_metadata(residue_output, system)
     metadata.update(pass_metadata(pass_record() if record is None else record))
     return pa.schema(list(BASE_FIELDS) + [(residue_output, PAYLOAD_TYPE), (SEQ_SHA1, SEQ_SHA1_TYPE)],
+                     metadata=metadata)
+
+
+def code_table_type(system) -> pa.DataType:
+    """The ``residue_codes`` column of a residue-code file: one list of ``code_bytes`` (8) values per residue."""
+    return pa.list_(pa.list_(pa.uint8(), system.code_bytes))
+
+
+def code_table_schema(system, record: Optional[Dict[str, Any]] = None) -> pa.Schema:
+    """The schema of fm-embedding's residue-code Parquet files (``--output-codes-folder``): ``id | residue_codes |
+    seq_sha1``, ``residue_codes`` a ``uint8 [L, 8]`` table per sequence (:func:`code_table_type`), with the metadata of
+    a shard of ``system`` (its name and digests) and the pass ``record`` (:func:`pass_record`), but the kind
+    :data:`RESIDUE_CODE_TABLE`, which no shard reader takes."""
+    if system is None:
+        raise ValueError("a residue-code table schema needs the scoring system")
+    metadata = _system_metadata(RESIDUE_CODE_TABLE, system)
+    metadata.update(pass_metadata(pass_record() if record is None else record))
+    return pa.schema([(ID, pa.string()), (RESIDUE_CODES, code_table_type(system)), (SEQ_SHA1, SEQ_SHA1_TYPE)],
                      metadata=metadata)
 
 
@@ -258,6 +289,9 @@ class ShardInfo:
     def describe(self) -> str:
         if self.residue_output is None:
             return "no residue column (a plain pass)"
+        if self.residue_output == RESIDUE_CODE_TABLE:
+            return (f"the residue-code tables of 'fm-embedding ... --output-codes-folder' ({self.system}), not an "
+                    f"embedding shard")
         return (f"{self.residue_output} of {self.system} (encoding_digest {self.encoding_digest}, system_digest "
                 f"{self.system_digest})")
 
@@ -341,6 +375,9 @@ def check_shards(paths: Iterable, residue_output: str, system) -> List[ShardInfo
                                 "the shards of other runs or use another folder.")
     info = infos[0]
     where = f"{len(infos)} shard(s) ({info.path.name}, ...)"
+    if info.residue_output == RESIDUE_CODE_TABLE:
+        raise ResidueShardError(f"{where} hold {info.describe()}: a build's {residue_output} are read from the "
+                                f"embedding shards of its own pass (emb_<run id>-<rank>.parquet), not from these files")
     if info.residue_output != residue_output:
         raise ResidueShardError(f"{where} hold {info.describe()}, not {residue_output}: they were written by a pass "
                                 f"without --residue-codes or for another purpose")

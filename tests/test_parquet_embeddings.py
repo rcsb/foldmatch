@@ -212,9 +212,9 @@ class ParquetEmbeddingsTest(unittest.TestCase):
         file: an empty file after a chain shard, a shard cut short (its first half, as an interrupted run leaves it:
         the footer is written last), a shard with a corrupted page (its first page header zeroed) and a shard's rows
         under the columns name and vector, or without id. They stopped on pyarrow's message, which names no file, or
-        on a traceback: an OSError, or a KeyError (iter_batches drops a missing column without a word). A folder named
-        *.parquet, such as the dataset folder that Spark writes, is refused as a folder, and a broken link with the
-        system's reason, which pyarrow's message gives after the whole path."""
+        on a traceback: an OSError, or a KeyError (iter_batches drops a missing column without a word). A broken link
+        is refused with the system's reason, which pyarrow's message gives after the whole path. (A folder named
+        *.parquet, such as the dataset folder that Spark writes, is skipped: tests/test_embedding_folders.py.)"""
         shard = self.shard(self.folder("shard"), _vectors(64))
         data, table = shard.read_bytes(), pq.read_table(shard)
         empty = self.folder("empty")
@@ -227,8 +227,6 @@ class ParquetEmbeddingsTest(unittest.TestCase):
         renamed, no_id = folder / "renamed.parquet", folder / "no-id.parquet"
         pq.write_table(table.rename_columns(["name", "vector"]), renamed)
         pq.write_table(table.drop_columns(["id"]), no_id)
-        dataset = self.folder("dataset")
-        (dataset / "embeddings.parquet").mkdir()
         broken = self.folder("broken")
         (broken / "inference-0.parquet").symlink_to(broken / "moved.parquet")
         again = "Write it again: an interrupted run or a damaged copy leaves an unreadable file."
@@ -241,7 +239,6 @@ class ParquetEmbeddingsTest(unittest.TestCase):
                                                f"thrift: TProtocolException: Invalid data). {again}"),
                  "name and vector": (renamed, f"{renamed} has no 'id' or 'embedding' column: {columns}"),
                  "no id": (no_id, f"{no_id} has no 'id' column: {columns}"),
-                 "folder": (dataset, f"{dataset / 'embeddings.parquet'} is a folder, not a Parquet file."),
                  "broken link": (broken, f"{broken / 'inference-0.parquet'} could not be opened (No such file or "
                                          f"directory).")}
         for name, (path, text) in cases.items():

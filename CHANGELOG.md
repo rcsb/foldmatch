@@ -6,6 +6,96 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Added
+
+- **`--output-codes-folder`** on `fm-embedding from-sequences residue` and
+  `fm-embedding from-sequences chain`: the same ESM3 pass also computes each
+  sequence's residue codes, the esm-codes-v1 target codes that `fm-search
+  build sequences --residue-codes` stores (8 bytes per residue), and writes
+  them to that folder, in `--output-format`: `<id>.csv` (L lines of 8
+  integers) or `<id>.pt` (a `uint8` tensor `[L, 8]`), as the embeddings are
+  `<output-folder>/<id>.csv|pt`, or `<output-codes-name>-<rank>.parquet` (`id
+  | residue_codes | seq_sha1`, `residue_codes` a `list<fixed_size_list<uint8,
+  8>>`, the scoring system, its digests and the pass record in the schema
+  metadata) or `<output-codes-name>-<rank>.json.gz`. Row `i` of a sequence's
+  codes is residue `i`, row `i + 1` of its residue embeddings (`[L + 2,
+  1536]`, with ESM3's BOS and EOS rows). The folder must exist and must not be
+  `--output-folder`, compared as folders on disk (a symbolic link, `.` or a
+  case variant on macOS is the same folder): a usage error, exit status 2,
+  before anything is loaded. One inside the other is allowed, both ways
+  (`fm-search` skips subfolders, below), unless the subfolder is named as a
+  file of the other folder's output (refused below). The
+  embedding files are byte for byte those of a run without the option (a
+  `.json.gz` but for its gzip timestamp, as between any two runs), and the
+  output folder holds them only: `fm-search build embeddings` and `query
+  embedding` read a chain run's output folder as that of a plain run.
+  **`--output-codes-name`** names the parquet and json files (default
+  `<output-name>-codes`; like `--output-name`, no csv or pt file); without
+  `--output-codes-folder` it is refused (exit status 2). Refused before ESM3,
+  exit status 1: a codes name that cannot name the files, ids (csv, pt) that
+  the codes folder takes for one file, a `--fasta-file` among the code files,
+  one folder inside the other under the name of one of the other's files
+  (`out/<id>.csv` as the codes folder of a csv run, or
+  `out/inference-0.parquet` of a parquet run; the writer would meet a folder
+  after the pass), FASTA records with `<`, `>` or non-ASCII sequences, an
+  esm-codes bundle that cannot be fetched (only the process that starts a run
+  fetches it; on several nodes, run `fm-embedding download-models` first), and
+  a run that would replace an embedding file in the codes folder (an earlier
+  run's output folder given as the codes folder, say; each file that the run
+  would replace is read as little as tells its kind, and one of no kind,
+  empty or cut short, is replaced as before). A
+  sequence whose codes cannot be computed (ESM3's rows do not match its
+  length) is logged as an ERROR and gets an empty table (an empty file in
+  csv); the run writes every file, then ends with exit status 1 and a message
+  that names how many sequences got no codes, the first ids and where their
+  empty tables are. With several ranks, each rank that ends its pass posts
+  its count in the process group's store and waits for the others (at most a
+  day), and rank 0 then fails for the whole run while the other ranks log
+  their count and end, so that no rank fails while another still writes
+  (its launcher would kill it): exit status 1 under Lightning's launcher,
+  `srun` and `torchrun` alike. Library: `out_codes_folder=`
+  and `out_codes_name=` on `foldmatch.inference.sequence_inference.predict`
+  and `foldmatch.inference.chain_complete_inference.predict`, with the same
+  checks (an `out_codes_folder` that is `out_folder` raises `ValueError`), and
+  a codes folder that is not an existing folder refused before ESM3;
+  `scoring_system=` on the former too, as on the latter (default `None`,
+  `esm-codes-v1`; used only with `out_codes_folder`). The predictions are then
+  `(embeddings, ids, codes, seq_sha1s)`, `codes` one CPU `uint8` tensor `[L,
+  8]` per sequence, as its `.pt` code file holds. Missing codes raise
+  `foldmatch.errors.MissingResidueCodesError` (a `RefusalError`) at the end,
+  on rank 0, with `count` and `ids` of the run, `rank_counts`, `rank`,
+  `world_size` and the `predictions`; under a strategy that spawns or forks
+  its ranks (`ddp_spawn`, `ddp_fork`, `ddp_notebook`) the calling process
+  does not learn the ranks' counts and only logs a WARNING. The code
+  Parquet files carry the kind `residue_code_table`, which the shard readers
+  of builds and queries refuse; `fm-search build embeddings` and `query
+  embedding` refuse code files moved into an embedding folder (a code Parquet
+  file and a code `.pt` are named as such). The legacy `inference` CLI has no
+  FASTA command, so no equivalent.
+
+### Changed
+
+- **`fm-search build embeddings` and `fm-search query embedding` skip
+  folders in `--embedding-folder`.** They read the files of the folder named
+  `*.parquet`, `*.pt` or `*.csv`, and listed a folder so named too (the
+  dataset folder `x.parquet` that Spark writes, say), which they then refused
+  (`... is a folder, not a Parquet file`), so the whole embedding folder was
+  refused. Such a folder, or a symbolic link to one, is now skipped, not read,
+  with one WARNING that names the skipped folders (the first five, and how
+  many more); a symbolic link to a file is read as before. To read the files
+  of such a folder, give that folder itself. A folder that then holds no
+  embedding file is refused as before (`No embedding files found ...`), its
+  message naming the skipped folders. `--help` of both says that subfolders
+  are not read.
+- **Every `fm-embedding` command (and the legacy `inference` commands, and
+  the library functions that write embeddings) refuses to replace a file of
+  residue codes in its output folder** (as `--output-codes-folder` writes
+  them: a codes folder given as `--output-folder`, say), before ESM3, exit
+  status 1; a rerun into the same folder replaces its own embedding files as
+  before.
+
 ## [0.11.0] - 2026-11-12
 
 ### Added

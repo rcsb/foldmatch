@@ -12,7 +12,8 @@ from lightning.pytorch.callbacks import BasePredictionWriter
 from foldmatch.errors import RefusalError
 from foldmatch.utils.output_files import name_key, name_problem, probe_folding
 from foldmatch.search.residue_shards import (
-    SEQ_SHA1, SEQ_SHA1_BYTES, SEQ_SHA1_TYPE, check_residue_output, large_binary_array, pass_record, shard_schema,
+    ID, RESIDUE_CODES, SEQ_SHA1, SEQ_SHA1_BYTES, SEQ_SHA1_TYPE, check_residue_output, code_table_schema,
+    code_table_type, large_binary_array, pass_record, shard_schema,
 )
 
 #: Default byte budget of a writer with a residue column or residue embeddings: buffered rows are written once they
@@ -33,6 +34,15 @@ class CoreBatchWriter(BasePredictionWriter):
         # The files this writer has written in this run, by the name the folder compares (claim_file)
         self._written = {}
         self._folding = None
+
+    #: What this writer writes, in its refusals ("Each embedding of a run needs a file of its own", "Write the
+    #: embeddings as parquet or json").
+    _ITEM = "embedding"
+    _ITEMS = "embeddings"
+
+    def _what(self, dom_id) -> str:
+        """What this writer writes of ``dom_id``, in its refusals."""
+        return f"The embedding {dom_id!r}"
 
     def write_on_batch_end(
             self,
@@ -72,8 +82,8 @@ class CoreBatchWriter(BasePredictionWriter):
         problem = name_problem(dom_id, suffix)
         if problem is not None:
             raise RefusalError(
-                f"The embedding {dom_id!r} cannot be written to {self.out_path}: its name {problem}, so it cannot name "
-                f"the file <name>{suffix} there. Write the embeddings as parquet or json, which keep each under its "
+                f"{self._what(dom_id)} cannot be written to {self.out_path}: its name {problem}, so it cannot name "
+                f"the file <name>{suffix} there. Write the {self._ITEMS} as parquet or json, which keep each under its "
                 f"id, or give it another name."
             )
         if self._folding is None:
@@ -85,8 +95,8 @@ class CoreBatchWriter(BasePredictionWriter):
             note = f" (the folder does not tell {folded} apart)" if folded and first != dom_id else ""
             raise RefusalError(
                 f"{self.file_name(first)} would be written twice by this run, for {first!r} and then for "
-                f"{dom_id!r}{note}: the first is kept, {dom_id!r} is not written, and the run stops. Each embedding of "
-                f"a run needs a file of its own: write them as parquet or json, which keep each under its id, or, "
+                f"{dom_id!r}{note}: the first is kept, {dom_id!r} is not written, and the run stops. Each {self._ITEM} "
+                f"of a run needs a file of its own: write them as parquet or json, which keep each under its id, or, "
                 f"for names that differ only in case, to a folder of a case-sensitive file system."
             )
         self._written[key] = dom_id
@@ -403,3 +413,199 @@ class ParquetBatchWriter(BasePredictionWriter):
         self._flush(trainer.global_rank)
         if self._writer is not None:
             self._writer.close()
+
+
+# =====================================================================================================================
+# Residue codes in their own folder (fm-embedding from-sequences residue|chain --output-codes-folder)
+# =====================================================================================================================
+def residue_code_tables(prediction, code_bytes: int = 8):
+    """The residue codes of a prediction ``(embeddings, ids, payloads, seq_sha1s)`` of a module with the
+    ``residue_codes`` output: ``(ids, tables, seq_sha1s)``, one writable ``uint8 [L, code_bytes]`` array per id (``[0,
+    code_bytes]`` for an empty payload, a protein whose codes could not be computed). ValueError for a prediction
+    without the payloads, or a payload that is not whole codes."""
+    if prediction is None or len(prediction) < 4:
+        raise ValueError(
+            f"a residue-code writer needs predictions (embeddings, ids, payloads, seq_sha1s), got "
+            f"{'none' if prediction is None else f'a {len(prediction)}-tuple'}: the module computes no residue codes"
+        )
+    ids, payloads, digests = tuple(prediction[1]), prediction[2], prediction[3]
+    if len(payloads) != len(ids) or len(digests) != len(ids):
+        raise ValueError(f"{len(ids)} ids but {len(payloads)} residue-code payloads and {len(digests)} seq_sha1s")
+    tables = []
+    for dom_id, payload in zip(ids, payloads):
+        payload = bytes(payload)
+        if len(payload) % code_bytes:
+            raise ValueError(f"the residue codes of {dom_id!r} are {len(payload)} bytes, not a whole number of "
+                             f"{code_bytes}-byte codes")
+        tables.append(np.frombuffer(payload, dtype=np.uint8).reshape(-1, code_bytes).copy())
+    digests = [bytes(d) for d in digests]
+    bad = [i for i, d in zip(ids, digests) if len(d) != SEQ_SHA1_BYTES]
+    if bad:
+        raise ValueError(f"seq_sha1 must be {SEQ_SHA1_BYTES} bytes (e.g. for {bad[0]!r})")
+    return ids, tables, digests
+
+
+def _check_codes_module(pl_module):
+    """Refuse, at the start of the pass and so on every rank, a module that does not compute residue codes."""
+    produced = getattr(pl_module, "residue_output", None)
+    if produced != RESIDUE_CODES:
+        raise ValueError(f"this writer stores {RESIDUE_CODES}, but the module produces "
+                         f"{produced or 'no residue output'}")
+
+
+class _CodeFiles:
+    """The residue codes of each id to its own file, ``<codes folder>/<id>.<format>`` (as the embedding of the id is
+    ``<output folder>/<id>.<format>``), by the item writer it is mixed into (csv or pt), which writes each ``uint8 [L,
+    8]`` table as it writes an embedding."""
+
+    _ITEM = "residue-code table"
+    _ITEMS = "residue codes"
+
+    def _what(self, dom_id) -> str:
+        return f"The residue codes of {dom_id!r}"
+
+    def on_predict_start(self, trainer, pl_module):
+        _check_codes_module(pl_module)
+
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
+        if prediction is None:
+            return
+        ids, tables, _ = residue_code_tables(prediction)
+        deque(map(self._write_embedding, (torch.from_numpy(t) for t in tables), ids))
+
+
+class CsvCodeWriter(_CodeFiles, CsvBatchWriter):
+    """``<output_path>/<id>.csv``: an id's residue codes, L lines of 8 integers (0-255), no header or index (an empty
+    file for a protein without codes)."""
+
+    def __init__(self, output_path, write_interval="batch"):
+        super().__init__(output_path, postfix="csv", write_interval=write_interval)
+
+
+class TensorCodeWriter(_CodeFiles, TensorBatchWriter):
+    """``<output_path>/<id>.pt``: an id's residue codes, a CPU ``uint8`` tensor ``[L, 8]``."""
+
+    def __init__(self, output_path, write_interval="batch"):
+        super().__init__(output_path, postfix="pt", write_interval=write_interval, device="cpu")
+
+
+class JsonCodeStorage(BasePredictionWriter):
+    """``<output_path>/<codes_name>-<rank>.json.gz``: one record ``{"id", "residue_codes"}`` per id, its residue codes
+    a list of 8 integers per residue, written at the end of the pass as the embeddings' JSON (orient records, gzip)."""
+
+    def __init__(self, output_path, codes_name, write_interval="batch"):
+        super().__init__(write_interval)
+        self.out_path = output_path
+        self.codes_name = codes_name
+        self._ids = []
+        self._tables = []
+
+    def on_predict_start(self, trainer, pl_module):
+        _check_codes_module(pl_module)
+
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
+        if prediction is None:
+            return
+        ids, tables, _ = residue_code_tables(prediction)
+        self._ids.extend(ids)
+        self._tables.extend(tables)
+
+    def on_predict_end(self, trainer, pl_module):
+        codes = np.empty(len(self._tables), dtype=object)
+        for k, table in enumerate(self._tables):
+            codes[k] = table
+        pd.DataFrame({'id': pd.Series(self._ids, dtype=object), RESIDUE_CODES: codes}).to_json(
+            f"{self.out_path}/{self.codes_name}-{trainer.global_rank}.json.gz",
+            orient='records',
+            compression='gzip'
+        )
+
+
+class ParquetCodeWriter(BasePredictionWriter):
+    """Per-rank ``<output_path>/<codes_name>-<rank>.parquet`` of residue codes, written in row groups: columns ``id |
+    residue_codes | seq_sha1`` (``residue_codes`` one ``uint8 [L, 8]`` table per sequence, as
+    ``list<fixed_size_list<uint8, 8>>``), with the scoring system's name and digests and the pass record in the
+    schema metadata (:func:`foldmatch.search.residue_shards.code_table_schema`: not an embedding shard, which every
+    shard reader refuses). The pass record holds ``min_res_n`` and ``esm_revision`` given here, and the device type,
+    its ESM3 precision and the number of ranks, added at the start of the pass. Rows are buffered up to ``buffer_size``
+    rows or ``byte_budget`` bytes of codes. No file for a rank without rows, as for the embeddings."""
+
+    def __init__(self, output_path, codes_name, system, *, min_res_n=None, esm_revision=None, write_interval="batch",
+                 buffer_size=16384, byte_budget=DEFAULT_BYTE_BUDGET):
+        super().__init__(write_interval)
+        if system is None:
+            raise ValueError("a residue-code writer needs the scoring system (its schema metadata)")
+        if int(byte_budget) <= 0:
+            raise ValueError(f"byte_budget must be > 0, got {byte_budget!r}")
+        self.out_path = output_path
+        self.codes_name = codes_name
+        self.system = system
+        self.buffer_size = buffer_size
+        self.byte_budget = int(byte_budget)
+        self._pass = {"min_res_n": min_res_n, "esm_revision": esm_revision}
+        self._schema = code_table_schema(system, pass_record(**self._pass))
+        self._writer = None
+        self._ids, self._tables, self._digests = [], [], []
+        self._buffered_bytes = 0
+
+    @property
+    def schema(self):
+        return self._schema
+
+    def on_predict_start(self, trainer, pl_module):
+        _check_codes_module(pl_module)
+        if self._writer is None:
+            device = getattr(getattr(pl_module, "device", None), "type", None)
+            world_size = getattr(trainer, "world_size", None)
+            self._schema = code_table_schema(self.system, pass_record(
+                **self._pass, accelerator=device, world_size=None if world_size is None else int(world_size)))
+
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
+        if prediction is None:
+            return
+        ids, tables, digests = residue_code_tables(prediction, self.system.code_bytes)
+        self._ids.extend(ids)
+        self._tables.extend(tables)
+        self._digests.extend(digests)
+        self._buffered_bytes += sum(t.nbytes for t in tables)
+        if len(self._ids) >= self.buffer_size or self._buffered_bytes >= self.byte_budget:
+            self._flush(trainer.global_rank)
+
+    def _flush(self, rank):
+        if not self._ids:
+            return
+        width = self.system.code_bytes
+        offsets = np.concatenate(([0], np.cumsum([len(t) for t in self._tables]))).astype(np.int32)
+        values = np.concatenate(self._tables).reshape(-1) if self._tables else np.empty(0, dtype=np.uint8)
+        residues = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.uint8()), width)
+        codes = pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), residues)
+        table = pa.table({
+            ID: pa.array(self._ids, type=pa.string()),
+            RESIDUE_CODES: codes.cast(code_table_type(self.system)),
+            SEQ_SHA1: pa.array(self._digests, type=SEQ_SHA1_TYPE),
+        }, schema=self._schema)
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(f"{self.out_path}/{self.codes_name}-{rank}.parquet", self._schema,
+                                            compression='snappy')
+        self._writer.write_table(table)
+        self._ids.clear()
+        self._tables.clear()
+        self._digests.clear()
+        self._buffered_bytes = 0
+
+    def on_predict_end(self, trainer, pl_module):
+        self._flush(trainer.global_rank)
+        if self._writer is not None:
+            self._writer.close()
+
+
+def residue_code_writer(out_format, codes_folder, codes_name, system, *, min_res_n=None, esm_revision=None):
+    """The writer of the residue codes of an fm-embedding pass (``--output-codes-folder``) in ``out_format``, to
+    ``codes_folder``: ``<codes_name>-<rank>.parquet`` or ``.json.gz``, else ``<id>.csv`` or ``<id>.pt`` (which
+    ``codes_name`` does not name)."""
+    fmt = getattr(out_format, "value", out_format)
+    if fmt == "parquet":
+        return ParquetCodeWriter(codes_folder, codes_name, system, min_res_n=min_res_n, esm_revision=esm_revision)
+    if fmt == "json":
+        return JsonCodeStorage(codes_folder, codes_name)
+    return TensorCodeWriter(codes_folder) if fmt == "pt" else CsvCodeWriter(codes_folder)

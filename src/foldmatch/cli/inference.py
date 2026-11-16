@@ -223,6 +223,7 @@ def chain_embedding(
 ):
     from foldmatch.dataset.utils import CHAIN_LIST_DEFAULT_NAME, read_chain_list, refuse_repeated_names, row_labels
     from foldmatch.inference.chain_inference import predict
+    from foldmatch.utils.file_kinds import remembering
     from foldmatch.utils.output_files import check_outputs
     set_log_level(log_level)
 
@@ -230,8 +231,10 @@ def chain_embedding(
     chains = read_chain_list(src_file)
     refuse_repeated_names(chains, str(src_file), CHAIN_LIST_DEFAULT_NAME)
     _refuse_chains_over_residues(output_folder, output_format, res_embedding_location, res_embedding_format)
-    check_outputs(output_folder, output_format, output_name, names=list(chains.item_name), labels=row_labels(chains),
-                  source=str(src_file), inputs=[("the chain list", src_file)], stem_what="--output-name")
+    with remembering():   # predict checks the folder again
+        check_outputs(output_folder, output_format, output_name, names=list(chains.item_name),
+                      labels=row_labels(chains), source=str(src_file), inputs=[("the chain list", src_file)],
+                      stem_what="--output-name")
     # The residue embedding of each row is the file of its embedding name, as residue-embedding writes it
     predict(
         src_stream=[(os.path.join(res_embedding_location, f"{name}.{res_embedding_format.value}"), name)
@@ -553,6 +556,7 @@ def _refuse_conflicting_steps(src_chain_file: Path, src_assembly_file, assemblie
         read_chain_list, refuse_repeated_names, row_labels
     from foldmatch.errors import RefusalError
     from foldmatch.inference.utils import list_inputs
+    from foldmatch.utils.file_kinds import remembering
     from foldmatch.utils.output_files import check_outputs, file_id, probe_folding, refuse_assemblies_over_residues, \
         same_folder, shown
     res_path, chain_path, assembly_path = folders
@@ -582,22 +586,23 @@ def _refuse_conflicting_steps(src_chain_file: Path, src_assembly_file, assemblie
     # Chains that differ only as the folder does not tell apart (A and a of one structure): complete-embedding names
     # them <structure name>.<chain ID>, and its residue step writes pt files, so only another folder keeps them apart
     named = "complete-embedding names each chain <structure name>.<chain ID>"
-    steps = [
-        ("--output-res-path", "residue", res_path, check_outputs(
-            res_path, OutFormat.pt, None, names=chain_names, labels=chain_rows, source=str(src_chain_file),
-            inputs=inputs, folding=folding(res_path),
-            folded_advice=f"give --output-res-path a folder of a file system that tells {{apart}} apart ({named}, "
-                          f"and its residue step writes pt files)")),
-        ("--output-chain-path", "chain", chain_path, check_outputs(
-            chain_path, output_format, chain_name, names=chain_names, labels=chain_rows, source=str(src_chain_file),
-            inputs=inputs, folding=folding(chain_path), stem_what="--output-chain-name",
-            folded_advice=f"give --output-chain-path a folder of a file system that tells {{apart}} apart, or use "
-                          f"--output-format parquet or json ({named})")),
-        ("--output-assembly-path", "assembly", assembly_path, check_outputs(
-            assembly_path, output_format, assembly_name, names=assembly_names, labels=assembly_rows,
-            source=assembly_source, folding=folding(assembly_path), stem_what="--output-assembly-name",
-            inputs=inputs)),
-    ]
+    with remembering():   # each step's predict checks its folder again
+        steps = [
+            ("--output-res-path", "residue", res_path, check_outputs(
+                res_path, OutFormat.pt, None, names=chain_names, labels=chain_rows, source=str(src_chain_file),
+                inputs=inputs, folding=folding(res_path),
+                folded_advice=f"give --output-res-path a folder of a file system that tells {{apart}} apart ({named}, "
+                              f"and its residue step writes pt files)")),
+            ("--output-chain-path", "chain", chain_path, check_outputs(
+                chain_path, output_format, chain_name, names=chain_names, labels=chain_rows, source=str(src_chain_file),
+                inputs=inputs, folding=folding(chain_path), stem_what="--output-chain-name",
+                folded_advice=f"give --output-chain-path a folder of a file system that tells {{apart}} apart, or use "
+                              f"--output-format parquet or json ({named})")),
+            ("--output-assembly-path", "assembly", assembly_path, check_outputs(
+                assembly_path, output_format, assembly_name, names=assembly_names, labels=assembly_rows,
+                source=assembly_source, folding=folding(assembly_path), stem_what="--output-assembly-name",
+                inputs=inputs)),
+        ]
     refuse_assemblies_over_residues(assembly_names, assemblies.stream_name, out_folder=assembly_path,
                                     out_format=output_format, res_folder=res_path, res_format=OutFormat.pt,
                                     source=assembly_source, labels=assembly_rows)
