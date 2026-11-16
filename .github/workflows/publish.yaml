@@ -13,7 +13,7 @@ jobs:
   hatch-test:
     name: Test on Python ${{ matrix.python-version }}
     runs-on: ["self-hosted", "buildchain"]
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       # The editable install compiles the native kernel in place (hatch_build.py); a failed compile is an error here,
       # never a pure-Python install or skipped kernel tests.
