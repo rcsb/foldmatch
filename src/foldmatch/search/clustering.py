@@ -15,7 +15,7 @@ from tqdm import tqdm
 from foldmatch.search import FaissEmbeddingDatabase
 from foldmatch.search.embedding_database import _parse_db_path
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, GREEDY_CLUSTER_OUTPUT_FIELDS, write_cluster_results
-from foldmatch.types.api_types import FormatMode, IndexType
+from foldmatch.types.api_types import EdgeRule, FormatMode, IndexType
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,35 @@ def _release_freed_memory():
         pass
 
 
+class SimilarityEdges:
+    """The kept edges of a similarity graph of ``n`` chains (:meth:`EmbeddingClusterer.build_similarity_edges`), in
+    the blocks of the search: ``pair_blocks``, (m, 2) arrays of chain indexes, the lower end first (int32 when the
+    largest index fits, else int64), and ``weight_blocks``, one float32 score a pair, in the same order. A block with
+    no kept edge is not stored.
+
+    ``n_edges`` counts the pairs and ``min_weight`` is the smallest weight (+inf with no edge). Under the rescue rule
+    (:class:`~foldmatch.types.api_types.EdgeRule`), ``n_rescued_chains`` chains got ``n_rescued_edges`` of the edges
+    from their own search (0 and 0 under the lower rule)."""
+
+    def __init__(self, n: int, pair_blocks: list, weight_blocks: list, n_rescued_chains: int = 0,
+                 n_rescued_edges: int = 0):
+        self.n = n
+        self.pair_blocks = pair_blocks
+        self.weight_blocks = weight_blocks
+        self.n_edges = sum(len(b) for b in pair_blocks)
+        self.min_weight = min((float(b.min()) for b in weight_blocks if len(b)), default=float("inf"))
+        self.n_rescued_chains = n_rescued_chains
+        self.n_rescued_edges = n_rescued_edges
+
+    def chunks(self, size: int = None):
+        """Yield the edges in order as ``(pairs, weights)`` views of at most ``size`` edges (default
+        _GRAPH_EDGE_CHUNK), block by block: a chunk never spans two blocks. The blocks are kept."""
+        size = _GRAPH_EDGE_CHUNK if size is None else size
+        for pairs, weights in zip(self.pair_blocks, self.weight_blocks):
+            for s in range(0, len(pairs), size):
+                yield pairs[s:s + size], weights[s:s + size]
+
+
 class EmbeddingClusterer:
     """Cluster protein structure embeddings: Leiden on the similarity graph (:meth:`cluster_leiden`), or greedy
     representatives in one streamed pass over the database (:meth:`cluster_greedy`)."""
@@ -118,42 +147,61 @@ class EmbeddingClusterer:
         self.chain_ids = self.db.chain_ids
 
         self.graph = None
+        # The edges of the last build_similarity_edges (a SimilarityEdges), until a graph is built from them
+        self.edges = None
         self.clusters = None
-        # The smallest kept edge weight of the last build_similarity_graph, and a weak reference to the graph it was
-        # recorded for (cluster_leiden refuses a negative one for that graph only)
+        # The smallest kept edge weight of the last build_similarity_edges or build_similarity_graph, and a weak
+        # reference to the graph it was recorded for (cluster_leiden refuses a negative one for that graph only)
         self.min_weight = None
         self._min_weight_graph = None
         # The method of the last clustering ("leiden" or "greedy"), and under greedy each cluster's representative
         self.method = None
         self.representatives = None
 
-    def build_similarity_graph(
+    def build_similarity_edges(
             self,
             threshold: float = 0.8,
-            max_neighbors: int = 1000
-    ) -> ig.Graph:
+            max_neighbors: int = 1000,
+            edge_rule: EdgeRule = EdgeRule.rescue
+    ) -> SimilarityEdges:
         """
-        Build a similarity graph using FAISS k-NN search with threshold filtering.
+        Find the edges of the similarity graph with FAISS k-NN search and threshold filtering, with no igraph graph.
+
+        Sets ``self.edges`` and ``self.min_weight``; a graph built before is dropped (``self.graph`` is None).
+        :meth:`cluster_leiden` builds the igraph graph from ``self.edges`` when it needs one.
 
         Args:
             threshold: Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on
                 ivf_pq, where scores are PQ estimates)
             max_neighbors: Maximum number of neighbors to consider per node
+            edge_rule: Which hits become edges (:class:`~foldmatch.types.api_types.EdgeRule`). ``lower``: an edge
+                (i, j), i < j, is kept from the search of the lower chain i only. ``rescue`` (default): the same
+                edges, plus, for each chain i that has none of them, an edge (j, i) to each of its own hits j at or
+                above the threshold, weighted by i's score for j; every such j is lower than i.
 
         Returns:
-            igraph Graph object with edges weighted by similarity
+            The edges, a :class:`SimilarityEdges`
         """
+        edge_rule = EdgeRule(edge_rule)
         self.min_weight = None
         self._min_weight_graph = None
+        self.edges = None
         if self.db.index is None:
             raise ValueError("Database not loaded. Call load_database() first.")
+        self.graph = None
 
-        n_chains = len(self.chain_ids)
         logging.info(f"\nBuilding similarity graph with threshold >= {threshold}")
         logging.info(f"Searching up to {max_neighbors} neighbors per chain")
 
         # Clamp max_neighbors to actual database size
-        k = min(max_neighbors, n_chains)
+        k = min(max_neighbors, len(self.chain_ids))
+        self.edges = self._search_edges(threshold, k, edge_rule)
+        self.min_weight = self.edges.min_weight
+        return self.edges
+
+    def _search_edges(self, threshold: float, k: int, edge_rule: EdgeRule) -> SimilarityEdges:
+        """The block loop of :meth:`build_similarity_edges`, at ``k`` neighbours a chain (already clamped)."""
+        n_chains = len(self.chain_ids)
         # Chains per block, from the result budget and the row cap (k = 0 is left to FAISS to refuse, as before, after
         # one chain is read)
         rows = 1 if k < 1 else max(1, min(n_chains, _GRAPH_MAX_ROWS, _GRAPH_RESULT_BYTES // (k * 12)))
@@ -170,16 +218,26 @@ class EmbeddingClusterer:
         normalize = self.db.index_type == IndexType.ivf_pq
 
         id_dtype = _graph_id_dtype(n_chains)
+        rescue = edge_rule is EdgeRule.rescue
+        # Under rescue, whether each chain has an edge yet (1 byte a chain)
+        has_edge = np.zeros(n_chains, dtype=bool) if rescue else None
         pair_blocks = []
         weight_blocks = []
         n_edges = 0
-        start_time = time.perf_counter()
+        n_rescued_chains = 0
+        n_rescued_edges = 0
 
         # Blocks of chains in ascending order, read with reconstruct_n (no direct map needed on ivf_pq) and searched
-        # with one FAISS call each. An edge (i, j) is kept from the search of the lower chain i only, which also drops
-        # self-hits and the -1 ids FAISS fills in; edges come in chain order, then in FAISS rank order. A block's kept
-        # pairs are stored with int32 ids when the database's largest id fits, and a block with no kept edge is not
-        # stored.
+        # with one FAISS call each. An edge (i, j) is kept from the search of the lower chain i, which also drops
+        # self-hits and the -1 ids FAISS fills in; these edges come in chain order, then in FAISS rank order. A block's
+        # kept pairs are stored with int32 ids when the database's largest id fits, and a block with no kept edge is
+        # not stored.
+        #
+        # Rescue: once a block's own edges are marked on both ends, a chain of the block with no edge has none for
+        # good, since every lower block is done and a higher chain's search gives no edge to a lower chain. Its own
+        # hits j at or above the threshold (all lower: a higher one would be an edge of its own) become edges (j, i),
+        # weighted by its score for j, stored after the block's other edges, in chain order, then in rank order. None
+        # repeats an edge: had j's search kept i, i would have an edge.
         logging.info("Performing k-NN search ...")
         with tqdm(total=n_chains, desc="Processing chains", unit="chain") as progress:
             for start in range(0, n_chains, rows):
@@ -192,40 +250,99 @@ class EmbeddingClusterer:
 
                 chains = np.arange(start, end, dtype=np.int64)[:, None]
                 block_rows, block_cols = np.nonzero((chains < indices) & (scores >= threshold))
+                pairs = weights = None
                 if len(block_rows):
-                    pair_blocks.append(np.stack([block_rows + start, indices[block_rows, block_cols]],
-                                                axis=1).astype(id_dtype, copy=False))
-                    weight_blocks.append(scores[block_rows, block_cols])
-                    n_edges += len(block_rows)
-                del scores, indices, chains, block_rows, block_cols
+                    pairs = np.stack([block_rows + start, indices[block_rows, block_cols]],
+                                     axis=1).astype(id_dtype, copy=False)
+                    weights = scores[block_rows, block_cols]
+                if rescue:
+                    if pairs is not None:
+                        has_edge[pairs[:, 0]] = True
+                        has_edge[pairs[:, 1]] = True
+                    lone = np.flatnonzero(~has_edge[start:end])
+                    lone_ids, lone_scores = indices[lone], scores[lone]
+                    lone_rows, lone_cols = np.nonzero((lone_ids >= 0) & (lone_ids < chains[lone]) &
+                                                      (lone_scores >= threshold))
+                    if len(lone_rows):
+                        m = 0 if pairs is None else len(pairs)
+                        both = np.empty((m + len(lone_rows), 2), dtype=id_dtype)
+                        both_weights = np.empty(m + len(lone_rows), dtype=scores.dtype)
+                        if m:
+                            both[:m] = pairs
+                            both_weights[:m] = weights
+                        both[m:, 0] = lone_ids[lone_rows, lone_cols]
+                        both[m:, 1] = lone[lone_rows] + start
+                        both_weights[m:] = lone_scores[lone_rows, lone_cols]
+                        has_edge[both[m:, 0]] = True
+                        has_edge[both[m:, 1]] = True
+                        n_rescued_chains += len(np.unique(lone_rows))
+                        n_rescued_edges += len(lone_rows)
+                        pairs, weights = both, both_weights
+                        del both, both_weights
+                    del lone, lone_ids, lone_scores, lone_rows, lone_cols
+                if pairs is not None:
+                    pair_blocks.append(pairs)
+                    weight_blocks.append(weights)
+                    n_edges += len(pairs)
+                del scores, indices, chains, block_rows, block_cols, pairs, weights
 
                 progress.set_postfix(edges=n_edges, refresh=False)
                 progress.update(end - start)
 
         logging.info(f"Created graph with {n_chains} nodes and {n_edges} edges")
+        if rescue:
+            logging.info(f"Rescued {n_rescued_chains} chains with no edge from a lower chain's search "
+                         f"({n_rescued_edges} edges)")
+        return SimilarityEdges(n_chains, pair_blocks, weight_blocks, n_rescued_chains, n_rescued_edges)
 
+    def build_similarity_graph(
+            self,
+            threshold: float = 0.8,
+            max_neighbors: int = 1000,
+            edge_rule: EdgeRule = EdgeRule.rescue
+    ) -> ig.Graph:
+        """
+        Build a similarity graph using FAISS k-NN search with threshold filtering: :meth:`build_similarity_edges`,
+        then the igraph graph of its edges. The edge blocks are released as the graph takes them (``self.edges`` is
+        None afterwards).
+
+        Args:
+            threshold: Similarity threshold for edge creation (cosine; identical chains score 1, or close to 1 on
+                ivf_pq, where scores are PQ estimates)
+            max_neighbors: Maximum number of neighbors to consider per node
+            edge_rule: Which hits become edges, as in :meth:`build_similarity_edges` (default: rescue)
+
+        Returns:
+            igraph Graph object with edges weighted by similarity
+        """
+        start_time = time.perf_counter()
+        self.build_similarity_edges(threshold=threshold, max_neighbors=max_neighbors, edge_rule=edge_rule)
+        self._graph_from_edges()
+        logging.info(f"Similarity graph built in {time.perf_counter() - start_time:.2f}s")
+        return self.graph
+
+    def _graph_from_edges(self):
+        """The igraph graph of ``self.edges``, as ``self.graph``; the edge blocks are consumed and ``self.edges`` is
+        set to None."""
+        edges = self.edges
         # Create igraph from the blocks, with no concatenation, through a generator of int tuples: python-igraph 1.0.0
         # converts an edge ndarray through Python objects as well, at about 170 bytes an edge at its peak against 50 to
         # 57. Each block is released once consumed, and each weight block once its floats are in the list. An error
         # raised while igraph pulls the edges (MemoryError, KeyboardInterrupt) surfaces from python-igraph 1.0.0 as a
         # SystemError, with the original as its __cause__.
-        self.graph = ig.Graph(n=n_chains, edges=_edge_tuples(pair_blocks), directed=False)
+        self.graph = ig.Graph(n=edges.n, edges=_edge_tuples(edges.pair_blocks), directed=False)
         # glibc keeps freed blocks in the heap: give them back before the weights and before Leiden.
         _release_freed_memory()
-        # The smallest kept weight (+inf with no edge), before the weight blocks are consumed: Leiden refuses negative
-        # weights
-        min_weight = min((float(b.min()) for b in weight_blocks), default=float("inf"))
-        self.graph.es['weight'] = _weight_list(weight_blocks)
+        # The smallest kept weight (+inf with no edge) was taken before the weight blocks are consumed: Leiden refuses
+        # negative weights
+        self.graph.es['weight'] = _weight_list(edges.weight_blocks)
         _release_freed_memory()
 
         # Add chain IDs as vertex attribute
         self.graph.vs['name'] = self.chain_ids
-        self.min_weight = min_weight
+        self.min_weight = edges.min_weight
         self._min_weight_graph = weakref.ref(self.graph)
-
-        logging.info(f"Similarity graph built in {time.perf_counter() - start_time:.2f}s")
-
-        return self.graph
+        self.edges = None
 
     def cluster_leiden(
             self,
@@ -234,7 +351,8 @@ class EmbeddingClusterer:
             seed: Optional[int] = None
     ) -> np.ndarray:
         """
-        Apply Leiden clustering algorithm to the similarity graph.
+        Apply Leiden clustering algorithm to the similarity graph. After :meth:`build_similarity_edges`, the graph is
+        built from ``self.edges`` first.
 
         The call is python-igraph's ``Graph.community_leiden(objective_function="modularity", weights="weight",
         resolution=resolution, beta=0.01, n_iterations=n_iterations)``: modularity at ``resolution`` with the edge
@@ -261,8 +379,9 @@ class EmbeddingClusterer:
             Array of cluster IDs (one per chain), int32 below 2**31 chains
 
         Raises:
-            ValueError: ``n_iterations`` below 1, ``seed`` below 0, no graph, or a graph built by
-                build_similarity_graph with a negative kept weight (modularity needs non-negative edge weights)
+            ValueError: ``n_iterations`` below 1, ``seed`` below 0, no graph (nor edges), or a graph built by
+                build_similarity_graph or from build_similarity_edges with a negative kept weight (modularity needs
+                non-negative edge weights)
         """
         if n_iterations < 1:
             raise ValueError("n_iterations must be at least 1 (Leiden runs a fixed number of iterations).")
@@ -270,6 +389,8 @@ class EmbeddingClusterer:
             seed = operator.index(seed)
             if seed < 0:
                 raise ValueError("--seed must be at least 0.")
+        if self.graph is None and self.edges is not None:
+            self._graph_from_edges()
         if self.graph is None:
             raise ValueError("Graph not built. Call build_similarity_graph() first.")
         if self._min_weight_graph is not None and self._min_weight_graph() is self.graph and self.min_weight < 0:

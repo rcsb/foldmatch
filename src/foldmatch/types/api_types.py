@@ -89,6 +89,12 @@ class ClusterMethod(str, Enum):
     greedy = "greedy"    # greedy representatives in one streamed pass: memory grows with the chains
 
 
+class EdgeRule(str, Enum):
+    """Which k-NN hits become edges of the similarity graph (``fm-search cluster`` and ``similarity-graph``)."""
+    rescue = "rescue"    # lower's edges, plus each chain with none of them to its own hits (the default)
+    lower = "lower"      # an edge (i, j), i < j, from the search of the lower chain i only (FoldMatch up to 0.12.0)
+
+
 class FormatMode(str, Enum):
     """How a result file is laid out.
 

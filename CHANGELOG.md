@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Added
+
+- **`--edge-rule [rescue|lower]`** on `fm-search cluster` (`--method leiden`)
+  and `fm-search similarity-graph`: which k-NN hits become edges. `lower` is
+  the graph of FoldMatch up to 0.12.0: an edge (i, j), i < j, is kept only
+  from the search of the lower chain i. `rescue`, the new default, keeps the
+  same edges and, for each chain that gets none of them (its own hits at or
+  above `--threshold` are all lower chains, and no lower chain's search keeps
+  it; such chains sit mostly at the end of the database), adds an edge to
+  each of its own hits at or above `--threshold`, weighted by its own score.
+  It is decided in the same pass over the database: a chain's edges are all
+  known once its block is searched, so there is no second search. On
+  Swiss-Prot (573,010 chains, `--threshold` 0.8) it removed 4,616 / 1,892 /
+  551 / 207 singletons at `--max-neighbors` 30 / 50 / 100 / 300, for +1.59% /
+  +0.62% / +0.14% / +0.012% edges: all but one of the singletons that adding
+  every reverse edge removes, at +63% / +56% / +43% / +28%. `--edge-rule`
+  with `--method greedy`, which builds no graph, is refused (exit status 2,
+  before the database is loaded). The log of the graph build gives the
+  rescued chains and edges. Library: `foldmatch.types.api_types.EdgeRule`,
+  `edge_rule=` on `EmbeddingClusterer.build_similarity_graph` (default
+  `rescue`), and **`EmbeddingClusterer.build_similarity_edges`**, which finds
+  the edges with no igraph graph and returns a
+  `foldmatch.search.clustering.SimilarityEdges` (`n`, the `pair_blocks` and
+  `weight_blocks` of the search, `n_edges`, `min_weight`, `n_rescued_chains`,
+  `n_rescued_edges`, and `chunks()`), kept as `clusterer.edges` (a graph
+  built before is dropped); `cluster_leiden` builds the igraph graph from
+  them when there is no graph.
+
+### Changed
+
+- **BREAKING — `fm-search cluster` and `fm-search similarity-graph` build the
+  rescue graph by default** (`--edge-rule rescue`, above): wherever a chain
+  had no edge under the old rule but has hits at or above `--threshold`, the
+  graph, the GraphML file and the Leiden partition change. `--edge-rule
+  lower` gives the old graph, GraphML and partitions. On Swiss-Prot the two
+  rules' partitions agreed at AMI 0.987 at `--max-neighbors` 30 and 0.995 /
+  0.994 at 50 / 100, within seed noise at 50 and 100. Under `rescue` the
+  order of the edges in the graph (not the edges) depends on the block size
+  of the search, which `--max-neighbors` and the chain count fix: each
+  block's rescued edges follow its other edges. The same applies to
+  `EmbeddingClusterer.build_similarity_graph`, whose `edge_rule` defaults to
+  `rescue`.
+
 ## [0.12.0] - 2026-11-16
 
 ### Added

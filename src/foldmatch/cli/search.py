@@ -32,6 +32,7 @@ from foldmatch.types.api_types import (
     StructureFormat,
     Accelerator,
     ClusterMethod,
+    EdgeRule,
     Strategy,
     Granularity,
     IndexConfig,
@@ -122,6 +123,14 @@ _QUERY_MAX_EVALUE_HELP = (
 )
 
 _BLOSUM62_ONLY = " BLOSUM62 scoring only: refused with --scoring esm-codes."
+
+# cluster and similarity-graph: the edge rule (P9.CL D1); rescue's figures from the Swiss-Prot edge-rule study.
+_EDGE_RULE_HELP = (
+    "Which k-NN hits become edges. lower: an edge (i, j), i < j, is kept only from the search of the lower chain i "
+    f"(FoldMatch up to 0.12.0). {EdgeRule.rescue.value} (default): the same edges, plus, for each chain that would "
+    "get no edge that way, an edge to each of its own hits at or above --threshold; these chains sit mostly at the "
+    "end of the database. rescue adds about 0.1-1.6% edges at --max-neighbors 30-100 (measured on Swiss-Prot)."
+)
 
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
@@ -1576,6 +1585,9 @@ def cluster_database(
                  'this many neighbours above --threshold, clusters are bounded by it rather than by --threshold (see '
                  'the statistics).'
         )] = 1000,
+        edge_rule: Annotated[Optional[EdgeRule], typer.Option(
+            help=f'{_EDGE_RULE_HELP} --method leiden only (greedy builds no graph).'
+        )] = None,
         min_cluster_size: Annotated[Optional[int], typer.Option(
             help='Minimum cluster size to include in output (filters smaller clusters).'
         )] = None,
@@ -1597,6 +1609,8 @@ def cluster_database(
 
     set_log_level(log_level)
     method = _refuse_leiden_only_options(method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed)
+    _refuse_edge_rule_under_greedy(method, edge_rule)
+    edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
     if leiden_iterations is not None and leiden_iterations < 1:
         raise typer.BadParameter("--leiden-iterations must be at least 1.", param_hint="--leiden-iterations")
     if seed is not None and seed < 0:
@@ -1625,7 +1639,8 @@ def cluster_database(
         # Build similarity graph
         clusterer.build_similarity_graph(
             threshold=threshold,
-            max_neighbors=max_neighbors
+            max_neighbors=max_neighbors,
+            edge_rule=edge_rule
         )
         # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
         if clusterer.min_weight < 0:
@@ -1668,6 +1683,9 @@ def similarity_graph(
         max_neighbors: Annotated[int, typer.Option(
             help='Maximum number of neighbors to consider per chain.'
         )] = 1000,
+        edge_rule: Annotated[Optional[EdgeRule], typer.Option(
+            help=_EDGE_RULE_HELP
+        )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
             help='Use GPU for FAISS operations (requires faiss-gpu).'
         )] = False,
@@ -1678,6 +1696,7 @@ def similarity_graph(
     """Build and export a similarity graph from database embeddings."""
 
     set_log_level(log_level)
+    edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
     _refuse_max_neighbors_below_1(max_neighbors)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
@@ -1693,7 +1712,8 @@ def similarity_graph(
 
     graph = clusterer.build_similarity_graph(
         threshold=threshold,
-        max_neighbors=max_neighbors
+        max_neighbors=max_neighbors,
+        edge_rule=edge_rule
     )
 
     output_path = Path(output_file)
@@ -3301,6 +3321,14 @@ def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> Cluster
             f"--method greedy has no resolution or iteration count and is deterministic. "
             f"Remove {'it' if len(refused) == 1 else 'them'}, or use --method leiden.", param_hint="--method")
     return method
+
+
+def _refuse_edge_rule_under_greedy(method: ClusterMethod, edge_rule: Optional[EdgeRule]):
+    """``cluster``'s ``--edge-rule`` is refused under ``--method greedy``, which builds no graph (exit status 2), before
+    the database is loaded."""
+    if method is ClusterMethod.greedy and edge_rule is not None:
+        raise typer.BadParameter("--edge-rule chooses the edges of the similarity graph: --method greedy builds none. "
+                                 "Remove it, or use --method leiden.", param_hint="--method")
 
 
 def _refuse_max_neighbors_below_1(max_neighbors: int):

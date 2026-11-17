@@ -31,7 +31,7 @@ from foldmatch.search.clustering import EmbeddingClusterer
 from foldmatch.search.faiss_database import FaissEmbeddingDatabase
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, GREEDY_CLUSTER_OUTPUT_FIELDS, format_spec, \
     write_cluster_results
-from foldmatch.types.api_types import ClusterMethod, FormatMode, IndexConfig, IndexType
+from foldmatch.types.api_types import ClusterMethod, EdgeRule, FormatMode, IndexConfig, IndexType
 
 
 def _clustered_vectors(seed: int, n: int, d: int, n_centers: int, noise: float) -> np.ndarray:
@@ -895,17 +895,26 @@ class ClusterCommandTest(unittest.TestCase):
         self.assertGreater(len(ref.read_text().splitlines()), 100)
 
     def test_methods_route(self):
-        """greedy calls cluster_greedy and builds no graph; leiden (the default) the graph, then Leiden at resolution
-        1.0 when --resolution is not given and 10 iterations when --leiden-iterations is not given."""
+        """greedy calls cluster_greedy and builds no graph; leiden (the default) the graph, under the rescue edge rule
+        when --edge-rule is not given, then Leiden at resolution 1.0 when --resolution is not given and 10 iterations
+        when --leiden-iterations is not given."""
         out = str(Path(self.tmp.name) / "routed.tsv")
+        rescue = EdgeRule.rescue
         cases = [
-            (dict(), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
+            (dict(), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
                       mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.leiden, resolution=2.5, seed=4),
-             [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
+             [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
               mock.call.cluster_leiden(resolution=2.5, n_iterations=10, seed=4)]),
-            (dict(leiden_iterations=3), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9),
+            (dict(leiden_iterations=3), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
+                                                                          edge_rule=rescue),
                                          mock.call.cluster_leiden(resolution=1.0, n_iterations=3, seed=None)]),
+            (dict(edge_rule=EdgeRule.lower), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
+                                                                               edge_rule=EdgeRule.lower),
+                                              mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+            (dict(edge_rule="rescue"), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
+                                                                         edge_rule=rescue),
+                                        mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
         ]
         for kwargs, calls in cases:
@@ -1010,6 +1019,30 @@ class RefusalTest(unittest.TestCase):
                 output = self.refused(*base, *extra)
                 self.assertIn(f"Invalid value for --method: {message}", output)
                 self.assertEqual(output.count("Leiden option"), 1)
+
+    def test_edge_rule_under_greedy(self):
+        """--edge-rule under --method greedy: refused, either value; the Leiden options' refusal comes first."""
+        base = ("cluster", "--db-path", "no/such/db", "--method", "greedy")
+        message = ("Invalid value for --method: --edge-rule chooses the edges of the similarity graph: --method "
+                   "greedy builds none. Remove it, or use --method leiden.")
+        for value in ("rescue", "lower"):
+            with self.subTest(value=value):
+                self.assertIn(message, self.refused(*base, "--edge-rule", value))
+        output = self.refused(*base, "--edge-rule", "lower", "--seed", "1")
+        self.assertIn("--seed is a Leiden option", output)
+        self.assertNotIn("--edge-rule chooses", output)
+
+    def test_edge_rule_values(self):
+        """--edge-rule takes rescue or lower, under leiden and in similarity-graph; any other value is a usage error."""
+        for command in (("cluster",), ("cluster", "--method", "leiden"), ("similarity-graph",)):
+            for value in ("rescue", "lower"):
+                with self.subTest(command=command, value=value):
+                    result = self.invoke(*command, "--db-path", "no/such/db", "--edge-rule", value)
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertEqual(str(result.exception), "the database was loaded")
+            with self.subTest(command=command, value="symmetric"):
+                output = self.refused(*command, "--db-path", "no/such/db", "--edge-rule", "symmetric")
+                self.assertIn("--edge-rule", output)
 
     def test_max_neighbors_below_1(self):
         for command in (("cluster",), ("cluster", "--method", "leiden"), ("cluster", "--method", "greedy"),
