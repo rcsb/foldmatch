@@ -104,11 +104,13 @@ class IdentityControlTest(_Fixtures, unittest.TestCase):
         cls.tmp.cleanup()
 
     def test_identity(self):
-        cases = [("--threshold", "0.5", "--max-neighbors", "10", "--seed", "3"),
-                 ("--threshold", "0.5", "--max-neighbors", "10", "--seed", "3", "--edge-rule", "lower"),
+        # The same --resolution for both methods, whose defaults differ (1.0 and 20)
+        cases = [("--threshold", "0.5", "--max-neighbors", "10", "--seed", "3", "--resolution", "1"),
+                 ("--threshold", "0.5", "--max-neighbors", "10", "--seed", "3", "--edge-rule", "lower",
+                  "--resolution", "1"),
                  ("--threshold", "0.6", "--max-neighbors", "30", "--seed", "8", "--resolution", "2.5",
                   "--leiden-iterations", "4"),
-                 ("--threshold", "0.5", "--max-neighbors", "1000", "--seed", "1")]
+                 ("--threshold", "0.5", "--max-neighbors", "1000", "--seed", "1", "--resolution", "1")]
         for name, db_path in self.dbs.items():
             for i, options in enumerate(cases):
                 with self.subTest(db=name, options=options):
@@ -136,7 +138,7 @@ class IdentityControlTest(_Fixtures, unittest.TestCase):
                 work = self.folder / f"{name}.lib.work"
                 chained = EmbeddingClusterer(db_path)
                 clusters = chained.cluster_greedy_leiden(work, greedy_threshold=2.0, threshold=0.5, max_neighbors=10,
-                                                         seed=5)
+                                                         seed=5, resolution=1.0)
                 self.assertEqual(clusters.dtype, expected.dtype)
                 np.testing.assert_array_equal(clusters, expected)
                 np.testing.assert_array_equal(chained.chain_representatives, np.arange(len(expected)))
@@ -180,7 +182,9 @@ class TwoFamiliesTest(unittest.TestCase):
         cls.n = len(cls.vectors)
         cls.db_path = _build(cls.folder, "fam", cls.vectors, IndexType.flat)
         cls.clusterer = EmbeddingClusterer(cls.db_path)
-        cls.clusterer.cluster_greedy_leiden(cls.folder / "work", seed=2)
+        # At resolution 1, fewer final clusters than representatives (at the default 20 each of its 11 representatives
+        # is a cluster of its own)
+        cls.clusterer.cluster_greedy_leiden(cls.folder / "work", seed=2, resolution=1.0)
         greedy = EmbeddingClusterer(cls.db_path)
         greedy.cluster_greedy(threshold=0.9, max_neighbors=1000)
         cls.greedy_reps = greedy.representatives[greedy.clusters]

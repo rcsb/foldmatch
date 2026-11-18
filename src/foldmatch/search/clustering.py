@@ -48,6 +48,18 @@ _LEIDEN_ITERATIONS = 10
 _GREEDY_LEIDEN_GREEDY_THRESHOLD = 0.9
 _GREEDY_LEIDEN_GREEDY_MAX_NEIGHBORS = 1000
 _GREEDY_LEIDEN_MAX_NEIGHBORS = 100
+# The Leiden resolution of greedy-leiden (P9.CL D4): on this method over TrEMBL samples of 1M and 10M chains (greedy
+# 0.9, k = 100, P9.CL V3.1) gamma 20 left no cluster above 1.745% of the chains at 10M (at most one at 1M, against 4-7
+# at gamma 1) and agreed better with Pfam families than 10, at some cost on domain superfamilies.
+_GREEDY_LEIDEN_RESOLUTION = 20.0
+# Giant clusters in the statistics (P9.CL D4): more than 1.745% of the chains, compared in integers (size x 100,000 >
+# 1,745 x chains), the rule of the cascade tables the resolution default rests on (work/p9t10m/a/CASCADE_SIZE.md,
+# work/p9res/a/RES_SWEEP.md). Under greedy-leiden they are a WARNING from _GIANT_WARN_MIN_CHAINS chains on, the
+# smallest set that default was measured on (on small or redundant sets such a cluster is ordinary).
+_GIANT_PER_100K = 1_745
+_GIANT_WARN_MIN_CHAINS = 1_000_000
+# The largest cluster sizes the statistics give
+_LARGEST_CLUSTERS = 10
 # Leiden memory a representatives' graph edge, logged after greedy for the edge bound k x R (measured whole-run peaks:
 # igraph 64.2 B an edge on Swiss-Prot, 63.8 on TrEMBL; NetworKit's graph 32-34 B an edge plus about 70 B a node).
 _IGRAPH_BYTES_PER_EDGE = 64
@@ -1036,7 +1048,7 @@ class EmbeddingClusterer:
             threshold: float = 0.8,
             max_neighbors: int = _GREEDY_LEIDEN_MAX_NEIGHBORS,
             edge_rule: EdgeRule = EdgeRule.rescue,
-            resolution: float = 1.0,
+            resolution: float = _GREEDY_LEIDEN_RESOLUTION,
             n_iterations: int = _LEIDEN_ITERATIONS,
             seed: Optional[int] = None
     ) -> np.ndarray:
@@ -1077,7 +1089,7 @@ class EmbeddingClusterer:
             threshold: The edge threshold of the representatives' graph (default: 0.8)
             max_neighbors: The k of the representatives' graph (default: 100)
             edge_rule: The edge rule of the representatives' graph (default: rescue)
-            resolution: Leiden's resolution (default: 1.0)
+            resolution: Leiden's resolution (default: 20.0, chosen on TrEMBL samples of 1M and 10M chains)
             n_iterations: Leiden iterations, at least 1 (default: 10)
             seed: Leiden's random seed, at least 0
 
@@ -1236,9 +1248,14 @@ class EmbeddingClusterer:
             raise ValueError("Clustering not performed. Call cluster_leiden() or cluster_greedy() first.")
 
         # Memberships are 0..C-1 (Leiden, greedy and greedy-leiden)
-        sizes = np.bincount(self.clusters).tolist()
+        size_array = np.bincount(self.clusters)
+        sizes = size_array.tolist()
         n_clusters = len(sizes)
         n_singletons = sum(1 for s in sizes if s == 1)
+        n_chains = len(self.clusters)
+        # Giants: more than 1.745% of the chains, in integers
+        n_giants = int(np.count_nonzero(size_array.astype(np.int64) * 100_000 > _GIANT_PER_100K * n_chains))
+        largest = np.sort(size_array)[::-1][:_LARGEST_CLUSTERS].tolist()
 
         # Calculate modularity if graph exists and the partition is not greedy's, which is not computed on a graph;
         # greedy-leiden's is the one stored on the representatives' graph
@@ -1256,7 +1273,12 @@ class EmbeddingClusterer:
             'max_cluster_size': max(sizes),
             'mean_cluster_size': np.mean(sizes),
             'median_cluster_size': np.median(sizes),
-            'modularity': modularity
+            'modularity': modularity,
+            # The largest cluster's chains over all chains; the clusters with more than 1.745% of the chains; the
+            # _LARGEST_CLUSTERS largest sizes, largest first
+            'largest_cluster_share': largest[0] / n_chains,
+            'n_giant_clusters': n_giants,
+            'largest_cluster_sizes': largest,
         }
         if self.method == "greedy":
             stats.update({
@@ -1360,6 +1382,14 @@ class EmbeddingClusterer:
         logging.info(f"Cluster size (max):  {stats['max_cluster_size']}")
         logging.info(f"Cluster size (mean): {stats['mean_cluster_size']:.2f}")
         logging.info(f"Cluster size (med):  {stats['median_cluster_size']:.1f}")
+        # The largest clusters and the giants, under every method
+        n_chains = stats['n_chains']
+        giant_share = f"{_GIANT_PER_100K / 1000:g}%"
+        logging.info(f"Largest cluster:     {stats['largest_cluster_sizes'][0]} chains "
+                     f"({stats['largest_cluster_share']:.3%} of the chains)")
+        logging.info(f"Giant clusters (more than {giant_share} of the chains): {stats['n_giant_clusters']}")
+        logging.info(f"Largest {len(stats['largest_cluster_sizes'])} clusters: "
+                     + ", ".join(f"{s} ({s / n_chains:.3%})" for s in stats['largest_cluster_sizes']))
         if stats['modularity'] is not None:
             if method == "greedy-leiden":
                 logging.info(f"Modularity (representatives' graph): {stats['modularity']:.4f}")
@@ -1367,6 +1397,13 @@ class EmbeddingClusterer:
                 logging.info(f"Modularity:          {stats['modularity']:.4f}")
         if method == "greedy":
             self._print_greedy_statistics(stats)
+        # Giants are a WARNING under greedy-leiden only, on sets as large as those its resolution default was measured
+        # on: on direct graphs every measured default run has giants, and a higher resolution there costs domain labels
+        n_giants = stats['n_giant_clusters']
+        if method == "greedy-leiden" and n_chains >= _GIANT_WARN_MIN_CHAINS and n_giants:
+            held = "clusters each hold" if n_giants > 1 else "cluster holds"
+            logging.warning(f"{n_giants} {held} more than {giant_share} of the chains; a higher --resolution splits "
+                            f"large clusters (measured on TrEMBL samples of 1M-10M chains).")
 
     @staticmethod
     def _print_greedy_statistics(stats: dict):

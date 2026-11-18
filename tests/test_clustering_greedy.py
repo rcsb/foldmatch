@@ -899,15 +899,15 @@ class ClusterCommandTest(unittest.TestCase):
         default) the graph, under the rescue edge rule when --edge-rule is not given, then Leiden at resolution 1.0
         when --resolution is not given and 10 iterations when --leiden-iterations is not given; greedy-leiden calls
         cluster_greedy_leiden with the per-method defaults (greedy threshold 0.9, greedy k 1000, graph k 100 when
-        --max-neighbors is not given, rescue, resolution 1.0, 10 iterations). Every method makes the clusterer with
-        --nprobe (None when not given)."""
+        --max-neighbors is not given, rescue, resolution 20.0 when --resolution is not given, 10 iterations); given
+        values pass through. Every method makes the clusterer with --nprobe (None when not given)."""
         out = str(Path(self.tmp.name) / "routed.tsv")
         work = str(Path(self.tmp.name) / "routed-work")
         rescue = EdgeRule.rescue
 
         def greedy_leiden(**kwargs):
             call = dict(work_folder=work, greedy_threshold=0.9, greedy_max_neighbors=1000, threshold=0.7,
-                        max_neighbors=9, edge_rule=rescue, resolution=1.0, n_iterations=10, seed=None)
+                        max_neighbors=9, edge_rule=rescue, resolution=20.0, n_iterations=10, seed=None)
             return mock.call.cluster_greedy_leiden(**{**call, **kwargs})
 
         cases = [
@@ -942,9 +942,11 @@ class ClusterCommandTest(unittest.TestCase):
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work), [greedy_leiden()]),
             (dict(method="greedy-leiden", work_folder=work, max_neighbors=None), [greedy_leiden(max_neighbors=100)]),
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work, nprobe=3, greedy_threshold=0.95,
-                  greedy_max_neighbors=50, edge_rule=EdgeRule.lower, resolution=20.0, leiden_iterations=4, seed=8),
+                  greedy_max_neighbors=50, edge_rule=EdgeRule.lower, resolution=7.0, leiden_iterations=4, seed=8),
              [greedy_leiden(greedy_threshold=0.95, greedy_max_neighbors=50, edge_rule=EdgeRule.lower,
-                            resolution=20.0, n_iterations=4, seed=8)]),
+                            resolution=7.0, n_iterations=4, seed=8)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work, resolution=1.0),
+             [greedy_leiden(resolution=1.0)]),
         ]
         for kwargs, calls in cases:
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):

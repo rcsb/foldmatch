@@ -76,7 +76,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   (default 1000, also the greedy cluster-size cap), then Leiden on the
   representatives' similarity graph at `--threshold` (default 0.8),
   `--max-neighbors` (default **100** under this method), `--edge-rule`,
-  `--resolution`, `--leiden-iterations` and `--seed`; every chain takes its
+  `--resolution` (default **20** under this method, below),
+  `--leiden-iterations` and `--seed`; every chain takes its
   representative's cluster. For collections whose direct graph does not fit
   in memory. The representatives' database is copied from the parent
   (`FaissEmbeddingDatabase.subset`, above: the parent's PQ codes, or its
@@ -99,7 +100,7 @@ While the major version is `0`, breaking changes are released in a minor bump.
   refused under this method for now (the representatives' database is built
   from the CPU index). Library: `EmbeddingClusterer.cluster_greedy_leiden(
   work_folder, greedy_threshold=0.9, greedy_max_neighbors=1000,
-  threshold=0.8, max_neighbors=100, edge_rule=rescue, resolution=1.0,
+  threshold=0.8, max_neighbors=100, edge_rule=rescue, resolution=20.0,
   n_iterations=10, seed=None)`, which sets `clusters`,
   `chain_representatives` (each chain's representative, a chain index),
   `modularity` and `graph_stats`, with `representatives` None.
@@ -164,6 +165,27 @@ While the major version is `0`, breaking changes are released in a minor bump.
   --method greedy." instead of "--method leiden only.".
 - `fm-search cluster --max-neighbors` defaults to None, resolved by method:
   1000 under `leiden` and `greedy` (unchanged), 100 under `greedy-leiden`.
+- `fm-search cluster --resolution` defaults to None, resolved by method: 1.0
+  under `leiden` (unchanged) and **20** under `greedy-leiden`
+  (`foldmatch.search.clustering._GREEDY_LEIDEN_RESOLUTION`). On
+  `greedy-leiden` over TrEMBL samples of 1M and 10M chains (greedy 0.9,
+  `--max-neighbors` 100), 20 left no cluster above 1.745% of the chains at
+  10M (at most one at 1M, against 4-7 at resolution 1) and agreed with Pfam
+  families better than 10 (+0.008 to +0.014 AMI), at a cost of up to 0.007
+  on Gene3D and SUPERFAMILY; a lower value such as 10 keeps more
+  superfamilies whole.
+  `EmbeddingClusterer.cluster_leiden` keeps 1.0.
+- The statistics log of `fm-search cluster` gains, under every method, the
+  largest cluster's size and share of the chains, the number of giant
+  clusters (more than 1.745% of the chains, compared in integers: size x
+  100,000 > 1,745 x chains, the rule of the cascade tables above) and the 10
+  largest cluster sizes with their shares, at INFO. Under `--method
+  greedy-leiden`, with 1,000,000 chains or more, giants are also a WARNING
+  that a higher `--resolution` splits large clusters; under `leiden` there
+  is no such warning (on direct graphs every measured run at the default
+  had giants, and a higher resolution there cost domain labels).
+  `get_cluster_statistics` gains `largest_cluster_share`,
+  `n_giant_clusters` and `largest_cluster_sizes`.
 - The greedy statistics (`get_cluster_statistics`) gain `n_representatives`,
   and the saturated share is printed over it (under `--method greedy` it
   equals the cluster count, so the log is unchanged).

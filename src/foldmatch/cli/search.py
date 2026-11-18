@@ -1578,7 +1578,11 @@ def cluster_database(
                  'threshold of the representatives\' graph (its kept scores must be at least 0).'
         )] = 0.8,
         resolution: Annotated[Optional[float], typer.Option(
-            help='Leiden resolution parameter (higher = more clusters). Default: 1.0. Refused with --method greedy.'
+            help='Leiden resolution parameter (higher = more, smaller clusters). Default: 1.0 with --method leiden; '
+                 '20 with --method greedy-leiden (measured on TrEMBL samples of 1M-10M chains: largest cluster about '
+                 '2% of the chains or less; Pfam family agreement higher than at 10, best at 50, the top of the '
+                 'measured grid; a lower value such as 10 keeps more superfamilies whole). Refused with --method '
+                 'greedy.'
         )] = None,
         leiden_iterations: Annotated[Optional[int], typer.Option(
             help='Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured 1M-chain graphs '
@@ -1681,7 +1685,8 @@ def cluster_database(
     # Initialize clusterer
     logging.info("Initializing clusterer...")
     clusterer = _clusterer(db_path, use_gpu_index, nprobe)
-    resolution = 1.0 if resolution is None else resolution
+    if resolution is None:
+        resolution = clustering._GREEDY_LEIDEN_RESOLUTION if greedy_leiden else 1.0
     leiden_iterations = clustering._LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations
 
     try:
