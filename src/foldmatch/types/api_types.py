@@ -87,6 +87,7 @@ class ClusterMethod(str, Enum):
     """Clustering method of ``fm-search cluster``."""
     leiden = "leiden"    # Leiden on the similarity graph: memory grows with the edges (the default)
     greedy = "greedy"    # greedy representatives in one streamed pass: memory grows with the chains
+    greedy_leiden = "greedy-leiden"  # greedy representatives, then Leiden on the representatives' graph
 
 
 class EdgeRule(str, Enum):

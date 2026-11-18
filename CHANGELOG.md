@@ -10,14 +10,15 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 ### Added
 
-- **`--edge-rule [rescue|lower]`** on `fm-search cluster` (`--method leiden`)
-  and `fm-search similarity-graph`: which k-NN hits become edges. `lower` is
-  the graph of FoldMatch up to 0.12.0: an edge (i, j), i < j, is kept only
-  from the search of the lower chain i. `rescue`, the new default, keeps the
-  same edges and, for each chain that gets none of them (its own hits at or
-  above `--threshold` are all lower chains, and no lower chain's search keeps
-  it; such chains sit mostly at the end of the database), adds an edge to
-  each of its own hits at or above `--threshold`, weighted by its own score.
+- **`--edge-rule [rescue|lower]`** on `fm-search cluster` (`--method leiden`;
+  `greedy-leiden`, below, too) and `fm-search similarity-graph`: which k-NN
+  hits become edges. `lower` is the graph of FoldMatch up to 0.12.0: an edge
+  (i, j), i < j, is kept only from the search of the lower chain i.
+  `rescue`, the new default, keeps the same edges and, for each chain that
+  gets none of them (its own hits at or above `--threshold` are all lower
+  chains, and no lower chain's search keeps it; such chains sit mostly at
+  the end of the database), adds an edge to each of its own hits at or above
+  `--threshold`, weighted by its own score.
   It is decided in the same pass over the database: a chain's edges are all
   known once its block is searched, so there is no second search. On
   Swiss-Prot (573,010 chains, `--threshold` 0.8) it removed 4,616 / 1,892 /
@@ -70,6 +71,69 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `auto` one that is hnsw included); a database on the GPU or not loaded;
   the parent's own files as the target. A database already at the target is
   refused (`FileExistsError`) unless `overwrite=True`.
+- **`fm-search cluster --method greedy-leiden`**: greedy representatives at
+  **`--greedy-threshold`** (default 0.9) with **`--greedy-max-neighbors`**
+  (default 1000, also the greedy cluster-size cap), then Leiden on the
+  representatives' similarity graph at `--threshold` (default 0.8),
+  `--max-neighbors` (default **100** under this method), `--edge-rule`,
+  `--resolution`, `--leiden-iterations` and `--seed`; every chain takes its
+  representative's cluster. For collections whose direct graph does not fit
+  in memory. The representatives' database is copied from the parent
+  (`FaissEmbeddingDatabase.subset`, above: the parent's PQ codes, or its
+  vectors on `flat`) and searched at the same nprobe (`--nprobe` applies to
+  both searches); its graph's edges are written to the work folder and read
+  back memory-mapped; both FAISS indexes are released before Leiden. The
+  output has the four columns of `--method greedy`: `cluster_id` and
+  `cluster_size` are the final cluster, `representative` the chain's greedy
+  representative (its own id on a representative's row); clusters are
+  numbered over the chains by decreasing size, ties by the smallest chain
+  index. The statistics give the greedy step (representatives, chains
+  searched, saturated representatives over the representatives, greedy
+  clusters at the cap), the representatives' graph (nodes, edges, rescued
+  chains and edges) and its modularity, "Modularity (representatives'
+  graph)". With `--greedy-threshold` above every score every chain is its
+  own representative and the file's first three columns are `--method
+  leiden`'s at the same settings, byte for byte (checked on `flat` and
+  `ivf_pq` databases). An `hnsw` database (an `auto` one that is hnsw
+  included) is refused after the load (exit status 2); `--use-gpu-index` is
+  refused under this method for now (the representatives' database is built
+  from the CPU index). Library: `EmbeddingClusterer.cluster_greedy_leiden(
+  work_folder, greedy_threshold=0.9, greedy_max_neighbors=1000,
+  threshold=0.8, max_neighbors=100, edge_rule=rescue, resolution=1.0,
+  n_iterations=10, seed=None)`, which sets `clusters`,
+  `chain_representatives` (each chain's representative, a chain index),
+  `modularity` and `graph_stats`, with `representatives` None.
+- **`--work-folder`** on `fm-search cluster`: required by `--method
+  greedy-leiden`, optional with `--method greedy`, refused with `--method
+  leiden`. It holds `run.json` (the FoldMatch and FAISS versions, the
+  parent's path, chain count, the sha256 of its `.index` and `.metadata`
+  files and its `.invlists` size, the effective nprobe (the cells probed:
+  an `--nprobe` above the cell count is recorded as the cell count), the
+  greedy and graph settings as resolved, and each run's steps with FAISS's
+  thread count),
+  `greedy.state.npz` (written every 900 s of greedy and at its end, to a
+  temporary name, fsynced, then renamed; each checkpoint logs the rate in
+  searched chains a second), the representatives' database with a
+  `representatives.done` marker, and the graph's edges (`graph.pairs.i32`,
+  `graph.weights.f32`, `graph.json`, `graph.done`). Running the same command
+  again resumes greedy from its last state, reuses every step with its
+  marker, rebuilds the representatives' database without its marker, and
+  restarts the graph from its first block without `graph.done`; Leiden,
+  propagation and export always run, so a rerun at another `--resolution`,
+  `--leiden-iterations` or `--seed` searches nothing. A work folder of
+  `--method greedy` can be continued by `--method greedy-leiden` at the same
+  greedy settings (`--greedy-threshold` and `--greedy-max-neighbors` equal
+  to its `--threshold` and `--max-neighbors`). Refused (exit status 2): a
+  recorded setting or parent file that differs (each named with both
+  values; `--nprobe` equal to the stored value is no difference), a folder
+  with work files but no `run.json`, or a `run.json` of another layout. A
+  moved parent with the same files is accepted; another FAISS thread count
+  or FoldMatch or FAISS version is a WARNING. `--output-file` may be inside
+  the work folder, but not one of its files (exit status 1). Library:
+  `work_folder=` on `EmbeddingClusterer.cluster_greedy` and on
+  `EmbeddingClusterer.build_similarity_edges` (the edges appended to the
+  files block by block and returned memory-mapped), and
+  `SimilarityEdges.from_folder`.
 
 ### Changed
 
@@ -85,6 +149,24 @@ While the major version is `0`, breaking changes are released in a minor bump.
   block's rescued edges follow its other edges. The same applies to
   `EmbeddingClusterer.build_similarity_graph`, whose `edge_rule` defaults to
   `rescue`.
+- **BREAKING — `fm-search cluster`'s refusals of options a method does not
+  take are one check with one message**: every such option given
+  (`--resolution`, `--leiden-iterations`, `--seed`, `--edge-rule`,
+  `--greedy-threshold`,
+  `--greedy-max-neighbors`, `--work-folder`, and `--use-gpu-index` under
+  `greedy-leiden`) is named with the methods that take it, for example
+  "--method greedy does not take --resolution (--method leiden or
+  greedy-leiden), --seed (--method leiden or greedy-leiden). Remove them, or
+  use a method that takes them." (exit status 2, before the database is
+  loaded). This replaces the message "... is a Leiden option: --method greedy
+  has no resolution or iteration count and is deterministic.". The help of
+  `--resolution`, `--leiden-iterations` and `--seed` now ends "Refused with
+  --method greedy." instead of "--method leiden only.".
+- `fm-search cluster --max-neighbors` defaults to None, resolved by method:
+  1000 under `leiden` and `greedy` (unchanged), 100 under `greedy-leiden`.
+- The greedy statistics (`get_cluster_statistics`) gain `n_representatives`,
+  and the saturated share is printed over it (under `--method greedy` it
+  equals the cluster count, so the log is unchanged).
 
 ### Fixed
 

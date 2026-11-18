@@ -1551,8 +1551,9 @@ def show_statistics(
 
 @app.command(
     name="cluster",
-    help="Cluster database embeddings: Leiden on the similarity graph (default), or greedy representatives in one "
-         "streamed pass (--method greedy)."
+    help="Cluster database embeddings: Leiden on the similarity graph (default), greedy representatives in one "
+         "streamed pass (--method greedy), or greedy representatives then Leiden on the representatives' graph "
+         "(--method greedy-leiden)."
 )
 def cluster_database(
         db_path: Annotated[str, typer.Option(
@@ -1563,39 +1564,61 @@ def cluster_database(
                  'of iterations, --leiden-iterations; memory grows with the edges); '
                  'greedy picks representatives in one streamed pass over the database (memory grows with the chains, '
                  'searches only chains no representative has taken; for collections whose graph does not fit in '
-                 'memory).'
+                 'memory); '
+                 'greedy-leiden: greedy representatives at --greedy-threshold, then Leiden on the representatives\' '
+                 'similarity graph (--threshold, --max-neighbors, --resolution); every chain takes its '
+                 'representative\'s cluster. For collections whose direct graph does not fit in memory. Needs '
+                 '--work-folder and an ivf_pq or flat database.'
         )] = ClusterMethod.leiden,
         threshold: Annotated[float, typer.Option(
             help='Similarity threshold (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ '
                  'estimates): with --method leiden, the edge threshold, and the kept scores must be at least 0 '
                  '(Leiden\'s modularity needs non-negative edge weights); with --method greedy, a representative takes '
-                 'the still-unclustered neighbours scoring at least this.'
+                 'the still-unclustered neighbours scoring at least this; with --method greedy-leiden, the edge '
+                 'threshold of the representatives\' graph (its kept scores must be at least 0).'
         )] = 0.8,
         resolution: Annotated[Optional[float], typer.Option(
-            help='Leiden resolution parameter (higher = more clusters). Default: 1.0. --method leiden only.'
+            help='Leiden resolution parameter (higher = more clusters). Default: 1.0. Refused with --method greedy.'
         )] = None,
         leiden_iterations: Annotated[Optional[int], typer.Option(
             help='Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured 1M-chain graphs '
                  'agreed with Leiden run to convergence within seed noise; fewer are faster, with somewhat noisier '
-                 'partitions. --method leiden only.'
+                 'partitions. Refused with --method greedy.'
         )] = None,
         output_file: Annotated[str, typer.Option(
             help='Path to save cluster assignments, as tab-separated rows with '
                  f'no header: {", ".join(CLUSTER_OUTPUT_FIELDS)} (--method leiden) or '
-                 f'{", ".join(GREEDY_CLUSTER_OUTPUT_FIELDS)} (--method greedy, the representative\'s chain id last); '
+                 f'{", ".join(GREEDY_CLUSTER_OUTPUT_FIELDS)} (--method greedy, the representative\'s chain id last; '
+                 '--method greedy-leiden, the final cluster and the chain\'s greedy representative); '
                  'cluster_id 0 is the largest cluster.'
         )] = "clusters.tsv",
-        max_neighbors: Annotated[int, typer.Option(
+        max_neighbors: Annotated[Optional[int], typer.Option(
             help='Maximum number of neighbors to consider per chain. With --method greedy, the neighbours a '
                  'representative takes from, so also a cluster\'s size cap (this + 1); when most representatives have '
                  'this many neighbours above --threshold, clusters are bounded by it rather than by --threshold (see '
-                 'the statistics).'
-        )] = 1000,
+                 'the statistics). Default: 1000; 100 with --method greedy-leiden, where it sets the representatives\' '
+                 'graph.'
+        )] = None,
+        greedy_threshold: Annotated[Optional[float], typer.Option(
+            help='With --method greedy-leiden, a representative takes the still-unclustered chains scoring at least '
+                 'this. Default: 0.9. Refused with the other methods (use --threshold).'
+        )] = None,
+        greedy_max_neighbors: Annotated[Optional[int], typer.Option(
+            help='With --method greedy-leiden, the neighbours a representative takes from, so also the greedy '
+                 'cluster-size cap. Default: 1000.'
+        )] = None,
         edge_rule: Annotated[Optional[EdgeRule], typer.Option(
-            help=f'{_EDGE_RULE_HELP} --method leiden only (greedy builds no graph).'
+            help=f'{_EDGE_RULE_HELP} --method leiden and greedy-leiden (greedy builds no graph).'
         )] = None,
         nprobe: Annotated[Optional[int], typer.Option(
             help=_CLUSTER_NPROBE_HELP
+        )] = None,
+        work_folder: Annotated[Optional[str], typer.Option(
+            help='A folder for the intermediate results of --method greedy-leiden (greedy labels, the '
+                 'representatives\' database, the representatives\' graph), so that a run that stops can be resumed '
+                 'by running the same command again, and Leiden can be run again at another --resolution without the '
+                 'searches. With --method greedy, it keeps the greedy labels for a resume. It may hold tens of GiB at '
+                 '200M chains: put it on scratch.'
         )] = None,
         min_cluster_size: Annotated[Optional[int], typer.Option(
             help='Minimum cluster size to include in output (filters smaller clusters).'
@@ -1605,7 +1628,7 @@ def cluster_database(
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
             help='Random seed of the Leiden step: the same seed gives the same clusters; without it each run may '
-                 'differ. At least 0. --method leiden only (greedy is deterministic).'
+                 'differ. At least 0. Refused with --method greedy (deterministic).'
         )] = None,
         format_mode: Annotated[FormatMode, typer.Option(
             help=_FORMAT_MODE_HELP
@@ -1614,53 +1637,96 @@ def cluster_database(
             help='Logging level.'
         )] = LogLevel.info
 ):
-    """Cluster database embeddings: Leiden on the similarity graph, or greedy representatives in one streamed pass."""
+    """Cluster database embeddings: Leiden on the similarity graph, greedy representatives in one streamed pass, or
+    greedy representatives then Leiden on the representatives' graph."""
 
     set_log_level(log_level)
-    method = _refuse_leiden_only_options(method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed)
-    _refuse_edge_rule_under_greedy(method, edge_rule)
+    # The options a method does not take, given (not None), in one message; then the per-method defaults; then the
+    # range checks; then the load (P9.CL D7)
+    method = _refuse_method_options(
+        method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed, edge_rule=edge_rule,
+        greedy_threshold=greedy_threshold, greedy_max_neighbors=greedy_max_neighbors, work_folder=work_folder,
+        use_gpu_index=use_gpu_index or None)
+    from foldmatch.search import clustering
+    greedy_leiden = method is ClusterMethod.greedy_leiden
+    if greedy_leiden and work_folder is None:
+        raise typer.BadParameter("--method greedy-leiden needs --work-folder: a folder for its intermediate results "
+                                 "(greedy labels, the representatives' database, the representatives' graph), from "
+                                 "which a run that stops is resumed.", param_hint="--work-folder")
+    if max_neighbors is None:
+        max_neighbors = clustering._GREEDY_LEIDEN_MAX_NEIGHBORS if greedy_leiden else 1000
+    if greedy_threshold is None:
+        greedy_threshold = clustering._GREEDY_LEIDEN_GREEDY_THRESHOLD
+    if greedy_max_neighbors is None:
+        greedy_max_neighbors = clustering._GREEDY_LEIDEN_GREEDY_MAX_NEIGHBORS
     edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
     if leiden_iterations is not None and leiden_iterations < 1:
         raise typer.BadParameter("--leiden-iterations must be at least 1.", param_hint="--leiden-iterations")
     if seed is not None and seed < 0:
         raise typer.BadParameter("--seed must be at least 0.", param_hint="--seed")
     _refuse_max_neighbors_below_1(max_neighbors)
+    if greedy_max_neighbors < 1:
+        raise typer.BadParameter("--greedy-max-neighbors must be at least 1.", param_hint="--greedy-max-neighbors")
     _refuse_nprobe_below_1(nprobe)
-    _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
+    if work_folder is not None and os.path.exists(work_folder) and not os.path.isdir(work_folder):
+        raise typer.BadParameter(f"{work_folder} is a file, not a folder.", param_hint="--work-folder")
+    _refuse_output_over_inputs(
+        output_file, databases=[("the database", db_path)],
+        files=[] if work_folder is None else [("the work file", Path(work_folder) / name)
+                                              for name in clustering.WORK_FOLDER_FILES])
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
 
     # Initialize clusterer
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import _LEIDEN_ITERATIONS
     clusterer = _clusterer(db_path, use_gpu_index, nprobe)
+    resolution = 1.0 if resolution is None else resolution
+    leiden_iterations = clustering._LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations
 
-    if method is ClusterMethod.greedy:
-        # Greedy representatives, streamed: no graph
-        clusterer.cluster_greedy(
-            threshold=threshold,
-            max_neighbors=max_neighbors
-        )
-    else:
-        # Build similarity graph
-        clusterer.build_similarity_graph(
-            threshold=threshold,
-            max_neighbors=max_neighbors,
-            edge_rule=edge_rule
-        )
-        # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
-        if clusterer.min_weight < 0:
-            raise typer.BadParameter(f"with --method leiden, Leiden's modularity needs non-negative edge weights, and "
-                                     f"this --threshold kept a score of {clusterer.min_weight:.4g}. Use a --threshold "
-                                     f"of 0 or more, or --method greedy.", param_hint="--threshold")
+    try:
+        if method is ClusterMethod.greedy:
+            # Greedy representatives, streamed: no graph
+            clusterer.cluster_greedy(
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                work_folder=work_folder
+            )
+        elif greedy_leiden:
+            clusterer.cluster_greedy_leiden(
+                work_folder=work_folder,
+                greedy_threshold=greedy_threshold,
+                greedy_max_neighbors=greedy_max_neighbors,
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                edge_rule=edge_rule,
+                resolution=resolution,
+                n_iterations=leiden_iterations,
+                seed=seed
+            )
+        else:
+            # Build similarity graph
+            clusterer.build_similarity_graph(
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                edge_rule=edge_rule
+            )
+            # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
+            if clusterer.min_weight < 0:
+                _refuse_negative_weights(method, clusterer.min_weight)
 
-        # Perform clustering
-        clusterer.cluster_leiden(
-            resolution=1.0 if resolution is None else resolution,
-            n_iterations=_LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations,
-            seed=seed
-        )
+            # Perform clustering
+            clusterer.cluster_leiden(
+                resolution=resolution,
+                n_iterations=leiden_iterations,
+                seed=seed
+            )
+    except clustering._MethodNotApplicable as exc:
+        raise typer.BadParameter(str(exc), param_hint="--method") from None
+    except clustering._WorkFolderRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint="--work-folder") from None
+    except clustering._NegativeEdgeWeights as exc:
+        _refuse_negative_weights(method, exc.min_weight)
 
     # Display statistics
     clusterer.print_statistics()
@@ -1671,6 +1737,18 @@ def cluster_database(
         min_cluster_size=min_cluster_size,
         format_mode=format_mode,
     )
+
+
+def _refuse_negative_weights(method: ClusterMethod, min_weight: float):
+    """Leiden's modularity needs non-negative edge weights: a graph (under greedy-leiden, the representatives') whose
+    kept scores include a negative one is refused after its build (exit status 2), naming --threshold. Under
+    greedy-leiden the work folder records this --threshold, so the message says that a rerun needs a new one."""
+    graph = "" if method is ClusterMethod.leiden else " on the representatives' graph"
+    folder = ("" if method is ClusterMethod.leiden else
+              " with a new --work-folder (this one records this --threshold, so greedy runs again)")
+    raise typer.BadParameter(f"with --method {method.value}, Leiden's modularity needs non-negative edge weights, and "
+                             f"this --threshold kept a score of {min_weight:.4g}{graph}. Use a --threshold of 0 or "
+                             f"more{folder}, or --method greedy.", param_hint="--threshold")
 
 
 @app.command(
@@ -3308,34 +3386,49 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
     return QueryStage2Options(scoring=scoring, **values)
 
 
-#: The ``cluster`` options of the Leiden route only, refused under ``--method greedy`` (T5: exit status 2).
-_LEIDEN_ONLY_OPTIONS = (("resolution", "--resolution"), ("leiden_iterations", "--leiden-iterations"),
-                        ("seed", "--seed"))
+#: ``cluster``'s options that only some ``--method`` values take (P9.CL D7): (parameter name, flag, the methods that
+#: take it). Every other option is taken by every method. ``--use-gpu-index`` under greedy-leiden waits for the GPU
+#: path that keeps the CPU index (P9.CL D10).
+_METHOD_OPTIONS = (
+    ("resolution", "--resolution", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_iterations", "--leiden-iterations", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("seed", "--seed", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("edge_rule", "--edge-rule", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("greedy_threshold", "--greedy-threshold", (ClusterMethod.greedy_leiden,)),
+    ("greedy_max_neighbors", "--greedy-max-neighbors", (ClusterMethod.greedy_leiden,)),
+    ("work_folder", "--work-folder", (ClusterMethod.greedy, ClusterMethod.greedy_leiden)),
+    ("use_gpu_index", "--use-gpu-index", (ClusterMethod.leiden, ClusterMethod.greedy)),
+)
+
+#: What a refused option's entry adds, by (method, parameter name)
+_METHOD_OPTION_NOTES = {
+    (ClusterMethod.greedy, "greedy_threshold"): "--method greedy takes its threshold from --threshold",
+    (ClusterMethod.greedy, "greedy_max_neighbors"): "--method greedy takes its neighbours from --max-neighbors",
+    (ClusterMethod.greedy_leiden, "use_gpu_index"): "the representatives' database is built from the CPU index; GPU "
+                                                    "search is not supported for this method yet",
+}
 
 
-def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
-    """``cluster``'s ``--method``: under greedy, every Leiden-only option given (not None; :data:`_LEIDEN_ONLY_OPTIONS`)
-    is refused in one ``typer.BadParameter`` (exit status 2), before the database is loaded. Returns the method."""
+def _refuse_method_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
+    """``cluster``'s ``--method``, and every option of :data:`_METHOD_OPTIONS` given (not None) that it does not take,
+    refused in one ``typer.BadParameter`` (exit status 2) that names each one and the methods that take it, before the
+    database is loaded. Returns the method."""
     try:
         method = ClusterMethod(method)
     except ValueError:
         raise typer.BadParameter(f"{method!r} is not a clustering method; expected one of "
                                  f"{', '.join(m.value for m in ClusterMethod)}.", param_hint="--method") from None
-    refused = [flag for name, flag in _LEIDEN_ONLY_OPTIONS if given.get(name) is not None]
-    if method is ClusterMethod.greedy and refused:
-        raise typer.BadParameter(
-            f"{', '.join(refused)} {'is a Leiden option' if len(refused) == 1 else 'are Leiden options'}: "
-            f"--method greedy has no resolution or iteration count and is deterministic. "
-            f"Remove {'it' if len(refused) == 1 else 'them'}, or use --method leiden.", param_hint="--method")
+    refused = []
+    for name, flag, methods in _METHOD_OPTIONS:
+        if given.get(name) is None or method in methods:
+            continue
+        note = _METHOD_OPTION_NOTES.get((method, name))
+        refused.append(f"{flag} (--method {' or '.join(m.value for m in methods)}{'; ' + note if note else ''})")
+    if refused:
+        pronoun = "it" if len(refused) == 1 else "them"
+        raise typer.BadParameter(f"--method {method.value} does not take {', '.join(refused)}. Remove {pronoun}, or "
+                                 f"use a method that takes {pronoun}.", param_hint="--method")
     return method
-
-
-def _refuse_edge_rule_under_greedy(method: ClusterMethod, edge_rule: Optional[EdgeRule]):
-    """``cluster``'s ``--edge-rule`` is refused under ``--method greedy``, which builds no graph (exit status 2), before
-    the database is loaded."""
-    if method is ClusterMethod.greedy and edge_rule is not None:
-        raise typer.BadParameter("--edge-rule chooses the edges of the similarity graph: --method greedy builds none. "
-                                 "Remove it, or use --method leiden.", param_hint="--method")
 
 
 def _refuse_nprobe_below_1(nprobe: Optional[int]):

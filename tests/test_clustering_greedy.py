@@ -497,7 +497,7 @@ class SizeCapTest(_GreedyCase):
         stats = clusterer.get_cluster_statistics()
         for n_saturated, warned in ((2, False), (3, True)):
             with self.subTest(n_saturated=n_saturated):
-                four = dict(stats, n_clusters=4, n_saturated=n_saturated)
+                four = dict(stats, n_representatives=4, n_saturated=n_saturated)
                 with mock.patch.object(clusterer, "get_cluster_statistics", return_value=four), \
                         self.assertLogs(level="INFO") as logs:
                     clusterer.print_statistics()
@@ -895,11 +895,21 @@ class ClusterCommandTest(unittest.TestCase):
         self.assertGreater(len(ref.read_text().splitlines()), 100)
 
     def test_methods_route(self):
-        """greedy calls cluster_greedy and builds no graph; leiden (the default) the graph, under the rescue edge rule
-        when --edge-rule is not given, then Leiden at resolution 1.0 when --resolution is not given and 10 iterations
-        when --leiden-iterations is not given. Both make the clusterer with --nprobe (None when not given)."""
+        """greedy calls cluster_greedy (with --work-folder, None when not given) and builds no graph; leiden (the
+        default) the graph, under the rescue edge rule when --edge-rule is not given, then Leiden at resolution 1.0
+        when --resolution is not given and 10 iterations when --leiden-iterations is not given; greedy-leiden calls
+        cluster_greedy_leiden with the per-method defaults (greedy threshold 0.9, greedy k 1000, graph k 100 when
+        --max-neighbors is not given, rescue, resolution 1.0, 10 iterations). Every method makes the clusterer with
+        --nprobe (None when not given)."""
         out = str(Path(self.tmp.name) / "routed.tsv")
+        work = str(Path(self.tmp.name) / "routed-work")
         rescue = EdgeRule.rescue
+
+        def greedy_leiden(**kwargs):
+            call = dict(work_folder=work, greedy_threshold=0.9, greedy_max_neighbors=1000, threshold=0.7,
+                        max_neighbors=9, edge_rule=rescue, resolution=1.0, n_iterations=10, seed=None)
+            return mock.call.cluster_greedy_leiden(**{**call, **kwargs})
+
         cases = [
             (dict(), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
                       mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
@@ -915,26 +925,42 @@ class ClusterCommandTest(unittest.TestCase):
             (dict(edge_rule="rescue"), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
                                                                          edge_rule=rescue),
                                         mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
-            (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
+            (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9,
+                                                                          work_folder=None)]),
             (dict(method=ClusterMethod.greedy, nprobe=3),
-             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
+             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9, work_folder=None)]),
+            (dict(method=ClusterMethod.greedy, work_folder=work),
+             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9, work_folder=work)]),
+            (dict(method=ClusterMethod.greedy, max_neighbors=None),
+             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=1000, work_folder=None)]),
+            (dict(max_neighbors=None), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=1000,
+                                                                         edge_rule=rescue),
+                                        mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(nprobe=3, use_gpu_index=True), [
                 mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
                 mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work), [greedy_leiden()]),
+            (dict(method="greedy-leiden", work_folder=work, max_neighbors=None), [greedy_leiden(max_neighbors=100)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work, nprobe=3, greedy_threshold=0.95,
+                  greedy_max_neighbors=50, edge_rule=EdgeRule.lower, resolution=20.0, leiden_iterations=4, seed=8),
+             [greedy_leiden(greedy_threshold=0.95, greedy_max_neighbors=50, edge_rule=EdgeRule.lower,
+                            resolution=20.0, n_iterations=4, seed=8)]),
         ]
         for kwargs, calls in cases:
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
                 with mock.patch.object(clustering, "EmbeddingClusterer") as made:
                     # A graph whose kept scores are all at least 0
                     made.return_value.min_weight = 0.7
-                    cluster_database(db_path=self.db_path, threshold=0.7, max_neighbors=9, output_file=out, **kwargs)
+                    cluster_database(db_path=self.db_path, output_file=out, **{"threshold": 0.7, "max_neighbors": 9,
+                                                                               **kwargs})
                 # The constructor is the one source of nprobe: the database's own when --nprobe is not given
                 self.assertEqual(made.call_args_list, [mock.call(db_path=self.db_path,
                                                                  use_gpu=kwargs.get("use_gpu_index", False),
                                                                  nprobe=kwargs.get("nprobe"))])
                 clusterer = made.return_value
                 self.assertEqual([c for c in clusterer.mock_calls if c[0] in (
-                    "build_similarity_graph", "cluster_leiden", "cluster_greedy")], calls)
+                    "build_similarity_graph", "build_similarity_edges", "cluster_leiden", "cluster_greedy",
+                    "cluster_greedy_leiden")], calls)
 
     def test_leiden_iterations_reach_igraph(self):
         """cluster --leiden-iterations 3 --seed 5 runs python-igraph's Leiden at 3 iterations, and writes the reference
@@ -1006,40 +1032,46 @@ class RefusalTest(unittest.TestCase):
         return _flat(result.output)
 
     def test_leiden_options_under_greedy_in_one_message(self):
+        """The options --method greedy does not take, in one message naming each with the methods that take it
+        (P9.CL D7), before the range checks."""
         base = ("cluster", "--db-path", "no/such/db", "--method", "greedy")
-        greedy = "--method greedy has no resolution or iteration count and is deterministic."
+        leiden = "(--method leiden or greedy-leiden)"
         cases = (
-            (("--resolution", "1.0"), f"--resolution is a Leiden option: {greedy} Remove it, or use --method leiden."),
-            (("--seed", "7"), f"--seed is a Leiden option: {greedy} Remove it, or use --method leiden."),
-            (("--seed", "7", "--resolution", "2"), f"--resolution, --seed are Leiden options: {greedy} Remove them, "
-                                                   f"or use --method leiden."),
-            (("--leiden-iterations", "5"), f"--leiden-iterations is a Leiden option: {greedy} Remove it, or use "
-                                           f"--method leiden."),
-            # The greedy refusal comes first: not the minimum's message
-            (("--leiden-iterations", "0"), f"--leiden-iterations is a Leiden option: {greedy} Remove it, or use "
-                                           f"--method leiden."),
-            (("--seed", "-1"), f"--seed is a Leiden option: {greedy} Remove it, or use --method leiden."),
+            (("--resolution", "1.0"), f"--method greedy does not take --resolution {leiden}. Remove it, or use a "
+                                      f"method that takes it."),
+            (("--seed", "7"), f"--method greedy does not take --seed {leiden}. Remove it, or use a method that takes "
+                              f"it."),
+            (("--seed", "7", "--resolution", "2"), f"--method greedy does not take --resolution {leiden}, --seed "
+                                                   f"{leiden}. Remove them, or use a method that takes them."),
+            (("--leiden-iterations", "5"), f"--method greedy does not take --leiden-iterations {leiden}. Remove it, "
+                                           f"or use a method that takes it."),
+            # The method's refusal comes first: not the minimum's message
+            (("--leiden-iterations", "0"), f"--method greedy does not take --leiden-iterations {leiden}. Remove it, "
+                                           f"or use a method that takes it."),
+            (("--seed", "-1"), f"--method greedy does not take --seed {leiden}. Remove it, or use a method that "
+                               f"takes it."),
             (("--seed", "3", "--leiden-iterations", "5", "--resolution", "2"),
-             f"--resolution, --leiden-iterations, --seed are Leiden options: {greedy} Remove them, or use --method "
-             f"leiden."),
+             f"--method greedy does not take --resolution {leiden}, --leiden-iterations {leiden}, --seed {leiden}. "
+             f"Remove them, or use a method that takes them."),
         )
         for extra, message in cases:
             with self.subTest(extra=extra):
                 output = self.refused(*base, *extra)
                 self.assertIn(f"Invalid value for --method: {message}", output)
-                self.assertEqual(output.count("Leiden option"), 1)
+                self.assertEqual(output.count("does not take"), 1)
 
     def test_edge_rule_under_greedy(self):
-        """--edge-rule under --method greedy: refused, either value; the Leiden options' refusal comes first."""
+        """--edge-rule under --method greedy: refused, either value, in the same message as the other options."""
         base = ("cluster", "--db-path", "no/such/db", "--method", "greedy")
-        message = ("Invalid value for --method: --edge-rule chooses the edges of the similarity graph: --method "
-                   "greedy builds none. Remove it, or use --method leiden.")
+        message = ("Invalid value for --method: --method greedy does not take --edge-rule (--method leiden or "
+                   "greedy-leiden). Remove it, or use a method that takes it.")
         for value in ("rescue", "lower"):
             with self.subTest(value=value):
                 self.assertIn(message, self.refused(*base, "--edge-rule", value))
         output = self.refused(*base, "--edge-rule", "lower", "--seed", "1")
-        self.assertIn("--seed is a Leiden option", output)
-        self.assertNotIn("--edge-rule chooses", output)
+        self.assertIn("Invalid value for --method: --method greedy does not take --seed (--method leiden or "
+                      "greedy-leiden), --edge-rule (--method leiden or greedy-leiden). Remove them, or use a method "
+                      "that takes them.", output)
 
     def test_edge_rule_values(self):
         """--edge-rule takes rescue or lower, under leiden and in similarity-graph; any other value is a usage error."""
@@ -1102,7 +1134,7 @@ class RefusalTest(unittest.TestCase):
         text = next(p.help for p in command.params if p.name == "leiden_iterations")
         self.assertEqual(text, "Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured "
                                "1M-chain graphs agreed with Leiden run to convergence within seed noise; fewer are "
-                               "faster, with somewhat noisier partitions. --method leiden only.")
+                               "faster, with somewhat noisier partitions. Refused with --method greedy.")
         self.assertIn(f"Default: {clustering._LEIDEN_ITERATIONS},", text)
 
     def test_unknown_method(self):
