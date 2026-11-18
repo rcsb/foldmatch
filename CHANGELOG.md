@@ -35,6 +35,20 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `n_rescued_edges`, and `chunks()`), kept as `clusterer.edges` (a graph
   built before is dropped); `cluster_leiden` builds the igraph graph from
   them when there is no graph.
+- **`--nprobe`** on `fm-search cluster` (every method) and `fm-search
+  similarity-graph`: the IVF cells probed per query of an `ivf_pq` database
+  (default: the value stored at build, `--ivf-nprobe` or `--ivf-nlist` //
+  64), as the query commands have it. Higher finds more neighbours and is
+  slower; above the cell count FAISS probes every cell. Below 1 it is
+  refused before the database is loaded, and on a `flat` or `hnsw` database
+  after the load (both exit status 2; the query commands ignore it there).
+  The log gives the cells probed per query on every `ivf_pq` run. Library:
+  `EmbeddingClusterer(db_path=None, use_gpu=False, nprobe=None,
+  database=None)`: `nprobe` is set on the CPU index before any move to the
+  GPU (`ValueError` below 1, before the load, and for a database that is not
+  `ivf_pq`), `clusterer.nprobe` is the value searched at (None on `flat` and
+  `hnsw`), and `database` takes a `FaissEmbeddingDatabase` already loaded on
+  the CPU instead of `db_path` (exactly one of the two).
 
 ### Changed
 
@@ -50,6 +64,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
   block's rescued edges follow its other edges. The same applies to
   `EmbeddingClusterer.build_similarity_graph`, whose `edge_rule` defaults to
   `rescue`.
+
+### Fixed
+
+- The `EmbeddingClusterer` constructor's docstring named an `index_name`
+  argument that does not exist; it now documents its arguments.
 
 ## [0.12.0] - 2026-11-16
 

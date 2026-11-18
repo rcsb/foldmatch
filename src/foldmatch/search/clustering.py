@@ -128,22 +128,65 @@ class SimilarityEdges:
                 yield pairs[s:s + size], weights[s:s + size]
 
 
+class _NprobeNotApplicable(ValueError):
+    """nprobe given for a database that is not ivf_pq (the CLI reports it as a usage error, after the load)."""
+
+
 class EmbeddingClusterer:
     """Cluster protein structure embeddings: Leiden on the similarity graph (:meth:`cluster_leiden`), or greedy
     representatives in one streamed pass over the database (:meth:`cluster_greedy`)."""
 
-    def __init__(self, db_path: str, use_gpu: bool = False):
+    def __init__(self, db_path: Optional[str] = None, use_gpu: bool = False, nprobe: Optional[int] = None,
+                 database: Optional[FaissEmbeddingDatabase] = None):
         """
-        Initialize clustering — stashes db location; actual load happens in
-        :meth:`load_database`.
+        Load the database to cluster: from ``db_path``, or a ``database`` already loaded. The index is loaded on the
+        CPU, its nprobe set, and only then moved to the GPU when ``use_gpu`` (the IVF parameters of a GPU index are
+        not reachable through extract_index_ivf).
 
         Args:
-            db_path: Path to FAISS database directory
-            index_name: Name of the FAISS index
+            db_path: Path to the FAISS database (``<folder>/<index name>``)
+            use_gpu: Move the index to the GPU (if available) once nprobe is set
+            nprobe: IVF cells probed per query, at least 1, ivf_pq databases only (default: the value the database
+                stored at build). The one source of nprobe of this clusterer's searches; ``self.nprobe`` is the
+                value the index searches at (None on flat and hnsw). FAISS probes at most every cell.
+            database: A loaded FaissEmbeddingDatabase on the CPU, instead of ``db_path``
+
+        Raises:
+            ValueError: both or neither of ``db_path`` and ``database``; ``database`` not loaded, or on the GPU;
+                ``nprobe`` below 1 (before the load); ``nprobe`` given for a flat or hnsw database (after the load)
         """
-        db_folder, index_name, db_path = _parse_db_path(db_path)
-        self.db = FaissEmbeddingDatabase(db_folder, index_name)
-        self.db.load_database(use_gpu=use_gpu)
+        if (db_path is None) == (database is None):
+            raise ValueError("Give exactly one of db_path and database.")
+        if nprobe is not None:
+            nprobe = operator.index(nprobe)
+            if nprobe < 1:
+                raise ValueError("--nprobe must be at least 1.")
+        if database is None:
+            db_folder, index_name, db_path = _parse_db_path(db_path)
+            database = FaissEmbeddingDatabase(db_folder, index_name)
+            database.load_database(use_gpu=False)
+        elif database.index is None:
+            raise ValueError("Database not loaded. Call load_database() first.")
+        elif database.is_gpu_index:
+            raise ValueError("The database must be on the CPU: use_gpu=True moves it to the GPU once nprobe is set.")
+        self.db = database
+
+        self.nprobe = None
+        if self.db.index_type == IndexType.ivf_pq:
+            if nprobe is not None:
+                self.db.set_nprobe(nprobe)
+            ivf_index = faiss.extract_index_ivf(self.db.index)
+            self.nprobe = int(ivf_index.nprobe)
+            probed = min(self.nprobe, ivf_index.nlist)
+            logging.info(f"IVF cells probed per query: {probed} of {ivf_index.nlist}"
+                         + (f" (nprobe {self.nprobe} is above the cell count)" if self.nprobe > probed else ""))
+        elif nprobe is not None:
+            index_type = IndexType(self.db.index_type)
+            kind = "built with --index-type auto (flat or hnsw)" if index_type is IndexType.auto else index_type.value
+            raise _NprobeNotApplicable(f"--nprobe applies to ivf_pq databases only; this database is {kind}.")
+        if use_gpu:
+            self.db.move_to_gpu()
+
         self.chain_ids = self.db.chain_ids
 
         self.graph = None

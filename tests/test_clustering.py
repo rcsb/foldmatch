@@ -1,8 +1,9 @@
 """EmbeddingClusterer.build_similarity_graph: blocks of chains read with reconstruct_n and searched many at a time give,
 on every database type, the expected graph: on hnsw the one-query-per-call graph bit for bit, on flat the same up to
 float rounding, and on ivf_pq the normalised decoded query against each code. Also the rescue edge rule, the default
-(P9.CL1): the two-pass graph bit for bit, planted lost chains, and build_similarity_edges; and cluster_leiden on
-python-igraph's Leiden (P9.U): the call, its private seeding, the cluster ids by size, and its refusals."""
+(P9.CL1): the two-pass graph bit for bit, planted lost chains, and build_similarity_edges; --nprobe and the
+EmbeddingClusterer constructor (P9.CL2); and cluster_leiden on python-igraph's Leiden (P9.U): the call, its private
+seeding, the cluster ids by size, and its refusals."""
 import hashlib
 import inspect
 import logging
@@ -18,6 +19,7 @@ import time
 import unittest
 import weakref
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -28,6 +30,7 @@ import lightning  # noqa: F401
 import faiss
 import igraph as ig
 import numpy as np
+import typer
 from tqdm import tqdm
 from typer.testing import CliRunner
 
@@ -1469,6 +1472,238 @@ class SimilarityEdgesTest(unittest.TestCase):
                                  (EmbeddingClusterer.build_similarity_graph, EdgeRule.rescue)):
             with self.subTest(command=command.__name__):
                 self.assertIs(inspect.signature(command).parameters["edge_rule"].default, default)
+
+
+# P9.CL2: --nprobe on cluster and similarity-graph. The EmbeddingClusterer constructor is the one source of nprobe: it
+# loads on the CPU, sets nprobe, then moves to the GPU.
+
+def _invoke(*args, patch_clusterer=False):
+    """fm-search through CliRunner, the logging state restored; with ``patch_clusterer``, loading a database fails the
+    test (an AssertionError as the exception)."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        with (mock.patch.object(clustering, "EmbeddingClusterer", side_effect=AssertionError("the database was loaded"))
+              if patch_clusterer else nullcontext()):
+            return CliRunner().invoke(search.app, [str(a) for a in args])
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+
+
+class NprobeTest(unittest.TestCase):
+    """EmbeddingClusterer(nprobe=...): the IVF's nprobe, the graph at it, a value above nlist, the refusals, the order
+    against the GPU move, a database given loaded; and --nprobe on cluster and similarity-graph."""
+
+    # At threshold 0.3 and k 100 the graph depends on nprobe (edges at nprobe 1 / 4 / 9 / 16: 31,325 / 32,738 /
+    # 32,791 / 32,792); at threshold 0.5 it does not
+    n, threshold, k, stored = 1000, 0.3, 100, 4
+    config = IndexConfig(nlist=16, m=8, nbits=4, nprobe=4, opq_train_size=1000)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        folder = Path(cls.tmp.name)
+        cls.pq_path = _build(folder, "pq", IvfPqSameGraphAsK2Test.vectors(), IndexType.ivf_pq, cls.config)
+        small = _clustered_vectors(seed=11, n=60, d=16, n_centers=6, noise=0.5)
+        cls.other_paths = {kind: _build(folder, kind.value, small, kind) for kind in
+                           (IndexType.flat, IndexType.hnsw, IndexType.auto)}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    assert_same_list = _SameGraphAsK2.assert_same_list
+    assert_same_graph = _SameGraphAsK2.assert_same_graph
+
+    def test_default_is_the_stored_value(self):
+        clusterer = EmbeddingClusterer(self.pq_path)
+        ivf = faiss.extract_index_ivf(clusterer.db.index)
+        self.assertEqual((clusterer.nprobe, ivf.nprobe, ivf.nlist), (self.stored, self.stored, 16))
+        self.assertEqual(ivf.parallel_mode, 3)
+        for path in self.other_paths.values():
+            self.assertIsNone(EmbeddingClusterer(path).nprobe)
+
+    def test_nprobe_reaches_the_index(self):
+        """The IVF searches at the given nprobe, parallel_mode 3 kept, and the graph is the one of set_nprobe after a
+        plain load, bit for bit."""
+        edge_counts = set()
+        for nprobe in (1, 9, 16):
+            with self.subTest(nprobe=nprobe):
+                clusterer = EmbeddingClusterer(self.pq_path, nprobe=nprobe)
+                ivf = faiss.extract_index_ivf(clusterer.db.index)
+                self.assertEqual((clusterer.nprobe, ivf.nprobe, ivf.parallel_mode), (nprobe, nprobe, 3))
+                graph = clusterer.build_similarity_graph(self.threshold, self.k)
+                ref = EmbeddingClusterer(self.pq_path)
+                ref.db.set_nprobe(nprobe)
+                self.assert_same_graph(graph, ref.build_similarity_graph(self.threshold, self.k))
+                edge_counts.add(graph.ecount())
+        self.assertEqual(len(edge_counts), 3)
+
+    def test_above_nlist_probes_every_cell(self):
+        """nprobe above nlist is kept as given and logged; FAISS probes every cell: the results and the graph of
+        nprobe = nlist, bit for bit."""
+        at_nlist = EmbeddingClusterer(self.pq_path, nprobe=16)
+        with self.assertLogs(level="INFO") as logs:
+            above = EmbeddingClusterer(self.pq_path, nprobe=21)
+        self.assertIn("INFO:root:IVF cells probed per query: 16 of 16 (nprobe 21 is above the cell count)",
+                      logs.output)
+        self.assertEqual((above.nprobe, faiss.extract_index_ivf(above.db.index).nprobe), (21, 21))
+        queries = above.db.index.reconstruct_n(0, self.n)
+        faiss.normalize_L2(queries)
+        for k in (10, self.n):
+            got, ref = above.db.index.search(queries, k), at_nlist.db.index.search(queries, k)
+            self.assertEqual(got[0].tobytes(), ref[0].tobytes())
+            self.assertTrue(np.array_equal(got[1], ref[1]))
+        self.assert_same_graph(above.build_similarity_graph(self.threshold, self.k),
+                               at_nlist.build_similarity_graph(self.threshold, self.k))
+        with self.assertLogs(level="INFO") as logs:
+            EmbeddingClusterer(self.pq_path)
+        self.assertIn(f"INFO:root:IVF cells probed per query: {self.stored} of 16", logs.output)
+
+    def test_below_1_refused_before_the_load(self):
+        with mock.patch.object(FaissEmbeddingDatabase, "load_database",
+                               side_effect=AssertionError("the database was loaded")):
+            for nprobe in (0, -3):
+                with self.subTest(nprobe=nprobe), \
+                        self.assertRaisesRegex(ValueError, r"^--nprobe must be at least 1\.$"):
+                    EmbeddingClusterer(self.pq_path, nprobe=nprobe)
+            with self.assertRaises(TypeError):
+                EmbeddingClusterer(self.pq_path, nprobe=2.0)
+        self.assertEqual(EmbeddingClusterer(self.pq_path, nprobe=np.int64(5)).nprobe, 5)
+
+    def test_flat_hnsw_auto_refused_after_the_load(self):
+        kinds = {IndexType.flat: "flat", IndexType.hnsw: "hnsw",
+                 IndexType.auto: "built with --index-type auto (flat or hnsw)"}
+        for kind, path in self.other_paths.items():
+            with self.subTest(kind=kind.value):
+                with mock.patch.object(FaissEmbeddingDatabase, "load_database", autospec=True,
+                                       side_effect=FaissEmbeddingDatabase.load_database) as load, \
+                        self.assertRaisesRegex(clustering._NprobeNotApplicable,
+                                               f"^--nprobe applies to ivf_pq databases only; this database is "
+                                               f"{re.escape(kinds[kind])}\\.$"):
+                    EmbeddingClusterer(path, nprobe=4)
+                load.assert_called_once()
+                self.assertTrue(issubclass(clustering._NprobeNotApplicable, ValueError))
+
+    def test_set_before_the_gpu_move(self):
+        """The load is on the CPU; nprobe is set on the CPU index, then the index moves to the GPU (move_to_gpu
+        recorded, not run: no GPU here)."""
+        for nprobe, use_gpu, expected in ((5, True, ["load", "set_nprobe 5", "move_to_gpu"]),
+                                          (None, True, ["load", "move_to_gpu"]),
+                                          (5, False, ["load", "set_nprobe 5"])):
+            with self.subTest(nprobe=nprobe, use_gpu=use_gpu):
+                calls = []
+                load, set_nprobe = FaissEmbeddingDatabase.load_database, FaissEmbeddingDatabase.set_nprobe
+
+                def record_load(db, use_gpu=False):
+                    calls.append("load" if use_gpu is False else "load on the GPU")
+                    return load(db, use_gpu=use_gpu)
+
+                def record_set(db, value):
+                    self.assertFalse(db.is_gpu_index)
+                    calls.append(f"set_nprobe {value}")
+                    return set_nprobe(db, value)
+
+                with mock.patch.object(FaissEmbeddingDatabase, "load_database", record_load), \
+                        mock.patch.object(FaissEmbeddingDatabase, "set_nprobe", record_set), \
+                        mock.patch.object(FaissEmbeddingDatabase, "move_to_gpu",
+                                          lambda db, gpu_id=0: calls.append("move_to_gpu")):
+                    clusterer = EmbeddingClusterer(self.pq_path, use_gpu=use_gpu, nprobe=nprobe)
+                self.assertEqual(calls, expected)
+                self.assertEqual(clusterer.nprobe, nprobe or self.stored)
+
+    def test_a_database_given_loaded(self):
+        db = _load_db(self.pq_path)
+        clusterer = EmbeddingClusterer(database=db, nprobe=7)
+        self.assertIs(clusterer.db, db)
+        self.assertEqual((clusterer.nprobe, faiss.extract_index_ivf(db.index).nprobe), (7, 7))
+        self.assertEqual(clusterer.chain_ids, db.chain_ids)
+        self.assert_same_graph(clusterer.build_similarity_graph(self.threshold, self.k),
+                               EmbeddingClusterer(self.pq_path, nprobe=7).build_similarity_graph(self.threshold,
+                                                                                                 self.k))
+        self.assertEqual(EmbeddingClusterer(database=_load_db(self.pq_path)).nprobe, self.stored)
+        cases = (
+            (dict(), r"^Give exactly one of db_path and database\.$"),
+            (dict(db_path=self.pq_path, database=db), r"^Give exactly one of db_path and database\.$"),
+            (dict(database=FaissEmbeddingDatabase(Path(self.tmp.name), "pq")),
+             r"^Database not loaded\. Call load_database\(\) first\.$"),
+        )
+        for kwargs, message in cases:
+            with self.subTest(kwargs=sorted(kwargs)), self.assertRaisesRegex(ValueError, message):
+                EmbeddingClusterer(**kwargs)
+        on_gpu = _load_db(self.pq_path)
+        on_gpu.is_gpu_index = True
+        with self.assertRaisesRegex(ValueError, r"^The database must be on the CPU: use_gpu=True moves it to the GPU "
+                                                r"once nprobe is set\.$"):
+            EmbeddingClusterer(database=on_gpu, nprobe=7)
+
+    # Through the CLI
+
+    def run_ok(self, *args):
+        result = _invoke(*args)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+
+    def test_cli_stored_value_gives_the_same_files(self):
+        out = Path(self.tmp.name)
+        base = ("--db-path", self.pq_path, "--threshold", self.threshold, "--max-neighbors", self.k)
+        # Every cell probed changes the graph and the greedy partition; the Leiden partition on this fixture is the
+        # same at both nprobe values
+        for command, extra, name, changes in ((("cluster",), ("--seed", 3), "leiden.tsv", False),
+                                              (("cluster", "--method", "greedy"), (), "greedy.tsv", True),
+                                              (("similarity-graph",), (), "graph.graphml", True)):
+            with self.subTest(command=command):
+                self.run_ok(*command, *base, *extra, "--output-file", out / f"none.{name}")
+                self.run_ok(*command, *base, *extra, "--nprobe", self.stored, "--output-file", out / f"given.{name}")
+                self.run_ok(*command, *base, *extra, "--nprobe", 16, "--output-file", out / f"all.{name}")
+                self.assertEqual((out / f"none.{name}").read_bytes(), (out / f"given.{name}").read_bytes())
+                if changes:
+                    self.assertNotEqual((out / f"none.{name}").read_bytes(), (out / f"all.{name}").read_bytes())
+
+    def test_cli_nprobe_reaches_the_index(self):
+        """cluster --nprobe 16 writes the file of a clusterer at nprobe 16; similarity-graph the GraphML."""
+        out = Path(self.tmp.name)
+        base = ("--db-path", self.pq_path, "--threshold", self.threshold, "--max-neighbors", self.k, "--nprobe", 16)
+        self.run_ok("cluster", *base, "--seed", 3, "--output-file", out / "np16.tsv")
+        self.run_ok("similarity-graph", *base, "--output-file", out / "np16.graphml")
+        clusterer = EmbeddingClusterer(self.pq_path, nprobe=16)
+        clusterer.build_similarity_graph(self.threshold, self.k).write_graphml(str(out / "np16_ref.graphml"))
+        clusterer.cluster_leiden(seed=3)
+        clusterer.export_clusters(str(out / "np16_ref.tsv"))
+        self.assertEqual((out / "np16.tsv").read_bytes(), (out / "np16_ref.tsv").read_bytes())
+        self.assertEqual((out / "np16.graphml").read_bytes(), (out / "np16_ref.graphml").read_bytes())
+
+    def test_cli_refusals(self):
+        out = Path(self.tmp.name) / "refused.out"
+        commands = (("cluster",), ("cluster", "--method", "leiden"), ("cluster", "--method", "greedy"),
+                    ("similarity-graph",))
+        for command in commands:
+            for value in ("0", "-3"):
+                with self.subTest(command=command, value=value):
+                    result = _invoke(*command, "--db-path", "no/such/db", "--nprobe", value, patch_clusterer=True)
+                    self.assertEqual(result.exit_code, 2, f"{result.output}\n{result.exception!r}")
+                    self.assertIn("Invalid value for --nprobe: --nprobe must be at least 1.", _flat(result.output))
+            for kind, path in self.other_paths.items():
+                with self.subTest(command=command, kind=kind.value):
+                    result = _invoke(*command, "--db-path", path, "--nprobe", 4, "--output-file", out)
+                    self.assertEqual(result.exit_code, 2, f"{result.output}\n{result.exception!r}")
+                    self.assertIn("Invalid value for --nprobe: --nprobe applies to ivf_pq databases only; this "
+                                  "database is", _flat(result.output))
+                    self.assertFalse(out.exists())
+        # Without --nprobe, or at 1 and above on ivf_pq, the database is loaded
+        for value in ((), ("--nprobe", "1")):
+            with self.subTest(value=value):
+                result = _invoke("cluster", "--db-path", "no/such/db", *value, patch_clusterer=True)
+                self.assertEqual(str(result.exception), "the database was loaded")
+
+    def test_cli_help(self):
+        for name in ("cluster", "similarity-graph"):
+            with self.subTest(command=name):
+                command = typer.main.get_command(search.app).commands[name]
+                text = next(p.help for p in command.params if p.name == "nprobe")
+                self.assertEqual(text, "IVF cells probed per query (ivf_pq databases only). Default: the value "
+                                       "stored at build (--ivf-nprobe, or --ivf-nlist // 64). Higher finds more "
+                                       "neighbours and is slower.")
 
 
 # P9.U: cluster_leiden runs python-igraph's community_leiden, a fixed number of iterations, seeded with a private

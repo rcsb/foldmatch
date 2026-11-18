@@ -897,7 +897,7 @@ class ClusterCommandTest(unittest.TestCase):
     def test_methods_route(self):
         """greedy calls cluster_greedy and builds no graph; leiden (the default) the graph, under the rescue edge rule
         when --edge-rule is not given, then Leiden at resolution 1.0 when --resolution is not given and 10 iterations
-        when --leiden-iterations is not given."""
+        when --leiden-iterations is not given. Both make the clusterer with --nprobe (None when not given)."""
         out = str(Path(self.tmp.name) / "routed.tsv")
         rescue = EdgeRule.rescue
         cases = [
@@ -916,6 +916,11 @@ class ClusterCommandTest(unittest.TestCase):
                                                                          edge_rule=rescue),
                                         mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
+            (dict(method=ClusterMethod.greedy, nprobe=3),
+             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9)]),
+            (dict(nprobe=3, use_gpu_index=True), [
+                mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
+                mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
         ]
         for kwargs, calls in cases:
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
@@ -923,6 +928,10 @@ class ClusterCommandTest(unittest.TestCase):
                     # A graph whose kept scores are all at least 0
                     made.return_value.min_weight = 0.7
                     cluster_database(db_path=self.db_path, threshold=0.7, max_neighbors=9, output_file=out, **kwargs)
+                # The constructor is the one source of nprobe: the database's own when --nprobe is not given
+                self.assertEqual(made.call_args_list, [mock.call(db_path=self.db_path,
+                                                                 use_gpu=kwargs.get("use_gpu_index", False),
+                                                                 nprobe=kwargs.get("nprobe"))])
                 clusterer = made.return_value
                 self.assertEqual([c for c in clusterer.mock_calls if c[0] in (
                     "build_similarity_graph", "cluster_leiden", "cluster_greedy")], calls)

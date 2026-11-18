@@ -132,6 +132,12 @@ _EDGE_RULE_HELP = (
     "end of the database. rescue adds about 0.1-1.6% edges at --max-neighbors 30-100 (measured on Swiss-Prot)."
 )
 
+# cluster and similarity-graph: the search depth (P9.CL D6). The build default is max(1, --ivf-nlist // 64).
+_CLUSTER_NPROBE_HELP = (
+    "IVF cells probed per query (ivf_pq databases only). Default: the value stored at build (--ivf-nprobe, or "
+    "--ivf-nlist // 64). Higher finds more neighbours and is slower."
+)
+
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
     "(emb_<run id>-<rank>.parquet) from --tmp-embedding-folder once the "
@@ -1588,6 +1594,9 @@ def cluster_database(
         edge_rule: Annotated[Optional[EdgeRule], typer.Option(
             help=f'{_EDGE_RULE_HELP} --method leiden only (greedy builds no graph).'
         )] = None,
+        nprobe: Annotated[Optional[int], typer.Option(
+            help=_CLUSTER_NPROBE_HELP
+        )] = None,
         min_cluster_size: Annotated[Optional[int], typer.Option(
             help='Minimum cluster size to include in output (filters smaller clusters).'
         )] = None,
@@ -1616,6 +1625,7 @@ def cluster_database(
     if seed is not None and seed < 0:
         raise typer.BadParameter("--seed must be at least 0.", param_hint="--seed")
     _refuse_max_neighbors_below_1(max_neighbors)
+    _refuse_nprobe_below_1(nprobe)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
@@ -1623,11 +1633,8 @@ def cluster_database(
 
     # Initialize clusterer
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import EmbeddingClusterer, _LEIDEN_ITERATIONS
-    clusterer = EmbeddingClusterer(
-        db_path=db_path,
-        use_gpu=use_gpu_index
-    )
+    from foldmatch.search.clustering import _LEIDEN_ITERATIONS
+    clusterer = _clusterer(db_path, use_gpu_index, nprobe)
 
     if method is ClusterMethod.greedy:
         # Greedy representatives, streamed: no graph
@@ -1686,6 +1693,9 @@ def similarity_graph(
         edge_rule: Annotated[Optional[EdgeRule], typer.Option(
             help=_EDGE_RULE_HELP
         )] = None,
+        nprobe: Annotated[Optional[int], typer.Option(
+            help=_CLUSTER_NPROBE_HELP
+        )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
             help='Use GPU for FAISS operations (requires faiss-gpu).'
         )] = False,
@@ -1698,17 +1708,14 @@ def similarity_graph(
     set_log_level(log_level)
     edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
     _refuse_max_neighbors_below_1(max_neighbors)
+    _refuse_nprobe_below_1(nprobe)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
 
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import EmbeddingClusterer
-    clusterer = EmbeddingClusterer(
-        db_path=db_path,
-        use_gpu=use_gpu_index
-    )
+    clusterer = _clusterer(db_path, use_gpu_index, nprobe)
 
     graph = clusterer.build_similarity_graph(
         threshold=threshold,
@@ -3329,6 +3336,23 @@ def _refuse_edge_rule_under_greedy(method: ClusterMethod, edge_rule: Optional[Ed
     if method is ClusterMethod.greedy and edge_rule is not None:
         raise typer.BadParameter("--edge-rule chooses the edges of the similarity graph: --method greedy builds none. "
                                  "Remove it, or use --method leiden.", param_hint="--method")
+
+
+def _refuse_nprobe_below_1(nprobe: Optional[int]):
+    """``cluster`` and ``similarity-graph``: ``--nprobe`` below 1 is refused (exit status 2) before the database is
+    loaded."""
+    if nprobe is not None and nprobe < 1:
+        raise typer.BadParameter("--nprobe must be at least 1.", param_hint="--nprobe")
+
+
+def _clusterer(db_path: str, use_gpu_index: bool, nprobe: Optional[int]):
+    """``cluster`` and ``similarity-graph``: the ``EmbeddingClusterer`` of the database, its nprobe set before any move
+    to the GPU. ``--nprobe`` on a database that is not ivf_pq is refused after the load (exit status 2)."""
+    from foldmatch.search.clustering import EmbeddingClusterer, _NprobeNotApplicable
+    try:
+        return EmbeddingClusterer(db_path=db_path, use_gpu=use_gpu_index, nprobe=nprobe)
+    except _NprobeNotApplicable as exc:
+        raise typer.BadParameter(str(exc), param_hint="--nprobe") from None
 
 
 def _refuse_max_neighbors_below_1(max_neighbors: int):
