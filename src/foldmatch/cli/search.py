@@ -33,6 +33,7 @@ from foldmatch.types.api_types import (
     Accelerator,
     ClusterMethod,
     EdgeRule,
+    LeidenBackend,
     Strategy,
     Granularity,
     IndexConfig,
@@ -1560,8 +1561,9 @@ def cluster_database(
             help='Path to the FAISS database.'
         )],
         method: Annotated[ClusterMethod, typer.Option(
-            help='Clustering method: leiden builds the similarity graph and runs Leiden (python-igraph, a fixed number '
-                 'of iterations, --leiden-iterations; memory grows with the edges); '
+            help='Clustering method: leiden builds the similarity graph and runs Leiden (python-igraph, or NetworKit '
+                 'with --leiden-backend networkit; a fixed number of iterations, --leiden-iterations; memory grows '
+                 'with the edges); '
                  'greedy picks representatives in one streamed pass over the database (memory grows with the chains, '
                  'searches only chains no representative has taken; for collections whose graph does not fit in '
                  'memory); '
@@ -1587,7 +1589,7 @@ def cluster_database(
         leiden_iterations: Annotated[Optional[int], typer.Option(
             help='Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured 1M-chain graphs '
                  'agreed with Leiden run to convergence within seed noise; fewer are faster, with somewhat noisier '
-                 'partitions. Refused with --method greedy.'
+                 'partitions. With --leiden-backend networkit, a maximum. Refused with --method greedy.'
         )] = None,
         output_file: Annotated[str, typer.Option(
             help='Path to save cluster assignments, as tab-separated rows with '
@@ -1614,6 +1616,22 @@ def cluster_database(
         edge_rule: Annotated[Optional[EdgeRule], typer.Option(
             help=f'{_EDGE_RULE_HELP} --method leiden and greedy-leiden (greedy builds no graph).'
         )] = None,
+        # The \\[ escapes the bracket: typer renders help as Rich markup, which would drop [networkit] as a style tag
+        leiden_backend: Annotated[Optional[LeidenBackend], typer.Option(
+            help='Leiden implementation. igraph (default): python-igraph\'s community_leiden, one thread, the same '
+                 '--seed gives the same clusters. networkit: NetworKit\'s ParallelLeiden on --leiden-threads threads, '
+                 '5-25x faster on large graphs (measured at 64 threads on Linux); needs pip install '
+                 '\'foldmatch\\[networkit]\' (NetworKit 11.3: wheels for Linux x86_64 and macOS 26 arm64, where it '
+                 'runs on 1 thread only; none for Linux aarch64). With more than one thread the same --seed does not '
+                 'give the same clusters. Refused with --method greedy.'
+        )] = None,
+        leiden_threads: Annotated[Optional[int], typer.Option(
+            help='With --leiden-backend networkit, the threads of ParallelLeiden and of its graph build (at least 1). '
+                 'Default: every OpenMP thread (NetworKit\'s maximum, OMP_NUM_THREADS when set); 1 on macOS, where '
+                 'more are refused (NetworKit\'s OpenMP runtime crashes there next to torch\'s and FAISS\'s). 1 gives '
+                 'the same clusters for the same --seed. Refused with --leiden-backend igraph and with --method '
+                 'greedy.'
+        )] = None,
         nprobe: Annotated[Optional[int], typer.Option(
             help=_CLUSTER_NPROBE_HELP
         )] = None,
@@ -1631,8 +1649,9 @@ def cluster_database(
             help='Use GPU for FAISS operations (requires faiss-gpu).'
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
-            help='Random seed of the Leiden step: the same seed gives the same clusters; without it each run may '
-                 'differ. At least 0. Refused with --method greedy (deterministic).'
+            help='Random seed of the Leiden step: the same seed gives the same clusters (with --leiden-backend '
+                 'networkit only on one --leiden-threads; on more, a WARNING); without it each run may differ. At '
+                 'least 0. Refused with --method greedy (deterministic).'
         )] = None,
         format_mode: Annotated[FormatMode, typer.Option(
             help=_FORMAT_MODE_HELP
@@ -1650,7 +1669,7 @@ def cluster_database(
     method = _refuse_method_options(
         method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed, edge_rule=edge_rule,
         greedy_threshold=greedy_threshold, greedy_max_neighbors=greedy_max_neighbors, work_folder=work_folder,
-        use_gpu_index=use_gpu_index or None)
+        leiden_backend=leiden_backend, leiden_threads=leiden_threads, use_gpu_index=use_gpu_index or None)
     from foldmatch.search import clustering
     greedy_leiden = method is ClusterMethod.greedy_leiden
     if greedy_leiden and work_folder is None:
@@ -1664,10 +1683,22 @@ def cluster_database(
     if greedy_max_neighbors is None:
         greedy_max_neighbors = clustering._GREEDY_LEIDEN_GREEDY_MAX_NEIGHBORS
     edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
+    leiden_backend = LeidenBackend.igraph if leiden_backend is None else LeidenBackend(leiden_backend)
+    networkit = leiden_backend is LeidenBackend.networkit
+    if leiden_threads is not None and not networkit:
+        raise typer.BadParameter("--leiden-threads applies to --leiden-backend networkit only; igraph runs on one "
+                                 "thread.", param_hint="--leiden-threads")
     if leiden_iterations is not None and leiden_iterations < 1:
         raise typer.BadParameter("--leiden-iterations must be at least 1.", param_hint="--leiden-iterations")
     if seed is not None and seed < 0:
         raise typer.BadParameter("--seed must be at least 0.", param_hint="--seed")
+    if networkit and seed is not None and seed > clustering._NETWORKIT_SEED_MAX:
+        raise typer.BadParameter("--seed must be below 2**64 with --leiden-backend networkit (NetworKit's seed is an "
+                                 "unsigned 64-bit integer).", param_hint="--seed")
+    if leiden_threads is not None and leiden_threads < 1:
+        raise typer.BadParameter("--leiden-threads must be at least 1.", param_hint="--leiden-threads")
+    if networkit and leiden_threads is not None and leiden_threads > 1 and sys.platform == "darwin":
+        raise typer.BadParameter(clustering._NETWORKIT_DARWIN_REFUSAL, param_hint="--leiden-threads")
     _refuse_max_neighbors_below_1(max_neighbors)
     if greedy_max_neighbors < 1:
         raise typer.BadParameter("--greedy-max-neighbors must be at least 1.", param_hint="--greedy-max-neighbors")
@@ -1678,6 +1709,9 @@ def cluster_database(
         output_file, databases=[("the database", db_path)],
         files=[] if work_folder is None else [("the work file", Path(work_folder) / name)
                                               for name in clustering.WORK_FOLDER_FILES])
+    if networkit:
+        # NetworKit 11.3 installed, read from its package metadata (no import): exit status 1
+        clustering._check_networkit()
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
@@ -1707,11 +1741,14 @@ def cluster_database(
                 edge_rule=edge_rule,
                 resolution=resolution,
                 n_iterations=leiden_iterations,
-                seed=seed
+                seed=seed,
+                backend=leiden_backend,
+                threads=leiden_threads
             )
         else:
-            # Build similarity graph
-            clusterer.build_similarity_graph(
+            # The similarity graph's edges: an igraph graph for igraph, the edges alone for NetworKit
+            build = clusterer.build_similarity_edges if networkit else clusterer.build_similarity_graph
+            build(
                 threshold=threshold,
                 max_neighbors=max_neighbors,
                 edge_rule=edge_rule
@@ -1724,7 +1761,9 @@ def cluster_database(
             clusterer.cluster_leiden(
                 resolution=resolution,
                 n_iterations=leiden_iterations,
-                seed=seed
+                seed=seed,
+                backend=leiden_backend,
+                threads=leiden_threads
             )
     except clustering._MethodNotApplicable as exc:
         raise typer.BadParameter(str(exc), param_hint="--method") from None
@@ -3399,6 +3438,8 @@ _METHOD_OPTIONS = (
     ("leiden_iterations", "--leiden-iterations", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
     ("seed", "--seed", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
     ("edge_rule", "--edge-rule", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_backend", "--leiden-backend", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_threads", "--leiden-threads", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
     ("greedy_threshold", "--greedy-threshold", (ClusterMethod.greedy_leiden,)),
     ("greedy_max_neighbors", "--greedy-max-neighbors", (ClusterMethod.greedy_leiden,)),
     ("work_folder", "--work-folder", (ClusterMethod.greedy, ClusterMethod.greedy_leiden)),

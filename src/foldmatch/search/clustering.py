@@ -1,4 +1,5 @@
 import ctypes
+import importlib.metadata
 import json
 import logging
 import operator
@@ -8,6 +9,7 @@ import sys
 import time
 import weakref
 from datetime import datetime, timezone
+from types import SimpleNamespace
 import numpy as np
 import faiss
 import igraph as ig
@@ -16,10 +18,11 @@ from pathlib import Path
 from tqdm import tqdm
 
 from foldmatch import __version__
+from foldmatch.errors import RefusalError
 from foldmatch.search import FaissEmbeddingDatabase
 from foldmatch.search.embedding_database import _parse_db_path
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, GREEDY_CLUSTER_OUTPUT_FIELDS, write_cluster_results
-from foldmatch.types.api_types import EdgeRule, FormatMode, IndexType
+from foldmatch.types.api_types import EdgeRule, FormatMode, IndexType, LeidenBackend
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,18 @@ _EXPORT_CHUNK = 1 << 20
 # Leiden iterations of cluster_leiden: a fixed count, since run-to-convergence is open-ended (221 iterations on a
 # 1M-chain graph).
 _LEIDEN_ITERATIONS = 10
+# NetworKit's ParallelLeiden, the optional Leiden backend (P9.CL D5): the one version taken (11.2 has no GraphFromCsr),
+# how to install it, and the largest seed (NetworKit's is an unsigned 64-bit integer)
+_NETWORKIT_VERSION = "11.3"
+_NETWORKIT_INSTALL = ("pip install 'foldmatch[networkit]' (NetworKit 11.3 has wheels for Linux x86_64, macOS 26 arm64 "
+                      "and Windows, none for Linux aarch64 or macOS before 26)")
+_NETWORKIT_SEED_MAX = 2 ** 64 - 1
+# On macOS NetworKit's own libomp.dylib, a third OpenMP runtime next to torch's and FAISS's, fails its first parallel
+# region on more than one thread (OMP Error #179, then a segmentation fault in ParallelLeiden.run, which no Python
+# error reports): there it runs on 1 thread, and more are refused
+_NETWORKIT_DARWIN_REFUSAL = ("--leiden-threads above 1 is refused on macOS: there NetworKit's own OpenMP runtime, a "
+                             "third one next to torch's and FAISS's, crashes the process on more than one thread. "
+                             "Use --leiden-threads 1.")
 
 # greedy-leiden (P9.CL D2): the defaults of the greedy step and of the representatives' graph. The greedy threshold is
 # the user's (2026-11-14); k = 100 is the k of every measured cascade (TrEMBL 1M-10M, work/p9t10m/a/CASCADE_SIZE.md).
@@ -443,18 +458,137 @@ def _leiden_clusters(graph: ig.Graph, resolution: float, n_iterations: int, seed
 
 
 def _by_size(membership: np.ndarray) -> np.ndarray:
-    """Cluster ids 0..C-1 (every one used) renumbered by decreasing cluster size, ties by the smallest chain index in
-    the cluster (0 is the largest cluster), in ``membership``'s dtype."""
+    """Cluster ids (below n) renumbered by decreasing cluster size, ties by the smallest chain index in the cluster (0
+    is the largest cluster), in ``membership``'s dtype: 0..C-1 over the C clusters. An id no chain has (size 0) sorts
+    after every cluster, so the ids need not be 0..C-1."""
     n = len(membership)
     dtype = membership.dtype
     sizes = np.bincount(membership)
-    # Every cluster has a member, so minimum.at overwrites the fill
+    # Every cluster has a member, so minimum.at overwrites the fill (an unused id keeps it, and sorts last by size)
     first = np.full(len(sizes), n - 1, dtype=dtype)
     np.minimum.at(first, membership, np.arange(n, dtype=dtype))
     order = np.lexsort((first, -sizes))
     new_id = np.empty(len(sizes), dtype=dtype)
     new_id[order] = np.arange(len(sizes), dtype=dtype)
     return new_id[membership]
+
+
+def _check_networkit():
+    """Refuse (:class:`~foldmatch.errors.RefusalError`) unless NetworKit 11.3 is installed. Read from the package
+    metadata, with no import: networkit's own OpenMP runtime is loaded only by the Leiden step."""
+    try:
+        version = importlib.metadata.version("networkit")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    if version != _NETWORKIT_VERSION:
+        found = "networkit is not installed" if version is None else f"networkit {version} is installed"
+        raise RefusalError(f"--leiden-backend networkit needs NetworKit {_NETWORKIT_VERSION}, and {found}: "
+                           f"{_NETWORKIT_INSTALL}.")
+
+
+def _leiden_backend(backend, threads, seed):
+    """The backend and thread count of a Leiden step, checked: ``threads`` (at least 1; 1 on macOS) for the networkit
+    backend only, a seed NetworKit takes, and NetworKit installed (:func:`_check_networkit`)."""
+    backend = LeidenBackend(backend)
+    if threads is not None:
+        threads = operator.index(threads)
+        if backend is not LeidenBackend.networkit:
+            raise ValueError("threads (--leiden-threads) applies to the networkit backend only; igraph runs on one "
+                             "thread.")
+        if threads < 1:
+            raise ValueError("--leiden-threads must be at least 1.")
+        if threads > 1 and sys.platform == "darwin":
+            raise ValueError(_NETWORKIT_DARWIN_REFUSAL)
+    if backend is LeidenBackend.networkit:
+        if seed is not None and seed > _NETWORKIT_SEED_MAX:
+            raise ValueError("--seed must be below 2**64 with --leiden-backend networkit (NetworKit's seed is an "
+                             "unsigned 64-bit integer).")
+        _check_networkit()
+    return backend, threads
+
+
+def _networkit_csr(edges: SimilarityEdges) -> SimpleNamespace:
+    """The edges as the upper-triangular CSR that networkit.graph.GraphFromCsr reads (row i: the edges whose lower end
+    is i, in the order of ``edges``): a two-pass counting sort over the chunks, since a rescued edge (j, i) comes after
+    the edges of later chains than j. ``indices`` int64 and ``data`` float64, in a plain object with ``indptr``,
+    ``indices``, ``data`` and ``shape`` (scipy's csr_matrix may downcast the indices to int32)."""
+    n = edges.n
+    # Pass 1: the edges of each row, hence indptr
+    counts = np.zeros(n, dtype=np.int64)
+    for pairs, _ in edges.chunks():
+        rows, row_counts = np.unique(pairs[:, 0], return_counts=True)
+        counts[rows] += row_counts
+    indptr = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(counts, out=indptr[1:])
+    del counts
+    # Pass 2: each chunk's edges scattered to their rows, after the earlier chunks' edges of the row, in chunk order
+    indices = np.empty(edges.n_edges, dtype=np.int64)
+    data = np.empty(edges.n_edges, dtype=np.float64)
+    fill = indptr[:-1].copy()
+    for pairs, weights in edges.chunks():
+        order = np.argsort(pairs[:, 0], kind="stable")
+        rows = np.asarray(pairs[order, 0], dtype=np.int64)
+        rank = np.arange(len(rows)) - np.searchsorted(rows, rows, side="left")
+        at = fill[rows] + rank
+        indices[at] = pairs[order, 1]
+        data[at] = weights[order]
+        rows, row_counts = np.unique(rows, return_counts=True)
+        fill[rows] += row_counts
+        del order, rows, rank, at
+    return SimpleNamespace(indptr=indptr, indices=indices, data=data, shape=(n, n))
+
+
+def _networkit_leiden(edges: SimilarityEdges, resolution: float, n_iterations: int, seed: Optional[int],
+                      threads: Optional[int]):
+    """NetworKit's ParallelLeiden on ``edges`` (see :meth:`EmbeddingClusterer.cluster_leiden`). Returns the cluster ids
+    (renumbered as :func:`_leiden_clusters` renumbers them), NetworKit's modularity of the partition, and the thread
+    count it ran on."""
+    n = edges.n
+    if edges.n_edges == 0:
+        # No edge: every chain is its own cluster, with the modularity python-igraph gives such a graph
+        logging.info("The graph has no edge: every chain is its own cluster")
+        return np.arange(n, dtype=_graph_id_dtype(n)), float("nan"), threads
+    # Imported here only, after FAISS (on Linux both use one OpenMP runtime)
+    import networkit
+    engineering = networkit.engineering
+    nk_threads = engineering.getMaxNumberOfThreads()
+    faiss_threads = faiss.omp_get_max_threads()
+    if threads is None:
+        # NetworKit's maximum, but 1 on macOS (more crash there: _NETWORKIT_DARWIN_REFUSAL)
+        threads = 1 if sys.platform == "darwin" else nk_threads
+    if seed is None:
+        seed = int.from_bytes(os.urandom(8), "little")
+    elif threads > 1:
+        logging.warning(f"--seed with --leiden-backend networkit on {threads} threads: ParallelLeiden does not give "
+                        f"the same clusters for the same seed on more than one thread; use --leiden-threads 1 for "
+                        f"that.")
+    logging.info(f"Running NetworKit ParallelLeiden on {threads} threads (resolution={resolution}, at most "
+                 f"{n_iterations} iterations)...")
+    # Both thread counts are restored afterwards, also on an error: on Linux NetworKit shares FAISS's OpenMP runtime,
+    # so a count left set would change later FAISS calls
+    try:
+        # Set before the graph build: GraphFromCsr fills the adjacency on these threads (in a fixed order on one)
+        engineering.setNumberOfThreads(threads)
+        graph = networkit.graph.GraphFromCsr(_networkit_csr(edges), directed=False, weighted=True)
+        _release_freed_memory()
+        engineering.setSeed(seed, True)
+        leiden = networkit.community.ParallelLeiden(graph, iterations=n_iterations, randomize=True, gamma=resolution)
+        leiden.run()
+        # The Partition is held in a variable before getQuality: networkit 11.3 segfaults when getQuality is given the
+        # temporary that getPartition() returns (work/p9leiden/LEIDEN_NETWORKIT.md, job 61389312, signal 11)
+        partition = leiden.getPartition()
+        modularity = float(networkit.community.Modularity().getQuality(partition, graph))
+        raw = np.asarray(partition.getVector(), dtype=np.int64)
+        del partition, leiden, graph
+    finally:
+        engineering.setNumberOfThreads(nk_threads)
+        faiss.omp_set_num_threads(faiss_threads)
+    _release_freed_memory()
+    # Numbered by decreasing size, ties by the smallest chain index, as igraph's. NetworKit's subset ids are below n;
+    # an id no chain has would sort after every cluster in _by_size, so the numbering does not need them to be 0..C-1
+    membership = raw.astype(_graph_id_dtype(n))
+    del raw
+    return _by_size(membership), modularity, threads
 
 
 class _NprobeNotApplicable(ValueError):
@@ -536,7 +670,8 @@ class EmbeddingClusterer:
         self.method = None
         self.representatives = None
         self.chain_representatives = None
-        # The modularity stored by cluster_greedy_leiden (on the representatives' graph), and that graph's counts
+        # The modularity stored by cluster_leiden and cluster_greedy_leiden (greedy-leiden's on the representatives'
+        # graph), and greedy-leiden's graph counts
         self.modularity = None
         self.graph_stats = None
 
@@ -774,11 +909,15 @@ class EmbeddingClusterer:
             self,
             resolution: float = 1.0,
             n_iterations: int = _LEIDEN_ITERATIONS,
-            seed: Optional[int] = None
+            seed: Optional[int] = None,
+            backend: LeidenBackend = LeidenBackend.igraph,
+            threads: Optional[int] = None
     ) -> np.ndarray:
         """
-        Apply Leiden clustering algorithm to the similarity graph. After :meth:`build_similarity_edges`, the graph is
-        built from ``self.edges`` first.
+        Apply Leiden clustering algorithm to the similarity graph, with python-igraph (``backend="igraph"``, the
+        default) or NetworKit's ParallelLeiden (``backend="networkit"``). Under igraph, after
+        :meth:`build_similarity_edges` the graph is built from ``self.edges`` first; under networkit the edges of
+        :meth:`build_similarity_edges` are needed (``self.edges``, which are kept).
 
         The call is python-igraph's ``Graph.community_leiden(objective_function="modularity", weights="weight",
         resolution=resolution, beta=0.01, n_iterations=n_iterations)``: modularity at ``resolution`` with the edge
@@ -792,22 +931,39 @@ class EmbeddingClusterer:
         has no getter), so a caller's own igraph generator is replaced; and the generator is process-global, so igraph
         calls of other threads during the Leiden step draw from it.
 
+        NetworKit (the optional extra ``foldmatch[networkit]``, NetworKit 11.3): ``networkit.community.ParallelLeiden(G,
+        iterations=n_iterations, randomize=True, gamma=resolution)`` on ``threads`` OpenMP threads (default: NetworKit's
+        maximum, ``networkit.engineering.getMaxNumberOfThreads()``, which follows ``OMP_NUM_THREADS``; on macOS 1,
+        and more are refused: NetworKit's own OpenMP runtime, a third one next to torch's and FAISS's, crashes the
+        process there on more than one thread), the graph built with ``networkit.graph.GraphFromCsr`` on the same
+        threads. ``n_iterations`` is a maximum there, and ``resolution`` the same modularity resolution. The seed goes
+        to ``networkit.engineering.setSeed(seed, True)``, which is process-global and stays set; without one a seed is
+        drawn from ``os.urandom``. On one thread the same seed gives the same partition; on more, it does not (a
+        WARNING when ``seed`` is given). NetworKit's and FAISS's OpenMP thread counts are restored afterwards (on Linux
+        they share one runtime). networkit is imported by this step only.
+
         Cluster ids are numbered by decreasing cluster size, ties by the smallest chain index in the cluster (0 is the
-        largest cluster), as under greedy.
+        largest cluster), as under greedy. The partition's modularity (at resolution 1, with the weights) is stored as
+        ``self.modularity``.
 
         Args:
             resolution: Resolution parameter (higher = more clusters, default: 1.0)
             n_iterations: Number of Leiden iterations, at least 1 (default: 10)
             seed: Random seed for reproducibility, an integer of at least 0 (``operator.index``: NumPy integers are
-                accepted, floats refused with TypeError)
+                accepted, floats refused with TypeError); below 2**64 under networkit
+            backend: ``igraph`` (default) or ``networkit`` (:class:`~foldmatch.types.api_types.LeidenBackend`)
+            threads: NetworKit's threads, at least 1, networkit only (default: NetworKit's maximum; on macOS 1, and
+                more are refused)
 
         Returns:
             Array of cluster IDs (one per chain), int32 below 2**31 chains
 
         Raises:
-            ValueError: ``n_iterations`` below 1, ``seed`` below 0, no graph (nor edges), or a graph built by
+            ValueError: ``n_iterations`` below 1, ``seed`` out of range, ``threads`` below 1, given under igraph, or
+                above 1 on macOS, no graph (nor edges; under networkit no edges), or a graph built by
                 build_similarity_graph or from build_similarity_edges with a negative kept weight (modularity needs
                 non-negative edge weights)
+            RefusalError: networkit asked for and NetworKit 11.3 not installed
         """
         if n_iterations < 1:
             raise ValueError("n_iterations must be at least 1 (Leiden runs a fixed number of iterations).")
@@ -815,6 +971,22 @@ class EmbeddingClusterer:
             seed = operator.index(seed)
             if seed < 0:
                 raise ValueError("--seed must be at least 0.")
+        backend, threads = _leiden_backend(backend, threads, seed)
+        if backend is LeidenBackend.networkit:
+            if self.edges is None:
+                raise ValueError("Edges not built. Call build_similarity_edges() first.")
+            if self.edges.min_weight < 0:
+                raise ValueError(f"Leiden needs non-negative edge weights: the edges' smallest weight is "
+                                 f"{self.edges.min_weight:.4g} (edges keep scores at or above the threshold of "
+                                 f"build_similarity_edges).")
+            start_time = time.perf_counter()
+            self.clusters, self.modularity, _ = _networkit_leiden(self.edges, resolution, n_iterations, seed,
+                                                                  threads)
+            logging.info(f"Found {int(self.clusters.max()) + 1 if len(self.clusters) else 0} clusters")
+            logging.info(f"Leiden clustering completed in {time.perf_counter() - start_time:.2f}s")
+            self.method = "leiden"
+            self.representatives = None
+            return self.clusters
         if self.graph is None and self.edges is not None:
             self._graph_from_edges()
         if self.graph is None:
@@ -827,6 +999,7 @@ class EmbeddingClusterer:
         logging.info(f"Running Leiden clustering (resolution={resolution})...")
         start_time = time.perf_counter()
         self.clusters = _leiden_clusters(self.graph, resolution, n_iterations, seed)
+        self.modularity = self.graph.modularity(self.clusters, weights='weight')
         sizes = np.bincount(self.clusters)
 
         logging.info(f"Found {len(sizes)} clusters")
@@ -1050,7 +1223,9 @@ class EmbeddingClusterer:
             edge_rule: EdgeRule = EdgeRule.rescue,
             resolution: float = _GREEDY_LEIDEN_RESOLUTION,
             n_iterations: int = _LEIDEN_ITERATIONS,
-            seed: Optional[int] = None
+            seed: Optional[int] = None,
+            backend: LeidenBackend = LeidenBackend.igraph,
+            threads: Optional[int] = None
     ) -> np.ndarray:
         """
         Greedy representatives, then Leiden on the representatives' similarity graph; every chain takes its
@@ -1067,15 +1242,15 @@ class EmbeddingClusterer:
         3. The representatives' graph at ``threshold``, ``max_neighbors`` and ``edge_rule``
            (:meth:`build_similarity_edges`), its edges in files of the work folder, then ``graph.done``.
         4. This database's and the representatives' FAISS indexes are released (``self.db.index`` is None
-           afterwards; the chain ids are kept), then python-igraph's Leiden on the representatives' graph, as
-           :meth:`cluster_leiden` (a graph with no edge is not passed to Leiden: every representative is its own
-           cluster).
+           afterwards; the chain ids are kept), then Leiden on the representatives' graph with ``backend`` (and
+           ``threads``), as :meth:`cluster_leiden` (a graph with no edge is not passed to Leiden: every representative
+           is its own cluster). NetworKit reads the memory-mapped edge files.
         5. Each chain takes its representative's cluster; cluster ids are numbered over the chains by decreasing size,
            ties by the smallest chain index (0 is the largest cluster).
 
-        Steps 4 and 5 are never stored, so a call with another ``resolution``, ``n_iterations`` or ``seed`` reuses the
-        searches. The folder's ``run.json`` records this database (the sha256 of its files), the nprobe and the
-        settings of steps 1-3; a folder recorded with other ones is refused.
+        Steps 4 and 5 are never stored, so a call with another ``resolution``, ``n_iterations``, ``seed``, ``backend``
+        or ``threads`` reuses the searches. The folder's ``run.json`` records this database (the sha256 of its files),
+        the nprobe and the settings of steps 1-3; a folder recorded with other ones is refused.
 
         Sets ``self.clusters`` (one per chain), ``self.chain_representatives`` (each chain's representative, a chain
         index), ``self.representatives`` None, ``self.method`` "greedy-leiden" and ``self.modularity`` (of the
@@ -1092,6 +1267,8 @@ class EmbeddingClusterer:
             resolution: Leiden's resolution (default: 20.0, chosen on TrEMBL samples of 1M and 10M chains)
             n_iterations: Leiden iterations, at least 1 (default: 10)
             seed: Leiden's random seed, at least 0
+            backend: The Leiden implementation, ``igraph`` (default) or ``networkit``, as in :meth:`cluster_leiden`
+            threads: NetworKit's threads, networkit only, as in :meth:`cluster_leiden`
 
         Returns:
             Array of cluster IDs (one per chain)
@@ -1100,6 +1277,7 @@ class EmbeddingClusterer:
             ValueError: an hnsw database (an ``auto`` one that is hnsw included), a database on the GPU, an argument
                 out of range, a work folder recorded with other settings or of another layout, or a representatives'
                 graph with a negative kept weight
+            RefusalError: networkit asked for and NetworKit 11.3 not installed (before greedy)
         """
         if work_folder is None:
             raise ValueError("cluster_greedy_leiden needs a work_folder.")
@@ -1113,6 +1291,8 @@ class EmbeddingClusterer:
             seed = operator.index(seed)
             if seed < 0:
                 raise ValueError("--seed must be at least 0.")
+        # Checked before hours of greedy
+        backend, threads = _leiden_backend(backend, threads, seed)
         if self.db.index is None:
             raise ValueError("Database not loaded. Call load_database() first.")
         # Judged on the loaded index: an auto database stores "auto", whichever index it built
@@ -1196,7 +1376,7 @@ class EmbeddingClusterer:
         self.edges = None
         _release_freed_memory()
         work.record["runs"][-1]["leiden"] = {"resolution": float(resolution), "n_iterations": int(n_iterations),
-                                             "seed": seed}
+                                             "seed": seed, "backend": backend.value, "threads": threads}
         _write_json(work.file(_RUN_FILE), work.record)
         n_graph_edges = edges.n_edges
         self.graph_stats = {"n_nodes": edges.n, "n_edges": n_graph_edges,
@@ -1209,6 +1389,12 @@ class EmbeddingClusterer:
         if n_graph_edges == 0:
             logging.info("The representatives' graph has no edge: every representative is its own cluster")
             rep_clusters = np.arange(n_reps, dtype=_graph_id_dtype(n_reps))
+        elif backend is LeidenBackend.networkit:
+            logging.info("Leiden clustering on the representatives' graph")
+            leiden_start = time.perf_counter()
+            rep_clusters, self.modularity, _ = _networkit_leiden(edges, resolution, n_iterations, seed, threads)
+            logging.info(f"Leiden clustering completed in {time.perf_counter() - leiden_start:.2f}s")
+            del edges
         else:
             graph = _igraph_from_edges(edges, rep_ids)
             del edges
@@ -1257,10 +1443,11 @@ class EmbeddingClusterer:
         n_giants = int(np.count_nonzero(size_array.astype(np.int64) * 100_000 > _GIANT_PER_100K * n_chains))
         largest = np.sort(size_array)[::-1][:_LARGEST_CLUSTERS].tolist()
 
-        # Calculate modularity if graph exists and the partition is not greedy's, which is not computed on a graph;
-        # greedy-leiden's is the one stored on the representatives' graph
+        # The modularity cluster_leiden or cluster_greedy_leiden stored (greedy-leiden's on the representatives'
+        # graph); none for greedy's partition, which is not computed on a graph; a partition set by the caller gets
+        # its graph's when there is one
         modularity = None
-        if self.method == "greedy-leiden":
+        if self.method in ("leiden", "greedy-leiden"):
             modularity = self.modularity
         elif self.graph is not None and self.method != "greedy":
             modularity = self.graph.modularity(self.clusters, weights='weight')

@@ -31,7 +31,7 @@ from foldmatch.search.clustering import EmbeddingClusterer
 from foldmatch.search.faiss_database import FaissEmbeddingDatabase
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, GREEDY_CLUSTER_OUTPUT_FIELDS, format_spec, \
     write_cluster_results
-from foldmatch.types.api_types import ClusterMethod, EdgeRule, FormatMode, IndexConfig, IndexType
+from foldmatch.types.api_types import ClusterMethod, EdgeRule, FormatMode, IndexConfig, IndexType, LeidenBackend
 
 
 def _clustered_vectors(seed: int, n: int, d: int, n_centers: int, noise: float) -> np.ndarray:
@@ -900,31 +900,38 @@ class ClusterCommandTest(unittest.TestCase):
         when --resolution is not given and 10 iterations when --leiden-iterations is not given; greedy-leiden calls
         cluster_greedy_leiden with the per-method defaults (greedy threshold 0.9, greedy k 1000, graph k 100 when
         --max-neighbors is not given, rescue, resolution 20.0 when --resolution is not given, 10 iterations); given
-        values pass through. Every method makes the clusterer with --nprobe (None when not given)."""
+        values pass through. Every method makes the clusterer with --nprobe (None when not given). The Leiden calls
+        carry the backend (igraph when --leiden-backend is not given) and --leiden-threads (None when not given);
+        leiden with networkit builds the edges (build_similarity_edges), not the igraph graph."""
         out = str(Path(self.tmp.name) / "routed.tsv")
         work = str(Path(self.tmp.name) / "routed-work")
         rescue = EdgeRule.rescue
+        igraph, networkit = LeidenBackend.igraph, LeidenBackend.networkit
 
         def greedy_leiden(**kwargs):
             call = dict(work_folder=work, greedy_threshold=0.9, greedy_max_neighbors=1000, threshold=0.7,
-                        max_neighbors=9, edge_rule=rescue, resolution=20.0, n_iterations=10, seed=None)
+                        max_neighbors=9, edge_rule=rescue, resolution=20.0, n_iterations=10, seed=None,
+                        backend=igraph, threads=None)
             return mock.call.cluster_greedy_leiden(**{**call, **kwargs})
+
+        def leiden(**kwargs):
+            return mock.call.cluster_leiden(**{**dict(backend=igraph, threads=None), **kwargs})
 
         cases = [
             (dict(), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
-                      mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+                      leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.leiden, resolution=2.5, seed=4),
              [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
-              mock.call.cluster_leiden(resolution=2.5, n_iterations=10, seed=4)]),
+              leiden(resolution=2.5, n_iterations=10, seed=4)]),
             (dict(leiden_iterations=3), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
                                                                           edge_rule=rescue),
-                                         mock.call.cluster_leiden(resolution=1.0, n_iterations=3, seed=None)]),
+                                         leiden(resolution=1.0, n_iterations=3, seed=None)]),
             (dict(edge_rule=EdgeRule.lower), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
                                                                                edge_rule=EdgeRule.lower),
-                                              mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+                                              leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(edge_rule="rescue"), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9,
                                                                          edge_rule=rescue),
-                                        mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+                                        leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.greedy), [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9,
                                                                           work_folder=None)]),
             (dict(method=ClusterMethod.greedy, nprobe=3),
@@ -935,10 +942,10 @@ class ClusterCommandTest(unittest.TestCase):
              [mock.call.cluster_greedy(threshold=0.7, max_neighbors=1000, work_folder=None)]),
             (dict(max_neighbors=None), [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=1000,
                                                                          edge_rule=rescue),
-                                        mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+                                        leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(nprobe=3, use_gpu_index=True), [
                 mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
-                mock.call.cluster_leiden(resolution=1.0, n_iterations=10, seed=None)]),
+                leiden(resolution=1.0, n_iterations=10, seed=None)]),
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work), [greedy_leiden()]),
             (dict(method="greedy-leiden", work_folder=work, max_neighbors=None), [greedy_leiden(max_neighbors=100)]),
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work, nprobe=3, greedy_threshold=0.95,
@@ -947,10 +954,26 @@ class ClusterCommandTest(unittest.TestCase):
                             resolution=7.0, n_iterations=4, seed=8)]),
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work, resolution=1.0),
              [greedy_leiden(resolution=1.0)]),
+            (dict(leiden_backend=LeidenBackend.igraph),
+             [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
+              leiden(resolution=1.0, n_iterations=10, seed=None)]),
+            (dict(leiden_backend=LeidenBackend.networkit),
+             [mock.call.build_similarity_edges(threshold=0.7, max_neighbors=9, edge_rule=rescue),
+              leiden(resolution=1.0, n_iterations=10, seed=None, backend=networkit)]),
+            (dict(leiden_backend="networkit", leiden_threads=4, seed=3, resolution=2.0, edge_rule=EdgeRule.lower),
+             [mock.call.build_similarity_edges(threshold=0.7, max_neighbors=9, edge_rule=EdgeRule.lower),
+              leiden(resolution=2.0, n_iterations=10, seed=3, backend=networkit, threads=4)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work, leiden_backend=LeidenBackend.networkit),
+             [greedy_leiden(backend=networkit)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work, leiden_backend="networkit", leiden_threads=1),
+             [greedy_leiden(backend=networkit, threads=1)]),
         ]
         for kwargs, calls in cases:
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
-                with mock.patch.object(clustering, "EmbeddingClusterer") as made:
+                # Routed as on Linux: macOS refuses more than one NetworKit thread
+                with mock.patch.object(clustering, "EmbeddingClusterer") as made, \
+                        mock.patch.object(clustering, "_check_networkit") as checked, \
+                        mock.patch.object(search.sys, "platform", "linux"):
                     # A graph whose kept scores are all at least 0
                     made.return_value.min_weight = 0.7
                     cluster_database(db_path=self.db_path, output_file=out, **{"threshold": 0.7, "max_neighbors": 9,
@@ -959,6 +982,8 @@ class ClusterCommandTest(unittest.TestCase):
                 self.assertEqual(made.call_args_list, [mock.call(db_path=self.db_path,
                                                                  use_gpu=kwargs.get("use_gpu_index", False),
                                                                  nprobe=kwargs.get("nprobe"))])
+                # NetworKit's installation is checked (before the load) under networkit only
+                self.assertEqual(checked.call_count, int(kwargs.get("leiden_backend") == "networkit"))
                 clusterer = made.return_value
                 self.assertEqual([c for c in clusterer.mock_calls if c[0] in (
                     "build_similarity_graph", "build_similarity_edges", "cluster_leiden", "cluster_greedy",
@@ -1136,7 +1161,8 @@ class RefusalTest(unittest.TestCase):
         text = next(p.help for p in command.params if p.name == "leiden_iterations")
         self.assertEqual(text, "Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured "
                                "1M-chain graphs agreed with Leiden run to convergence within seed noise; fewer are "
-                               "faster, with somewhat noisier partitions. Refused with --method greedy.")
+                               "faster, with somewhat noisier partitions. With --leiden-backend networkit, a maximum. "
+                               "Refused with --method greedy.")
         self.assertIn(f"Default: {clustering._LEIDEN_ITERATIONS},", text)
 
     def test_unknown_method(self):

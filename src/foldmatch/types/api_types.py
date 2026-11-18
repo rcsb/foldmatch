@@ -96,6 +96,12 @@ class EdgeRule(str, Enum):
     lower = "lower"      # an edge (i, j), i < j, from the search of the lower chain i only (FoldMatch up to 0.12.0)
 
 
+class LeidenBackend(str, Enum):
+    """The Leiden implementation of ``fm-search cluster`` (``--leiden-backend``)."""
+    igraph = "igraph"        # python-igraph's community_leiden, one thread (the default)
+    networkit = "networkit"  # NetworKit's ParallelLeiden, multithreaded (optional extra foldmatch[networkit])
+
+
 class FormatMode(str, Enum):
     """How a result file is laid out.
 

@@ -136,6 +136,47 @@ While the major version is `0`, breaking changes are released in a minor bump.
   files block by block and returned memory-mapped), and
   `SimilarityEdges.from_folder`.
 
+- **`--leiden-backend [igraph|networkit]`** on `fm-search cluster`
+  (`--method leiden` and `greedy-leiden`): `igraph` (the default,
+  python-igraph's `community_leiden`, one thread, as before) or `networkit`,
+  NetworKit's ParallelLeiden (`ParallelLeiden(G, iterations, randomize=True,
+  gamma=--resolution)`), multithreaded: 5-25x faster than igraph on large
+  graphs at 64 threads on Linux (126 s against 2,111 s on a 10M-chain
+  graph), with partitions within igraph's seed band on CATH and Swiss-Prot.
+  It needs the new optional extra **`pip install 'foldmatch[networkit]'`**
+  (`networkit==11.3`; 11.2 has no `GraphFromCsr`; wheels for Linux x86_64,
+  macOS 26 arm64 and Windows, none for Linux aarch64 or macOS before 26);
+  without it, or with another version, `--leiden-backend networkit` is
+  refused before the database is loaded (exit status 1; read from the
+  package metadata, networkit is not imported until the Leiden step). On
+  macOS it runs on 1 thread, where a FAISS search, ParallelLeiden and the
+  same search again gave the same results in one process with torch
+  loaded; more threads crashed that process (NetworKit's own OpenMP
+  runtime next to torch's and FAISS's: a segmentation fault in
+  ParallelLeiden), so there `--leiden-threads` above 1 is refused.
+  **`--leiden-threads`** (networkit only, at least 1; default every OpenMP
+  thread, NetworKit's maximum; 1 on macOS) sets NetworKit's threads before
+  its graph is built, and NetworKit's and FAISS's thread counts are restored
+  afterwards (on Linux they share one OpenMP runtime). With
+  `--leiden-threads 1` the
+  same `--seed` gives the same clusters, also in another process; on more
+  threads it does not, and `--seed` then logs a WARNING. Without `--seed` a
+  seed is drawn from `os.urandom`. `--leiden-iterations` is a maximum under
+  NetworKit. Under `--method leiden` the graph's edges are kept as arrays
+  (`build_similarity_edges`), with no igraph graph; under `greedy-leiden`
+  NetworKit reads the memory-mapped edge files of the work folder, and a
+  rerun with another backend or thread count reuses the searches (the
+  backend and threads are recorded with each run's Leiden settings in
+  `run.json`). Refused (exit status 2, before the load): `--leiden-backend`
+  or `--leiden-threads` with `--method greedy`, `--leiden-threads` with the
+  igraph backend, below 1, or above 1 on macOS, and a `--seed` of 2**64 or
+  more with networkit. `fm-search similarity-graph` stays on igraph. Library:
+  `foldmatch.types.api_types.LeidenBackend`, and `backend=` (default
+  `igraph`) and `threads=` on `EmbeddingClusterer.cluster_leiden` (networkit
+  needs `build_similarity_edges` first: "Edges not built. Call
+  build_similarity_edges() first.") and `cluster_greedy_leiden` (checked
+  before greedy runs).
+
 ### Changed
 
 - **BREAKING — `fm-search cluster` and `fm-search similarity-graph` build the
@@ -186,6 +227,15 @@ While the major version is `0`, breaking changes are released in a minor bump.
   had giants, and a higher resolution there cost domain labels).
   `get_cluster_statistics` gains `largest_cluster_share`,
   `n_giant_clusters` and `largest_cluster_sizes`.
+- `EmbeddingClusterer.cluster_leiden` stores the partition's modularity
+  (`modularity`, python-igraph's or NetworKit's), and
+  `get_cluster_statistics` reads it after `cluster_leiden` and
+  `cluster_greedy_leiden` instead of computing it on the graph (a partition
+  set by the caller still gets its graph's). `fm-search cluster`'s option
+  table names `--leiden-backend` and `--leiden-threads` among the options
+  `--method greedy` does not take. The help of `--leiden-iterations` adds
+  "With --leiden-backend networkit, a maximum.", and that of `--seed` that
+  the same seed gives the same clusters with networkit only on one thread.
 - The greedy statistics (`get_cluster_statistics`) gain `n_representatives`,
   and the saturated share is printed over it (under `--method greedy` it
   equals the cluster count, so the log is unchanged).
