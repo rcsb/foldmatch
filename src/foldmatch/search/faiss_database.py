@@ -1,3 +1,5 @@
+import dataclasses
+import hashlib
 import logging
 import faiss
 import torch
@@ -55,6 +57,39 @@ def _quantize_outside_parallel_regions(index) -> None:
     faiss-cpu pin moves to a release that has it.
     """
     faiss.extract_index_ivf(index).parallel_mode = 3
+
+
+# The suffixes of a database's files (the .invlists file is the on-disk lists of an ivf_pq database).
+_DATABASE_SUFFIXES = (".index", ".invlists", ".metadata")
+# Stored vectors read with one reconstruct_n call when a flat database is subset (16,384 x d x 4 bytes, 96 MiB at
+# d = 1536).
+_SUBSET_FLAT_BLOCK = 16_384
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _subset_rows(rows, n: int) -> np.ndarray:
+    """The rows of :meth:`FaissEmbeddingDatabase.subset` as an int64 array, checked: one dimension, integers, at least
+    one, strictly ascending (so no repeats), every row in [0, n)."""
+    arr = np.asarray(rows)
+    if arr.ndim != 1:
+        raise ValueError(f"rows must be one-dimensional, got {arr.ndim} dimensions.")
+    if arr.size == 0:
+        raise ValueError("rows must name at least one row.")
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(f"rows must be integers, got {arr.dtype}.")
+    arr = arr.astype(np.int64, copy=False)
+    if arr.size > 1 and not bool(np.all(arr[1:] > arr[:-1])):
+        raise ValueError("rows must be strictly ascending (database order, no repeats).")
+    if arr[0] < 0 or arr[-1] >= n:
+        raise ValueError(f"rows must lie in [0, {n}) for a database of {n} chains; got {arr[0]} to {arr[-1]}.")
+    return arr
 
 
 class FaissEmbeddingDatabase:
@@ -267,6 +302,180 @@ class FaissEmbeddingDatabase:
         self.index.add(arr)
         self.chain_ids.extend(ids_batch)
         return arr.shape[0]
+
+    def subset(
+            self,
+            rows,
+            db_folder: Path,
+            index_name: str,
+            parent_record: Optional[Dict] = None,
+            overwrite: bool = False,
+    ) -> "FaissEmbeddingDatabase":
+        """Write a database of some of this database's chains, from its stored data, and return it loaded on the CPU.
+
+        Nothing is trained or re-encoded. ``ivf_pq``: the trained OPQ, coarse quantizer and PQ are read from this
+        database's ``.index`` file without its lists, and each kept chain's PQ code is copied, list by list, into new
+        on-disk lists, in this database's list order; so a search of the subset is a search of this database restricted
+        to the subset's chains. The subset searches at this database's current nprobe (as set by :meth:`set_nprobe`,
+        else the stored one), which its metadata stores, so a load of the subset keeps it. ``flat``: an exact
+        ``IndexFlatIP`` of the kept chains' stored vectors, held in memory (rows x dimension x 4 bytes), so for small
+        sets. ``hnsw`` (an ``auto`` database that is hnsw included) is refused: an approximate graph is not subset.
+
+        Args:
+            rows: Row numbers of the chains to keep, integers, strictly ascending (database order) in [0, n). Row r
+                of this database becomes row ``rank(r)`` of the subset.
+            db_folder: Folder of the subset's files (created if needed).
+            index_name: Base name of the subset's ``.index``, ``.invlists`` (ivf_pq) and ``.metadata`` files.
+            parent_record: The caller's settings (for example, how the rows were chosen), stored in the subset's
+                metadata as ``metadata['parent']['settings']`` next to this database's path, chain count and the
+                sha256 of its ``.index`` and ``.metadata`` files.
+            overwrite: Replace a database already at ``db_folder``/``index_name``; otherwise it is refused.
+
+        Raises:
+            ValueError: the database is not loaded, or is on the GPU; ``rows`` are not as above; the database is hnsw,
+                or a flat index other than ``IndexFlatIP``; the subset would be this database's own files.
+            FileExistsError: a file of the subset exists and ``overwrite`` is False.
+        """
+        if self.index is None:
+            raise ValueError("Database not loaded. Call load_database() first.")
+        if self.is_gpu_index:
+            raise ValueError("subset reads the CPU index: load the database without use_gpu.")
+        n = len(self.chain_ids)
+        rows = _subset_rows(rows, n)
+        index = faiss.downcast_index(self.index)
+        if self.index_type != IndexType.ivf_pq:
+            if isinstance(index, faiss.IndexHNSW):
+                raise ValueError(
+                    f"A subset of an hnsw database is not supported ({self.db_folder / self.index_name}, built with "
+                    f"--index-type {self.index_type.name}): copy from an ivf_pq or flat database.")
+            if type(index) is not faiss.IndexFlatIP:
+                raise ValueError(f"A subset of a {type(index).__name__} index is not supported: copy from an ivf_pq "
+                                 "or flat database.")
+        db_folder = Path(db_folder)
+        if (db_folder.resolve(), index_name) == (Path(self.db_folder).resolve(), self.index_name):
+            raise ValueError(f"The subset would replace its own parent's files ({db_folder / index_name}): choose "
+                             "another folder or index name.")
+        paths = [db_folder / f"{index_name}{suffix}" for suffix in _DATABASE_SUFFIXES]
+        existing = [p for p in paths if p.exists()]
+        if existing and not overwrite:
+            raise FileExistsError(f"Database already exists at {db_folder / index_name} (found: "
+                                  f"{', '.join(str(p) for p in existing)}). Pass overwrite=True to replace it.")
+        db_folder.mkdir(parents=True, exist_ok=True)
+        for path in existing:
+            path.unlink()
+
+        parent = self._fingerprint()
+        parent["settings"] = dict(parent_record or {})
+        config = self.index_config
+        if self.index_type == IndexType.ivf_pq:
+            nprobe = int(faiss.extract_index_ivf(self.index).nprobe)
+            self._subset_ivf_pq(rows, db_folder, index_name, nprobe)
+            if config is None:  # a database whose metadata has no config: its layout, read from the index
+                ivf = faiss.downcast_index(faiss.extract_index_ivf(self.index))
+                pq = getattr(ivf, 'pq', None)
+                config = (IndexConfig(nlist=ivf.nlist) if pq is None
+                          else IndexConfig(nlist=ivf.nlist, m=pq.M, nbits=pq.nbits))
+            # load_database sets nprobe from the metadata, so the subset's config carries the value it searched at.
+            config = dataclasses.replace(config, nprobe=nprobe)
+            index_type = IndexType.ivf_pq
+        else:
+            self._subset_flat(rows, db_folder, index_name)
+            config = dataclasses.replace(config) if config is not None else None
+            index_type = IndexType.flat
+        metadata = {
+            'embedding_ids': [self.chain_ids[r] for r in rows.tolist()],
+            'dimension': self.dimension,
+            'index_type': index_type,
+            'index_config': config,
+            'parent': parent,
+        }
+        # The metadata file is written last: load_database refuses a folder without it.
+        with open(db_folder / f"{index_name}.metadata", 'wb') as f:
+            pickle.dump(metadata, f)
+        subset = FaissEmbeddingDatabase(db_folder, index_name)
+        subset.load_database()
+        return subset
+
+    def _fingerprint(self) -> Dict:
+        """This database's identity: its path, index name, chain count, the sha256 of its ``.index`` and ``.metadata``
+        files and the size of its ``.invlists`` file (None if it has none)."""
+        base = Path(self.db_folder).resolve() / self.index_name
+        invlists = Path(f"{base}.invlists")
+        return {
+            'path': str(base),
+            'index_name': self.index_name,
+            'n_chains': len(self.chain_ids),
+            'index_sha256': _file_sha256(Path(f"{base}.index")),
+            'metadata_sha256': _file_sha256(Path(f"{base}.metadata")),
+            'invlists_bytes': invlists.stat().st_size if invlists.exists() else None,
+        }
+
+    def _subset_ivf_pq(self, rows: np.ndarray, db_folder: Path, index_name: str, nprobe: int) -> None:
+        """Write the ``.index`` and ``.invlists`` files of the ivf_pq subset of :meth:`subset` (see there)."""
+        n = len(self.chain_ids)
+        # The ids of an ivf_pq database are row numbers (added in order, from 0), so a kept id's new id is its rank
+        # among the kept rows.
+        keep = np.zeros(n, dtype=bool)
+        keep[rows] = True
+        rank = np.cumsum(keep, dtype=np.int32 if n <= np.iinfo(np.int32).max else np.int64)
+        rank -= 1
+        subset = faiss.read_index(str(self.db_folder / f"{self.index_name}.index"), faiss.IO_FLAG_SKIP_IVF_DATA)
+        ivf = faiss.extract_index_ivf(subset)
+        invlists = faiss.OnDiskInvertedLists(ivf.nlist, ivf.code_size, str(db_folder / f"{index_name}.invlists"))
+        ivf.replace_invlists(invlists, True)
+        # As in _create_ivf_pq_ondisk: the IVF index owns the lists now; without disown() Python would free them too.
+        invlists.this.disown()
+        parent_lists = faiss.extract_index_ivf(self.index).invlists
+        code_size = ivf.code_size
+        total = 0
+        for list_no in range(ivf.nlist):
+            size = parent_lists.list_size(list_no)
+            if size == 0:
+                continue
+            ids_ptr = parent_lists.get_ids(list_no)
+            codes_ptr = parent_lists.get_codes(list_no)
+            try:
+                ids = faiss.rev_swig_ptr(ids_ptr, size)
+                kept = keep[ids]
+                n_kept = int(np.count_nonzero(kept))
+                if n_kept:
+                    new_ids = np.ascontiguousarray(rank[ids[kept]], dtype=np.int64)
+                    new_codes = np.ascontiguousarray(
+                        faiss.rev_swig_ptr(codes_ptr, size * code_size).reshape(size, code_size)[kept])
+                    ivf.invlists.add_entries(list_no, n_kept, faiss.swig_ptr(new_ids), faiss.swig_ptr(new_codes))
+                    total += n_kept
+            finally:
+                parent_lists.release_codes(list_no, codes_ptr)
+                parent_lists.release_ids(list_no, ids_ptr)
+        if total != len(rows):
+            raise RuntimeError(f"The code copy found {total} of the {len(rows)} kept chains in the lists of "
+                               f"{self.db_folder / self.index_name}: its lists do not hold one entry per chain.")
+        # The header read keeps the parent's count on the IVF and on the OPQ pre-transform.
+        ivf.ntotal = total
+        subset.ntotal = total
+        ivf.nprobe = nprobe
+        _quantize_outside_parallel_regions(subset)
+        faiss.write_index(subset, str(db_folder / f"{index_name}.index"))
+        logger.info(f"Copied the PQ codes of {total} of {n} chains into {db_folder / index_name} "
+                    f"(nlist {ivf.nlist}, nprobe {nprobe})")
+        del subset
+
+    def _subset_flat(self, rows: np.ndarray, db_folder: Path, index_name: str) -> None:
+        """Write the ``.index`` file of the flat subset of :meth:`subset`: the kept rows' stored vectors (unit vectors
+        already) in an exact ``IndexFlatIP``."""
+        n = len(self.chain_ids)
+        logger.info(f"Copying the stored vectors of {len(rows)} of {n} chains into an exact flat index at "
+                    f"{db_folder / index_name}; it holds {len(rows) * self.dimension * 4:,} bytes in memory, so a flat "
+                    "subset is for small sets")
+        subset = faiss.IndexFlatIP(self.dimension)
+        for start in range(0, n, _SUBSET_FLAT_BLOCK):
+            stop = min(start + _SUBSET_FLAT_BLOCK, n)
+            lo, hi = np.searchsorted(rows, [start, stop])
+            if lo == hi:
+                continue
+            block = self.index.reconstruct_n(start, stop - start)
+            subset.add(np.ascontiguousarray(block[rows[lo:hi] - start]))
+        faiss.write_index(subset, str(db_folder / f"{index_name}.index"))
 
     def load_database(self, use_gpu: bool = False):
         """

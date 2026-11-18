@@ -49,6 +49,27 @@ While the major version is `0`, breaking changes are released in a minor bump.
   `ivf_pq`), `clusterer.nprobe` is the value searched at (None on `flat` and
   `hnsw`), and `database` takes a `FaissEmbeddingDatabase` already loaded on
   the CPU instead of `db_path` (exactly one of the two).
+- **`FaissEmbeddingDatabase.subset(rows, db_folder, index_name,
+  parent_record=None, overwrite=False)`**: writes a database of some of a
+  loaded database's chains (`rows`: row numbers, strictly ascending) from
+  its stored data, with nothing trained or re-encoded, and returns it loaded
+  on the CPU; row r of the parent becomes row `rank(r)` of the subset. On an
+  `ivf_pq` database it copies each kept chain's PQ code, list by list, into
+  new on-disk lists under the parent's trained OPQ, coarse quantizer and PQ
+  (read from its `.index` file without the lists), so a search of the subset
+  is the parent's search restricted to the subset's chains (the same codes
+  and scores); the subset searches at the parent's current nprobe (as set by
+  `set_nprobe`, else the stored one), and its metadata stores that value, so
+  a load keeps it. On a `flat` database (or an `auto` one that is flat) it is
+  an exact `IndexFlatIP` of the kept stored vectors, held in memory, so for
+  small sets. The subset's metadata gains a `parent` block: the parent's
+  path, index name, chain count, the sha256 of its `.index` and `.metadata`
+  files, the size of its `.invlists` file, and the caller's `parent_record`
+  as `settings`. Refused (`ValueError`): rows that are not integers,
+  strictly ascending and in range, or no rows; an `hnsw` database (an
+  `auto` one that is hnsw included); a database on the GPU or not loaded;
+  the parent's own files as the target. A database already at the target is
+  refused (`FileExistsError`) unless `overwrite=True`.
 
 ### Changed
 
