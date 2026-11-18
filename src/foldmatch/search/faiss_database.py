@@ -5,19 +5,52 @@ import faiss
 import torch
 import numpy as np
 import pickle
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from foldmatch.errors import RefusalError
 from foldmatch.types.api_types import IndexConfig, IndexType
 
 logger = logging.getLogger(__name__)
 
-def _has_gpu_support():
-    """Check if FAISS has GPU support available."""
+# The most neighbours (k) a FAISS GPU index returns and the most cells (nprobe) it probes: GPU_MAX_SELECTION_K of
+# FAISS's CUDA build, as read from FAISS, not yet run against it here (the GPU benchmark probed up to 2048 cells only,
+# work/p9ivf/bench/IVF_BENCH.md). The clustering GPU path refuses more.
+GPU_MAX_K = 2048
+
+
+def _gpu_support_problem() -> Optional[str]:
+    """Why FAISS cannot search on a GPU here, or None when it can: FAISS's CUDA GPU layer and at least one visible GPU.
+    The macOS faiss-cpu wheel's Metal backend (a ``StandardGpuResources`` without ``setTempMemory``, so FoldMatch's
+    GPU paths fail in it) is not counted."""
+    if sys.platform == "darwin":
+        return "the macOS FAISS wheel, whose Metal backend FoldMatch does not use"
+    if not hasattr(faiss, 'StandardGpuResources'):
+        return f"a FAISS {faiss.__version__} without GPU support (faiss-cpu)"
     try:
-        return hasattr(faiss, 'StandardGpuResources') and faiss.get_num_gpus() > 0
-    except:
-        return False
+        n_gpus = faiss.get_num_gpus()
+    except Exception as exc:
+        return f"no GPU count from FAISS ({type(exc).__name__}: {exc})"
+    if n_gpus < 1:
+        return "no visible GPU (CUDA_VISIBLE_DEVICES, or a node without GPUs)"
+    return None
+
+
+def _require_gpu_support():
+    """Refuse (:class:`~foldmatch.errors.RefusalError`) unless FAISS can search on a GPU here
+    (:func:`_gpu_support_problem`)."""
+    problem = _gpu_support_problem()
+    if problem is not None:
+        raise RefusalError(f"GPU search (--use-gpu-index) needs FAISS's CUDA GPU support and a visible GPU, and this "
+                           f"is {problem}: install faiss-gpu {faiss.__version__} (conda), or search on the CPU without "
+                           f"--use-gpu-index.")
+
+
+def _has_gpu_support():
+    """Check if FAISS has GPU support available (FAISS's CUDA GPU layer and a visible GPU; not macOS's Metal
+    backend)."""
+    return _gpu_support_problem() is None
 
 
 # FAISS's documented minimum: k-means training degenerates below this
@@ -112,6 +145,10 @@ class FaissEmbeddingDatabase:
         self.dimension = None
         self.gpu_resources = None
         self.is_gpu_index = False
+        # The CPU index kept by a move to the GPU in the clustering mode (move_to_gpu(clustering=True)), for
+        # reconstruct_n and subset; None otherwise. And the number of GPUs the index is on (0 on the CPU).
+        self.cpu_index = None
+        self.n_gpus = 0
         self.index_type = None
         self.index_config: Optional[IndexConfig] = None
 
@@ -319,7 +356,8 @@ class FaissEmbeddingDatabase:
         to the subset's chains. The subset searches at this database's current nprobe (as set by :meth:`set_nprobe`,
         else the stored one), which its metadata stores, so a load of the subset keeps it. ``flat``: an exact
         ``IndexFlatIP`` of the kept chains' stored vectors, held in memory (rows x dimension x 4 bytes), so for small
-        sets. ``hnsw`` (an ``auto`` database that is hnsw included) is refused: an approximate graph is not subset.
+        sets. ``hnsw`` (an ``auto`` database that is hnsw included) is refused: an approximate graph is not subset. On
+        the GPU, the CPU index kept by ``move_to_gpu(clustering=True)`` is read.
 
         Args:
             rows: Row numbers of the chains to keep, integers, strictly ascending (database order) in [0, n). Row r
@@ -332,17 +370,20 @@ class FaissEmbeddingDatabase:
             overwrite: Replace a database already at ``db_folder``/``index_name``; otherwise it is refused.
 
         Raises:
-            ValueError: the database is not loaded, or is on the GPU; ``rows`` are not as above; the database is hnsw,
+            ValueError: the database is not loaded, or is on the GPU without its CPU index (:meth:`move_to_gpu`
+                without ``clustering``); ``rows`` are not as above; the database is hnsw,
                 or a flat index other than ``IndexFlatIP``; the subset would be this database's own files.
             FileExistsError: a file of the subset exists and ``overwrite`` is False.
         """
         if self.index is None:
             raise ValueError("Database not loaded. Call load_database() first.")
-        if self.is_gpu_index:
-            raise ValueError("subset reads the CPU index: load the database without use_gpu.")
+        cpu_index = self.host_index()
+        if cpu_index is None:
+            raise ValueError("subset reads the CPU index, which this move to the GPU dropped: load the database "
+                             "without use_gpu, or move it with move_to_gpu(clustering=True), which keeps it.")
         n = len(self.chain_ids)
         rows = _subset_rows(rows, n)
-        index = faiss.downcast_index(self.index)
+        index = faiss.downcast_index(cpu_index)
         if self.index_type != IndexType.ivf_pq:
             if isinstance(index, faiss.IndexHNSW):
                 raise ValueError(
@@ -368,10 +409,10 @@ class FaissEmbeddingDatabase:
         parent["settings"] = dict(parent_record or {})
         config = self.index_config
         if self.index_type == IndexType.ivf_pq:
-            nprobe = int(faiss.extract_index_ivf(self.index).nprobe)
+            nprobe = int(faiss.extract_index_ivf(cpu_index).nprobe)
             self._subset_ivf_pq(rows, db_folder, index_name, nprobe)
             if config is None:  # a database whose metadata has no config: its layout, read from the index
-                ivf = faiss.downcast_index(faiss.extract_index_ivf(self.index))
+                ivf = faiss.downcast_index(faiss.extract_index_ivf(cpu_index))
                 pq = getattr(ivf, 'pq', None)
                 config = (IndexConfig(nlist=ivf.nlist) if pq is None
                           else IndexConfig(nlist=ivf.nlist, m=pq.M, nbits=pq.nbits))
@@ -425,7 +466,7 @@ class FaissEmbeddingDatabase:
         ivf.replace_invlists(invlists, True)
         # As in _create_ivf_pq_ondisk: the IVF index owns the lists now; without disown() Python would free them too.
         invlists.this.disown()
-        parent_lists = faiss.extract_index_ivf(self.index).invlists
+        parent_lists = faiss.extract_index_ivf(self.host_index()).invlists
         code_size = ivf.code_size
         total = 0
         for list_no in range(ivf.nlist):
@@ -473,7 +514,7 @@ class FaissEmbeddingDatabase:
             lo, hi = np.searchsorted(rows, [start, stop])
             if lo == hi:
                 continue
-            block = self.index.reconstruct_n(start, stop - start)
+            block = self.host_index().reconstruct_n(start, stop - start)
             subset.add(np.ascontiguousarray(block[rows[lo:hi] - start]))
         faiss.write_index(subset, str(db_folder / f"{index_name}.index"))
 
@@ -556,15 +597,26 @@ class FaissEmbeddingDatabase:
         ivf_index.nprobe = nprobe
         logger.info(f"Set search-time nprobe = {nprobe}")
 
-    def move_to_gpu(self, gpu_id: int = 0):
+    def move_to_gpu(self, gpu_id: int = 0, clustering: bool = False):
         """
         Move the index to GPU.
 
         Args:
-            gpu_id: GPU device ID to use (default: 0)
+            gpu_id: GPU device ID to use (default: 0; not used in the clustering mode, which takes every GPU)
+            clustering: The clustering mode of ``fm-search cluster`` and ``similarity-graph`` (P9.CL D10): one replica
+                of the index on every visible GPU (``index_cpu_to_all_gpus``, not sharded: each search call's queries
+                are split between the GPUs), the PQ lookup tables of an ivf_pq index in float16 (an ivf_pq index of 64
+                sub-quantizers of 8 bits is refused on an A100 with float32 tables), and the CPU index kept as
+                ``self.cpu_index`` for ``reconstruct_n`` and :meth:`subset`. Set nprobe before the move: a GPU index
+                keeps the one it was cloned with. Refused (:class:`~foldmatch.errors.RefusalError`) without GPU support
+                instead of staying on the CPU; an hnsw index is refused (ValueError).
         """
         if self.is_gpu_index:
             logger.info("Index is already on GPU")
+            return
+
+        if clustering:
+            self._clone_to_all_gpus()
             return
 
         if not _has_gpu_support():
@@ -582,14 +634,54 @@ class FaissEmbeddingDatabase:
         self.is_gpu_index = True
         logger.info("Index successfully moved to GPU")
 
+    def _clone_to_all_gpus(self):
+        """The clustering mode of :meth:`move_to_gpu` (see there)."""
+        if self.index is None:
+            raise ValueError("No index loaded. Call load_database() first.")
+        _require_gpu_support()
+        if isinstance(faiss.downcast_index(self.index), faiss.IndexHNSW):
+            raise ValueError(f"GPU search takes flat and ivf_pq databases; {self.db_folder / self.index_name} is hnsw "
+                             f"(built with --index-type {IndexType(self.index_type).value}), which FAISS searches on "
+                             f"the CPU only.")
+        n_gpus = faiss.get_num_gpus()
+        options = faiss.GpuMultipleClonerOptions()
+        options.shard = False
+        # ivf_pq: float16 lookup tables (IVFPQ only; the coarse quantizer stays float32). On a flat index the same
+        # option would store the vectors in float16, so it is off there.
+        options.useFloat16 = self.index_type == IndexType.ivf_pq
+        logger.info(f"Copying the index to {n_gpus} GPU(s), one replica each"
+                    + (" (float16 lookup tables)" if options.useFloat16 else "")
+                    + "; the CPU index is kept for reading the stored vectors")
+        gpu_index = faiss.index_cpu_to_all_gpus(self.index, co=options, ngpu=n_gpus)
+        self.cpu_index = self.index
+        self.index = gpu_index
+        self.is_gpu_index = True
+        self.n_gpus = n_gpus
+        logger.info("Index successfully moved to GPU")
+
+    def host_index(self):
+        """The CPU index: the index itself on the CPU, the one kept by ``move_to_gpu(clustering=True)`` on the GPU,
+        None on the GPU without it (or when nothing is loaded)."""
+        return self.cpu_index if self.is_gpu_index else self.index
+
+    def release_index(self):
+        """Drop the index (on the GPU, its replicas and the kept CPU index too); the chain ids stay."""
+        self.index = None
+        self.cpu_index = None
+        self.is_gpu_index = False
+        self.n_gpus = 0
+        self.gpu_resources = None
+
     def move_to_cpu(self):
-        """Move the index from GPU to CPU."""
+        """Move the index from GPU to CPU (the CPU index kept by the clustering mode, when there is one)."""
         if not self.is_gpu_index:
             logger.info("Index is already on CPU")
             return
 
         logger.info("Moving index to CPU...")
-        self.index = faiss.index_gpu_to_cpu(self.index)
+        self.index = self.cpu_index if self.cpu_index is not None else faiss.index_gpu_to_cpu(self.index)
+        self.cpu_index = None
+        self.n_gpus = 0
         self.is_gpu_index = False
         self.gpu_resources = None
         logger.info("Index successfully moved to CPU")

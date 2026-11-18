@@ -20,6 +20,7 @@ from tqdm import tqdm
 from foldmatch import __version__
 from foldmatch.errors import RefusalError
 from foldmatch.search import FaissEmbeddingDatabase
+from foldmatch.search import faiss_database
 from foldmatch.search.embedding_database import _parse_db_path
 from foldmatch.search.output import CLUSTER_OUTPUT_FIELDS, GREEDY_CLUSTER_OUTPUT_FIELDS, write_cluster_results
 from foldmatch.types.api_types import EdgeRule, FormatMode, IndexType, LeidenBackend
@@ -215,6 +216,11 @@ class _NegativeEdgeWeights(ValueError):
         self.min_weight = min_weight
 
 
+def _device(gpus: int) -> str:
+    """The search device of a work folder's step, for the log: "the CPU" or "the GPU" (``gpus`` replicas)."""
+    return "the CPU" if gpus < 1 else ("the GPU" if gpus == 1 else f"{gpus} GPUs")
+
+
 class _WorkFolder:
     """The work folder of :meth:`EmbeddingClusterer.cluster_greedy_leiden` and of a resumable
     :meth:`EmbeddingClusterer.cluster_greedy` (P9.CL D3): ``run.json`` (the record), ``greedy.state.npz`` (greedy's
@@ -230,9 +236,11 @@ class _WorkFolder:
                  ("graph", (("threshold", "graph threshold"), ("max_neighbors", "graph max_neighbors"),
                             ("edge_rule", "graph edge_rule"))))
 
-    def __init__(self, path):
+    def __init__(self, path, gpus: int = 0):
         self.path = Path(path)
         self.record = None
+        # The GPUs this run searches on (0: the CPU), recorded with each run and step
+        self.gpus = gpus
 
     def file(self, name: str) -> Path:
         return self.path / name
@@ -296,6 +304,13 @@ class _WorkFolder:
                 logging.warning(f"FAISS runs on {threads} threads; this work folder's earlier steps ran on "
                                 f"{', '.join(str(t) for t in sorted(earlier))}: the graph can differ by a few edges "
                                 f"from a run at one thread count.")
+            devices = {step.get("gpus", 0) > 0 for run in stored.get("runs", [])
+                       for step in run.get("steps", {}).values() if not step.get("skipped")}
+            if devices - {self.gpus > 0}:
+                logging.warning(f"This run searches on {_device(self.gpus)}; this work folder's earlier steps searched "
+                                f"on {' and '.join(_device(1 if gpu else 0) for gpu in sorted(devices))}: the GPU's "
+                                f"float16 lookup tables move ivf_pq scores slightly, so reused or resumed steps may "
+                                f"differ from a run on one of them.")
         else:
             found = [name for name in WORK_FOLDER_FILES if self.has(name)]
             if found:
@@ -309,6 +324,7 @@ class _WorkFolder:
             "foldmatch_version": __version__,
             "faiss_version": faiss.__version__,
             "faiss_threads": threads,
+            "gpus": self.gpus,
             "steps": {},
         })
         self.record = stored
@@ -316,8 +332,9 @@ class _WorkFolder:
         logging.info(f"Work folder: {self.path}")
 
     def step(self, name: str, **fields):
-        """Record a step of this run in ``run.json``, with FAISS's thread count."""
-        self.record["runs"][-1]["steps"][name] = dict(fields, faiss_threads=faiss.omp_get_max_threads())
+        """Record a step of this run in ``run.json``, with FAISS's thread count and the GPUs searched on."""
+        self.record["runs"][-1]["steps"][name] = dict(fields, faiss_threads=faiss.omp_get_max_threads(),
+                                                      gpus=self.gpus)
         _write_json(self.file(_RUN_FILE), self.record)
 
     def save_greedy_state(self, labels: np.ndarray, next_start: int, n_searched: int, n_saturated: int,
@@ -595,6 +612,30 @@ class _NprobeNotApplicable(ValueError):
     """nprobe given for a database that is not ivf_pq (the CLI reports it as a usage error, after the load)."""
 
 
+class _GpuSearchRefused(ValueError):
+    """A GPU search this clusterer refuses (P9.CL D10): k or nprobe above what a FAISS GPU index takes, or an hnsw
+    database. ``param`` is the option the CLI names in its usage error."""
+
+    def __init__(self, message: str, param: str):
+        super().__init__(message)
+        self.param = param
+
+
+def _check_gpu_search():
+    """Refuse (:class:`~foldmatch.errors.RefusalError`) unless FAISS can search on a GPU here (its CUDA GPU layer and a
+    visible GPU; not macOS's Metal backend), as ``move_to_gpu(clustering=True)`` would after the load."""
+    faiss_database._require_gpu_support()
+
+
+def _refuse_gpu_k(k: int, flag: str):
+    """A search of ``k`` neighbours (already clamped to the chains) on a GPU index: refused above
+    faiss_database.GPU_MAX_K."""
+    if k > faiss_database.GPU_MAX_K:
+        raise _GpuSearchRefused(f"{flag} {k} is above {faiss_database.GPU_MAX_K}, the most neighbours a FAISS GPU "
+                                f"index returns: use at most {faiss_database.GPU_MAX_K} with --use-gpu-index, or search "
+                                f"on the CPU.", flag)
+
+
 class EmbeddingClusterer:
     """Cluster protein structure embeddings: Leiden on the similarity graph (:meth:`cluster_leiden`), greedy
     representatives in one streamed pass over the database (:meth:`cluster_greedy`), or greedy representatives then
@@ -605,11 +646,13 @@ class EmbeddingClusterer:
         """
         Load the database to cluster: from ``db_path``, or a ``database`` already loaded. The index is loaded on the
         CPU, its nprobe set, and only then moved to the GPU when ``use_gpu`` (the IVF parameters of a GPU index are
-        not reachable through extract_index_ivf).
+        not reachable through extract_index_ivf; a GPU index keeps the nprobe it was cloned with).
 
         Args:
             db_path: Path to the FAISS database (``<folder>/<index name>``)
-            use_gpu: Move the index to the GPU (if available) once nprobe is set
+            use_gpu: Search on the GPUs once nprobe is set: one replica of the index on every visible GPU, ivf_pq
+                lookup tables in float16, and the CPU index kept for reading the stored vectors
+                (``FaissEmbeddingDatabase.move_to_gpu(clustering=True)``); refused without GPU support
             nprobe: IVF cells probed per query, at least 1, ivf_pq databases only (default: the value the database
                 stored at build). The one source of nprobe of this clusterer's searches; ``self.nprobe`` is the
                 value the index searches at (None on flat and hnsw). FAISS probes at most every cell;
@@ -618,7 +661,9 @@ class EmbeddingClusterer:
 
         Raises:
             ValueError: both or neither of ``db_path`` and ``database``; ``database`` not loaded, or on the GPU;
-                ``nprobe`` below 1 (before the load); ``nprobe`` given for a flat or hnsw database (after the load)
+                ``nprobe`` below 1 (before the load); ``nprobe`` given for a flat or hnsw database (after the load);
+                with ``use_gpu``, an nprobe above ``faiss_database.GPU_MAX_K`` or an hnsw database (after the load)
+            RefusalError: ``use_gpu`` and FAISS cannot search on a GPU here (before the load)
         """
         if (db_path is None) == (database is None):
             raise ValueError("Give exactly one of db_path and database.")
@@ -626,6 +671,8 @@ class EmbeddingClusterer:
             nprobe = operator.index(nprobe)
             if nprobe < 1:
                 raise ValueError("--nprobe must be at least 1.")
+        if use_gpu:
+            _check_gpu_search()
         if database is None:
             db_folder, index_name, db_path = _parse_db_path(db_path)
             database = FaissEmbeddingDatabase(db_folder, index_name)
@@ -653,7 +700,19 @@ class EmbeddingClusterer:
             kind = "built with --index-type auto (flat or hnsw)" if index_type is IndexType.auto else index_type.value
             raise _NprobeNotApplicable(f"--nprobe applies to ivf_pq databases only; this database is {kind}.")
         if use_gpu:
-            self.db.move_to_gpu()
+            limit = faiss_database.GPU_MAX_K
+            if self.nprobe is not None and self.nprobe > limit:
+                stored = "" if nprobe is not None else " (the value stored at build)"
+                raise _GpuSearchRefused(f"--nprobe {self.nprobe}{stored} is above {limit}, the most cells a FAISS GPU "
+                                        f"index probes: give --nprobe {limit} or less with --use-gpu-index, or search "
+                                        f"on the CPU.", "--nprobe")
+            if isinstance(faiss.downcast_index(self.db.index), faiss.IndexHNSW):
+                index_type = IndexType(self.db.index_type)
+                kind = "built with --index-type auto, an hnsw index" if index_type is IndexType.auto else "hnsw"
+                raise _GpuSearchRefused(f"--use-gpu-index takes flat and ivf_pq databases; this one is {kind}, which "
+                                        f"FAISS searches on the CPU only. Search it without --use-gpu-index.",
+                                        "--use-gpu-index")
+            self.db.move_to_gpu(clustering=True)
 
         self.chain_ids = self.db.chain_ids
 
@@ -674,6 +733,15 @@ class EmbeddingClusterer:
         # graph), and greedy-leiden's graph counts
         self.modularity = None
         self.graph_stats = None
+
+    def _host_index(self):
+        """The CPU index of this clusterer's database, from which the stored vectors are read: the index itself, or on
+        the GPU the CPU index the move kept (a database moved without it is copied back, as before)."""
+        index = self.db.host_index()
+        if index is None:
+            logging.info("Moving GPU index to CPU for reconstruction...")
+            index = faiss.index_gpu_to_cpu(self.db.index)
+        return index
 
     def build_similarity_edges(
             self,
@@ -721,6 +789,8 @@ class EmbeddingClusterer:
 
         # Clamp max_neighbors to actual database size
         k = min(max_neighbors, len(self.chain_ids))
+        if self.db.is_gpu_index:
+            _refuse_gpu_k(k, "--max-neighbors")
         self.edges = self._search_edges(threshold, k, edge_rule, work_folder)
         self.min_weight = self.edges.min_weight
         return self.edges
@@ -768,11 +838,8 @@ class EmbeddingClusterer:
         # one chain is read)
         rows = 1 if k < 1 else max(1, min(n_chains, _GRAPH_MAX_ROWS, _GRAPH_RESULT_BYTES // (k * 12)))
 
-        # Get CPU index for reconstruction if using GPU
-        index_to_use = self.db.index
-        if self.db.is_gpu_index:
-            logging.info("Moving GPU index to CPU for reconstruction...")
-            index_to_use = faiss.index_gpu_to_cpu(self.db.index)
+        # The stored vectors are read from the CPU index (kept on the GPU path); the search runs on self.db.index
+        index_to_use = self._host_index()
 
         # ivf_pq decodes its PQ codes, which are not unit vectors: the query is normalised, as in query db, so a score
         # is the inner product of the chain's unit decoded embedding with each stored code. flat and hnsw store the
@@ -1061,9 +1128,11 @@ class EmbeddingClusterer:
             raise ValueError("Database not loaded. Call load_database() first.")
         if max_neighbors < 1:
             raise ValueError("--max-neighbors must be at least 1.")
+        if self.db.is_gpu_index:
+            _refuse_gpu_k(min(max_neighbors, len(self.chain_ids)), "--max-neighbors")
         work = None
         if work_folder is not None:
-            work = _WorkFolder(work_folder)
+            work = _WorkFolder(work_folder, gpus=self.db.n_gpus)
             work.open(self._work_record(greedy=dict(threshold=float(threshold),
                                                     max_neighbors=operator.index(max_neighbors))), "greedy")
 
@@ -1149,11 +1218,8 @@ class EmbeddingClusterer:
         if before_run is not None:
             before_run()
 
-        # Get CPU index for reconstruction if using GPU
-        index_to_use = self.db.index
-        if self.db.is_gpu_index:
-            logging.info("Moving GPU index to CPU for reconstruction...")
-            index_to_use = faiss.index_gpu_to_cpu(self.db.index)
+        # The stored vectors are read from the CPU index (kept on the GPU path); the search runs on self.db.index
+        index_to_use = self._host_index()
 
         # ivf_pq queries are normalised, as in build_similarity_graph
         normalize = self.db.index_type == IndexType.ivf_pq
@@ -1237,8 +1303,9 @@ class EmbeddingClusterer:
            resumable). The log then gives the representatives R, the bound of k x R edges of their graph and Leiden's
            memory at that bound.
         2. The representatives' database, ``<work_folder>/representatives``, copied from this one
-           (:meth:`FaissEmbeddingDatabase.subset`: on ivf_pq the representatives' PQ codes, on flat their vectors),
-           searched at this clusterer's nprobe, then a ``representatives.done`` marker.
+           (:meth:`FaissEmbeddingDatabase.subset`: on ivf_pq the representatives' PQ codes, on flat their vectors;
+           from the CPU index, which a clusterer on the GPU keeps), searched at this clusterer's nprobe, and on the
+           GPUs when this clusterer is, then a ``representatives.done`` marker.
         3. The representatives' graph at ``threshold``, ``max_neighbors`` and ``edge_rule``
            (:meth:`build_similarity_edges`), its edges in files of the work folder, then ``graph.done``.
         4. This database's and the representatives' FAISS indexes are released (``self.db.index`` is None
@@ -1274,8 +1341,8 @@ class EmbeddingClusterer:
             Array of cluster IDs (one per chain)
 
         Raises:
-            ValueError: an hnsw database (an ``auto`` one that is hnsw included), a database on the GPU, an argument
-                out of range, a work folder recorded with other settings or of another layout, or a representatives'
+            ValueError: an hnsw database (an ``auto`` one that is hnsw included), a database on the GPU without its CPU
+                index, a k above faiss_database.GPU_MAX_K on the GPU, an argument out of range, a work folder recorded with other settings or of another layout, or a representatives'
                 graph with a negative kept weight
             RefusalError: networkit asked for and NetworKit 11.3 not installed (before greedy)
         """
@@ -1295,23 +1362,29 @@ class EmbeddingClusterer:
         backend, threads = _leiden_backend(backend, threads, seed)
         if self.db.index is None:
             raise ValueError("Database not loaded. Call load_database() first.")
+        host = self.db.host_index()
+        if host is None:
+            raise ValueError("cluster_greedy_leiden copies the representatives' database from the CPU index, which this "
+                             "move to the GPU dropped: load the database without use_gpu, or move it with "
+                             "move_to_gpu(clustering=True), which keeps it.")
         # Judged on the loaded index: an auto database stores "auto", whichever index it built
         index_type = IndexType(self.db.index_type)
-        if index_type is IndexType.hnsw or (index_type is IndexType.auto and not self.db.is_gpu_index and isinstance(
-                faiss.downcast_index(self.db.index), faiss.IndexHNSW)):
+        if index_type is IndexType.hnsw or (index_type is IndexType.auto and isinstance(
+                faiss.downcast_index(host), faiss.IndexHNSW)):
             raise _MethodNotApplicable("--method greedy-leiden needs an ivf_pq or flat database; this one is hnsw. Use "
                                        "--method leiden, or build the database with --index-type ivf_pq or flat.")
+        n_chains = len(self.chain_ids)
         if self.db.is_gpu_index:
-            raise ValueError("cluster_greedy_leiden copies the representatives' database from the CPU index: load the "
-                             "database without use_gpu.")
+            # Both searches, before hours of greedy (the representatives are at most the chains)
+            _refuse_gpu_k(min(greedy_max_neighbors, n_chains), "--greedy-max-neighbors")
+            _refuse_gpu_k(min(max_neighbors, n_chains), "--max-neighbors")
         edge_rule = EdgeRule(edge_rule)
-        work = _WorkFolder(work_folder)
+        work = _WorkFolder(work_folder, gpus=self.db.n_gpus)
         work.open(self._work_record(
             greedy=dict(threshold=float(greedy_threshold), max_neighbors=operator.index(greedy_max_neighbors)),
             graph=dict(threshold=float(threshold), max_neighbors=operator.index(max_neighbors),
                        edge_rule=edge_rule.value)), "greedy-leiden")
         start_time = time.perf_counter()
-        n_chains = len(self.chain_ids)
 
         # 1. Greedy (a pass that runs here, not reused, invalidates the steps after it)
         labels, greedy_k, n_searched, n_saturated, n_reps = self._greedy_pass(
@@ -1361,17 +1434,18 @@ class EmbeddingClusterer:
                 _touch_marker(work.file(_REPRESENTATIVES_DONE))
                 work.step("representatives", seconds=round(time.perf_counter() - step_start, 3))
             step_start = time.perf_counter()
-            reps = EmbeddingClusterer(database=reps_db, nprobe=self.nprobe)
+            # Copied from the CPU index above, then moved to the GPUs as this database was
+            reps = EmbeddingClusterer(database=reps_db, nprobe=self.nprobe, use_gpu=self.db.is_gpu_index)
             edges = reps.build_similarity_edges(threshold=threshold, max_neighbors=max_neighbors,
                                                 edge_rule=edge_rule, work_folder=work.path)
             work.step("graph", seconds=round(time.perf_counter() - step_start, 3))
             # Only the edges are kept
-            reps.db.index = None
+            reps.db.release_index()
             reps.edges = None
             del reps, reps_db
 
-        # 4. Leiden, with both indexes released
-        self.db.index = None
+        # 4. Leiden, with both indexes released (on the GPU, their replicas and CPU indexes)
+        self.db.release_index()
         self.graph = None
         self.edges = None
         _release_freed_memory()

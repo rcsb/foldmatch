@@ -139,6 +139,14 @@ _CLUSTER_NPROBE_HELP = (
     "--ivf-nlist // 64). Higher finds more neighbours and is slower."
 )
 
+_CLUSTER_GPU_HELP = (
+    "Search on every visible GPU (needs FAISS with CUDA GPU support: faiss-gpu): one replica of the index on each "
+    "GPU, each search's queries split between them; ivf_pq lookup tables in float16, which move scores slightly "
+    "from the CPU's (the defaults of --threshold, --greedy-threshold and --resolution were measured on the CPU); the "
+    "stored vectors are read from the CPU index, which stays in memory. flat and ivf_pq databases; --max-neighbors, "
+    "--greedy-max-neighbors and --nprobe at most 2048. Refused without GPU support (exit status 1)."
+)
+
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
     "(emb_<run id>-<rank>.parquet) from --tmp-embedding-folder once the "
@@ -1646,7 +1654,7 @@ def cluster_database(
             help='Minimum cluster size to include in output (filters smaller clusters).'
         )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
-            help='Use GPU for FAISS operations (requires faiss-gpu).'
+            help=_CLUSTER_GPU_HELP
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
             help='Random seed of the Leiden step: the same seed gives the same clusters (with --leiden-backend '
@@ -1709,6 +1717,9 @@ def cluster_database(
         output_file, databases=[("the database", db_path)],
         files=[] if work_folder is None else [("the work file", Path(work_folder) / name)
                                               for name in clustering.WORK_FOLDER_FILES])
+    # GPU search: k and nprobe within FAISS's GPU limit (exit status 2), then FAISS's GPU support (exit status 1)
+    _refuse_gpu_search(use_gpu_index, nprobe, **{"--max-neighbors": max_neighbors, "--greedy-max-neighbors":
+                                                 greedy_max_neighbors if greedy_leiden else None})
     if networkit:
         # NetworKit 11.3 installed, read from its package metadata (no import): exit status 1
         clustering._check_networkit()
@@ -1767,6 +1778,8 @@ def cluster_database(
             )
     except clustering._MethodNotApplicable as exc:
         raise typer.BadParameter(str(exc), param_hint="--method") from None
+    except clustering._GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
     except clustering._WorkFolderRefused as exc:
         raise typer.BadParameter(str(exc), param_hint="--work-folder") from None
     except clustering._NegativeEdgeWeights as exc:
@@ -1819,7 +1832,7 @@ def similarity_graph(
             help=_CLUSTER_NPROBE_HELP
         )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
-            help='Use GPU for FAISS operations (requires faiss-gpu).'
+            help=_CLUSTER_GPU_HELP
         )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging verbosity level.'
@@ -1832,6 +1845,7 @@ def similarity_graph(
     _refuse_max_neighbors_below_1(max_neighbors)
     _refuse_nprobe_below_1(nprobe)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
+    _refuse_gpu_search(use_gpu_index, nprobe, **{"--max-neighbors": max_neighbors})
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
@@ -1839,11 +1853,15 @@ def similarity_graph(
     logging.info("Initializing clusterer...")
     clusterer = _clusterer(db_path, use_gpu_index, nprobe)
 
-    graph = clusterer.build_similarity_graph(
-        threshold=threshold,
-        max_neighbors=max_neighbors,
-        edge_rule=edge_rule
-    )
+    from foldmatch.search import clustering
+    try:
+        graph = clusterer.build_similarity_graph(
+            threshold=threshold,
+            max_neighbors=max_neighbors,
+            edge_rule=edge_rule
+        )
+    except clustering._GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
 
     output_path = Path(output_file)
     graph.write_graphml(str(output_path))
@@ -3431,8 +3449,7 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
 
 
 #: ``cluster``'s options that only some ``--method`` values take (P9.CL D7): (parameter name, flag, the methods that
-#: take it). Every other option is taken by every method. ``--use-gpu-index`` under greedy-leiden waits for the GPU
-#: path that keeps the CPU index (P9.CL D10).
+#: take it). Every other option is taken by every method, ``--use-gpu-index`` included (P9.CL D10).
 _METHOD_OPTIONS = (
     ("resolution", "--resolution", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
     ("leiden_iterations", "--leiden-iterations", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
@@ -3443,15 +3460,12 @@ _METHOD_OPTIONS = (
     ("greedy_threshold", "--greedy-threshold", (ClusterMethod.greedy_leiden,)),
     ("greedy_max_neighbors", "--greedy-max-neighbors", (ClusterMethod.greedy_leiden,)),
     ("work_folder", "--work-folder", (ClusterMethod.greedy, ClusterMethod.greedy_leiden)),
-    ("use_gpu_index", "--use-gpu-index", (ClusterMethod.leiden, ClusterMethod.greedy)),
 )
 
 #: What a refused option's entry adds, by (method, parameter name)
 _METHOD_OPTION_NOTES = {
     (ClusterMethod.greedy, "greedy_threshold"): "--method greedy takes its threshold from --threshold",
     (ClusterMethod.greedy, "greedy_max_neighbors"): "--method greedy takes its neighbours from --max-neighbors",
-    (ClusterMethod.greedy_leiden, "use_gpu_index"): "the representatives' database is built from the CPU index; GPU "
-                                                    "search is not supported for this method yet",
 }
 
 
@@ -3486,12 +3500,35 @@ def _refuse_nprobe_below_1(nprobe: Optional[int]):
 
 def _clusterer(db_path: str, use_gpu_index: bool, nprobe: Optional[int]):
     """``cluster`` and ``similarity-graph``: the ``EmbeddingClusterer`` of the database, its nprobe set before any move
-    to the GPU. ``--nprobe`` on a database that is not ivf_pq is refused after the load (exit status 2)."""
-    from foldmatch.search.clustering import EmbeddingClusterer, _NprobeNotApplicable
+    to the GPU. ``--nprobe`` on a database that is not ivf_pq is refused after the load (exit status 2), and so are,
+    with ``--use-gpu-index``, a stored nprobe above the GPU limit and an hnsw database."""
+    from foldmatch.search.clustering import EmbeddingClusterer, _GpuSearchRefused, _NprobeNotApplicable
     try:
         return EmbeddingClusterer(db_path=db_path, use_gpu=use_gpu_index, nprobe=nprobe)
     except _NprobeNotApplicable as exc:
         raise typer.BadParameter(str(exc), param_hint="--nprobe") from None
+    except _GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
+
+
+def _refuse_gpu_search(use_gpu_index: bool, nprobe: Optional[int], **neighbors: Optional[int]):
+    """``cluster`` and ``similarity-graph`` with ``--use-gpu-index`` (P9.CL D10), before the database is loaded: a
+    ``--nprobe`` or a neighbour count (``neighbors``: flag -> value) above what a FAISS GPU index takes is a usage
+    error (exit status 2); then FAISS without GPU support here is a refusal (exit status 1)."""
+    if not use_gpu_index:
+        return
+    from foldmatch.search import clustering, faiss_database
+    limit = faiss_database.GPU_MAX_K
+    for flag, value in neighbors.items():
+        if value is not None and value > limit:
+            raise typer.BadParameter(f"{flag} {value} is above {limit}, the most neighbours a FAISS GPU index "
+                                     f"returns: use at most {limit} with --use-gpu-index, or search on the CPU.",
+                                     param_hint=flag)
+    if nprobe is not None and nprobe > limit:
+        raise typer.BadParameter(f"--nprobe {nprobe} is above {limit}, the most cells a FAISS GPU index probes: give "
+                                 f"--nprobe {limit} or less with --use-gpu-index, or search on the CPU.",
+                                 param_hint="--nprobe")
+    clustering._check_gpu_search()
 
 
 def _refuse_max_neighbors_below_1(max_neighbors: int):

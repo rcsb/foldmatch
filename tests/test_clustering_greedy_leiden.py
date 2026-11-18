@@ -898,10 +898,6 @@ class MethodRefusalTest(unittest.TestCase):
              "--method greedy does not take --greedy-threshold (--method greedy-leiden; --method greedy takes its "
              "threshold from --threshold), --greedy-max-neighbors (--method greedy-leiden; --method greedy takes its "
              "neighbours from --max-neighbors). Remove them, or use a method that takes them."),
-            (("--method", "greedy-leiden", "--work-folder", "w", "--use-gpu-index"),
-             "--method greedy-leiden does not take --use-gpu-index (--method leiden or greedy; the representatives' "
-             "database is built from the CPU index; GPU search is not supported for this method yet). Remove it, or "
-             "use a method that takes it."),
             (("--method", "greedy", "--resolution", "2", "--edge-rule", "lower", "--greedy-threshold", "0.9",
               "--work-folder", "w", "--use-gpu-index"),
              "--method greedy does not take --resolution (--method leiden or greedy-leiden), --edge-rule (--method "
@@ -923,10 +919,14 @@ class MethodRefusalTest(unittest.TestCase):
                   "--greedy-max-neighbors", "5", "--resolution", "3", "--leiden-iterations", "2", "--seed", "1",
                   "--edge-rule", "lower", "--nprobe", "3", "--max-neighbors", "7"),
                  ("--method", "greedy", "--work-folder", "w", "--use-gpu-index", "--nprobe", "2"),
-                 ("--method", "leiden", "--use-gpu-index", "--edge-rule", "rescue")]
+                 ("--method", "leiden", "--use-gpu-index", "--edge-rule", "rescue"),
+                 ("--method", "greedy-leiden", "--work-folder", "w", "--use-gpu-index")]
         for extra in cases:
             with self.subTest(extra=extra):
-                result = self.invoke(*base, *extra)
+                # FAISS's GPU support (exit status 1 without it, before the load) is passed here: no GPU on this
+                # machine; the option table is what is checked
+                with mock.patch.object(clustering, "_check_gpu_search"):
+                    result = self.invoke(*base, *extra)
                 self.assertEqual(result.exit_code, 1, result.output)
                 self.assertEqual(str(result.exception), "the database was loaded")
 

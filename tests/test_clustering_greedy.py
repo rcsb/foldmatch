@@ -954,6 +954,9 @@ class ClusterCommandTest(unittest.TestCase):
                             resolution=7.0, n_iterations=4, seed=8)]),
             (dict(method=ClusterMethod.greedy_leiden, work_folder=work, resolution=1.0),
              [greedy_leiden(resolution=1.0)]),
+            (dict(method=ClusterMethod.greedy_leiden, work_folder=work, use_gpu_index=True), [greedy_leiden()]),
+            (dict(method=ClusterMethod.greedy, use_gpu_index=True),
+             [mock.call.cluster_greedy(threshold=0.7, max_neighbors=9, work_folder=None)]),
             (dict(leiden_backend=LeidenBackend.igraph),
              [mock.call.build_similarity_graph(threshold=0.7, max_neighbors=9, edge_rule=rescue),
               leiden(resolution=1.0, n_iterations=10, seed=None)]),
@@ -973,6 +976,7 @@ class ClusterCommandTest(unittest.TestCase):
                 # Routed as on Linux: macOS refuses more than one NetworKit thread
                 with mock.patch.object(clustering, "EmbeddingClusterer") as made, \
                         mock.patch.object(clustering, "_check_networkit") as checked, \
+                        mock.patch.object(clustering, "_check_gpu_search") as gpu_checked, \
                         mock.patch.object(search.sys, "platform", "linux"):
                     # A graph whose kept scores are all at least 0
                     made.return_value.min_weight = 0.7
@@ -984,6 +988,8 @@ class ClusterCommandTest(unittest.TestCase):
                                                                  nprobe=kwargs.get("nprobe"))])
                 # NetworKit's installation is checked (before the load) under networkit only
                 self.assertEqual(checked.call_count, int(kwargs.get("leiden_backend") == "networkit"))
+                # FAISS's GPU support is checked (before the load) with --use-gpu-index only
+                self.assertEqual(gpu_checked.call_count, int(kwargs.get("use_gpu_index", False)))
                 clusterer = made.return_value
                 self.assertEqual([c for c in clusterer.mock_calls if c[0] in (
                     "build_similarity_graph", "build_similarity_edges", "cluster_leiden", "cluster_greedy",

@@ -68,7 +68,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   files, the size of its `.invlists` file, and the caller's `parent_record`
   as `settings`. Refused (`ValueError`): rows that are not integers,
   strictly ascending and in range, or no rows; an `hnsw` database (an
-  `auto` one that is hnsw included); a database on the GPU or not loaded;
+  `auto` one that is hnsw included); a database not loaded, or on the GPU
+  without its CPU index (`move_to_gpu(clustering=True)`, below, keeps it);
   the parent's own files as the target. A database already at the target is
   refused (`FileExistsError`) unless `overwrite=True`.
 - **`fm-search cluster --method greedy-leiden`**: greedy representatives at
@@ -96,9 +97,10 @@ While the major version is `0`, breaking changes are released in a minor bump.
   own representative and the file's first three columns are `--method
   leiden`'s at the same settings, byte for byte (checked on `flat` and
   `ivf_pq` databases). An `hnsw` database (an `auto` one that is hnsw
-  included) is refused after the load (exit status 2); `--use-gpu-index` is
-  refused under this method for now (the representatives' database is built
-  from the CPU index). Library: `EmbeddingClusterer.cluster_greedy_leiden(
+  included) is refused after the load (exit status 2). With
+  `--use-gpu-index` (below) both searches run on the GPUs: the
+  representatives' database is copied from the parent's CPU index, then
+  moved. Library: `EmbeddingClusterer.cluster_greedy_leiden(
   work_folder, greedy_threshold=0.9, greedy_max_neighbors=1000,
   threshold=0.8, max_neighbors=100, edge_rule=rescue, resolution=20.0,
   n_iterations=10, seed=None)`, which sets `clusters`,
@@ -111,7 +113,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   files and its `.invlists` size, the effective nprobe (the cells probed:
   an `--nprobe` above the cell count is recorded as the cell count), the
   greedy and graph settings as resolved, and each run's steps with FAISS's
-  thread count),
+  thread count and
+  the GPUs searched on),
   `greedy.state.npz` (written every 900 s of greedy and at its end, to a
   temporary name, fsynced, then renamed; each checkpoint logs the rate in
   searched chains a second), the representatives' database with a
@@ -128,8 +131,9 @@ While the major version is `0`, breaking changes are released in a minor bump.
   recorded setting or parent file that differs (each named with both
   values; `--nprobe` equal to the stored value is no difference), a folder
   with work files but no `run.json`, or a `run.json` of another layout. A
-  moved parent with the same files is accepted; another FAISS thread count
-  or FoldMatch or FAISS version is a WARNING. `--output-file` may be inside
+  moved parent with the same files is accepted; another FAISS thread count,
+  FoldMatch or FAISS version, or a change between CPU and GPU search is a
+  WARNING. `--output-file` may be inside
   the work folder, but not one of its files (exit status 1). Library:
   `work_folder=` on `EmbeddingClusterer.cluster_greedy` and on
   `EmbeddingClusterer.build_similarity_edges` (the edges appended to the
@@ -176,6 +180,34 @@ While the major version is `0`, breaking changes are released in a minor bump.
   needs `build_similarity_edges` first: "Edges not built. Call
   build_similarity_edges() first.") and `cluster_greedy_leiden` (checked
   before greedy runs).
+- **GPU search for `fm-search cluster` (every `--method`) and `fm-search
+  similarity-graph`** (`--use-gpu-index`): one replica of the index on every
+  visible GPU (FAISS's `index_cpu_to_all_gpus`, not sharded: each search
+  call's queries are split between the GPUs), the PQ lookup tables of an
+  `ivf_pq` index in float16 (an `ivf_pq` index of 64 sub-quantizers of 8
+  bits is refused on an A100 with float32 tables; a `flat` index stays in
+  float32), and the CPU index kept in memory: the stored vectors are read
+  from it (`reconstruct_n`), and `--method greedy-leiden` copies the
+  representatives' database from it, then moves that database to the GPUs
+  too. nprobe is set on the CPU index before the move (a GPU index keeps the
+  value it was cloned with). On 4 A100s, FAISS searched 28,188-32,607
+  queries a second at nlist 16,384, nprobe 256, k = 1000 (30.4M chains),
+  against 1,011-1,752 on the node's 64 CPU cores. The float16 tables move
+  scores slightly: on a 10M-chain TrEMBL sample, `--method greedy-leiden`
+  on the GPUs kept 26 more representatives than on the CPU (1,886,496
+  against 1,886,470), its graph had an edge Jaccard of 0.992 with the CPU's,
+  and its label AMIs (Pfam clan and family, Gene3D, SUPERFAMILY, UniRef50)
+  were within 0.0007 of the CPU's at resolution 10 and 20, with greedy 7.5x
+  and the graph 9.9x faster on the GPUs than on the same node's CPU. Refused (exit status 2):
+  `--max-neighbors`, `--greedy-max-neighbors` or `--nprobe` above 2048, the
+  most FAISS's GPU indexes take (before the load; a stored nprobe above it
+  after the load), and an `hnsw` database (an `auto` one that is hnsw
+  included; after the load). Library:
+  `FaissEmbeddingDatabase.move_to_gpu(gpu_id=0, clustering=False)`, whose
+  `clustering=True` is this mode (refused without GPU support, an hnsw
+  index refused), `cpu_index`, `n_gpus`, `host_index()` (the CPU index) and
+  `release_index()`; `faiss_database.GPU_MAX_K`; and
+  `EmbeddingClusterer(use_gpu=True)` in this mode.
 
 ### Changed
 
@@ -195,8 +227,8 @@ While the major version is `0`, breaking changes are released in a minor bump.
   take are one check with one message**: every such option given
   (`--resolution`, `--leiden-iterations`, `--seed`, `--edge-rule`,
   `--greedy-threshold`,
-  `--greedy-max-neighbors`, `--work-folder`, and `--use-gpu-index` under
-  `greedy-leiden`) is named with the methods that take it, for example
+  `--greedy-max-neighbors`, `--work-folder`) is named with the methods that
+  take it, for example
   "--method greedy does not take --resolution (--method leiden or
   greedy-leiden), --seed (--method leiden or greedy-leiden). Remove them, or
   use a method that takes them." (exit status 2, before the database is
@@ -204,6 +236,14 @@ While the major version is `0`, breaking changes are released in a minor bump.
   has no resolution or iteration count and is deterministic.". The help of
   `--resolution`, `--leiden-iterations` and `--seed` now ends "Refused with
   --method greedy." instead of "--method leiden only.".
+- **BREAKING — `fm-search cluster --use-gpu-index` and `fm-search
+  similarity-graph --use-gpu-index` are refused without GPU support** (exit
+  status 1, before the database is loaded: FAISS without its CUDA GPU layer,
+  no visible GPU, or macOS) instead of searching on the CPU after a message,
+  and they search in the GPU mode above (every GPU, float16 tables on
+  `ivf_pq`, the CPU index kept) instead of one GPU with default options and
+  the CPU index copied back for every pass. `EmbeddingClusterer(use_gpu=
+  True)` raises `RefusalError` there.
 - `fm-search cluster --max-neighbors` defaults to None, resolved by method:
   1000 under `leiden` and `greedy` (unchanged), 100 under `greedy-leiden`.
 - `fm-search cluster --resolution` defaults to None, resolved by method: 1.0
@@ -244,6 +284,11 @@ While the major version is `0`, breaking changes are released in a minor bump.
 
 - The `EmbeddingClusterer` constructor's docstring named an `index_name`
   argument that does not exist; it now documents its arguments.
+- On macOS, FAISS's Metal backend (in the faiss-cpu wheel) counted as GPU
+  support, so a GPU request failed with an `AttributeError` in
+  `setTempMemory`. It no longer counts: the commands that fall back to the
+  CPU without GPU support (the query commands, the builds) do so on macOS
+  too.
 
 ## [0.12.0] - 2026-11-16
 

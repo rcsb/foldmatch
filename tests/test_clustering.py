@@ -1587,10 +1587,10 @@ class NprobeTest(unittest.TestCase):
                 self.assertTrue(issubclass(clustering._NprobeNotApplicable, ValueError))
 
     def test_set_before_the_gpu_move(self):
-        """The load is on the CPU; nprobe is set on the CPU index, then the index moves to the GPU (move_to_gpu
-        recorded, not run: no GPU here)."""
-        for nprobe, use_gpu, expected in ((5, True, ["load", "set_nprobe 5", "move_to_gpu"]),
-                                          (None, True, ["load", "move_to_gpu"]),
+        """The load is on the CPU; nprobe is set on the CPU index, then the index moves to the GPU in the clustering
+        mode (the GPU support check and move_to_gpu recorded, not run: no GPU here)."""
+        for nprobe, use_gpu, expected in ((5, True, ["GPU check", "load", "set_nprobe 5", "move_to_gpu clustering"]),
+                                          (None, True, ["GPU check", "load", "move_to_gpu clustering"]),
                                           (5, False, ["load", "set_nprobe 5"])):
             with self.subTest(nprobe=nprobe, use_gpu=use_gpu):
                 calls = []
@@ -1605,10 +1605,13 @@ class NprobeTest(unittest.TestCase):
                     calls.append(f"set_nprobe {value}")
                     return set_nprobe(db, value)
 
+                def record_move(db, gpu_id=0, clustering=False):
+                    calls.append("move_to_gpu clustering" if clustering else "move_to_gpu")
+
                 with mock.patch.object(FaissEmbeddingDatabase, "load_database", record_load), \
                         mock.patch.object(FaissEmbeddingDatabase, "set_nprobe", record_set), \
-                        mock.patch.object(FaissEmbeddingDatabase, "move_to_gpu",
-                                          lambda db, gpu_id=0: calls.append("move_to_gpu")):
+                        mock.patch.object(FaissEmbeddingDatabase, "move_to_gpu", record_move), \
+                        mock.patch.object(clustering, "_check_gpu_search", lambda: calls.append("GPU check")):
                     clusterer = EmbeddingClusterer(self.pq_path, use_gpu=use_gpu, nprobe=nprobe)
                 self.assertEqual(calls, expected)
                 self.assertEqual(clusterer.nprobe, nprobe or self.stored)
