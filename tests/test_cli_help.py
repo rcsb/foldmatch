@@ -137,5 +137,25 @@ class InferenceOutputHelpTest(unittest.TestCase):
                 self.assertIn("structure_format", _inference_help(name)[1])
 
 
+class RichMarkupHelpTest(unittest.TestCase):
+    """typer renders help as Rich markup: a bracketed word such as [networkit] is read as a style tag and dropped."""
+
+    def test_no_help_loses_text_to_markup(self):
+        from rich.text import Text
+        seen = 0
+        for typer_app in (app, inference.app, embedding.app):
+            for path, command in _commands(typer.main.get_command(typer_app)):
+                texts = [("help", command.help)] + [(param.name, getattr(param, "help", None))
+                                                    for param in command.params]
+                for name, text in texts:
+                    if not text:
+                        continue
+                    seen += 1
+                    with self.subTest(command=" ".join(path), param=name):
+                        # The only markup the help holds is an escaped bracket, \\[, rendered as [.
+                        self.assertEqual(Text.from_markup(text).plain, text.replace("\\[", "["))
+        self.assertGreater(seen, 100)
+
+
 if __name__ == "__main__":
     unittest.main()

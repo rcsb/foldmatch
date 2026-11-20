@@ -32,6 +32,8 @@ from foldmatch.types.api_types import (
     StructureFormat,
     Accelerator,
     ClusterMethod,
+    EdgeRule,
+    LeidenBackend,
     Strategy,
     Granularity,
     IndexConfig,
@@ -122,6 +124,28 @@ _QUERY_MAX_EVALUE_HELP = (
 )
 
 _BLOSUM62_ONLY = " BLOSUM62 scoring only: refused with --scoring esm-codes."
+
+# cluster and similarity-graph: the edge rule (P9.CL D1); rescue's figures from the Swiss-Prot edge-rule study.
+_EDGE_RULE_HELP = (
+    "Which k-NN hits become edges. lower: an edge (i, j), i < j, is kept only from the search of the lower chain i "
+    f"(FoldMatch up to 0.12.0). {EdgeRule.rescue.value} (default): the same edges, plus, for each chain that would "
+    "get no edge that way, an edge to each of its own hits at or above --threshold; these chains sit mostly at the "
+    "end of the database. rescue adds about 0.1-1.6% edges at --max-neighbors 30-100 (measured on Swiss-Prot)."
+)
+
+# cluster and similarity-graph: the search depth (P9.CL D6). The build default is max(1, --ivf-nlist // 64).
+_CLUSTER_NPROBE_HELP = (
+    "IVF cells probed per query (ivf_pq databases only). Default: the value stored at build (--ivf-nprobe, or "
+    "--ivf-nlist // 64). Higher finds more neighbours and is slower."
+)
+
+_CLUSTER_GPU_HELP = (
+    "Search on every visible GPU (needs FAISS with CUDA GPU support: faiss-gpu): one replica of the index on each "
+    "GPU, each search's queries split between them; ivf_pq lookup tables in float16, which move scores slightly "
+    "from the CPU's (the defaults of --threshold, --greedy-threshold and --resolution were measured on the CPU); the "
+    "stored vectors are read from the CPU index, which stays in memory. flat and ivf_pq databases; --max-neighbors, "
+    "--greedy-max-neighbors and --nprobe at most 2048. Refused without GPU support (exit status 1)."
+)
 
 _CLEANUP_EMBEDDINGS_HELP = (
     "Delete this build's intermediate embedding shards "
@@ -1536,55 +1560,106 @@ def show_statistics(
 
 @app.command(
     name="cluster",
-    help="Cluster database embeddings: Leiden on the similarity graph (default), or greedy representatives in one "
-         "streamed pass (--method greedy)."
+    help="Cluster database embeddings: Leiden on the similarity graph (default), greedy representatives in one "
+         "streamed pass (--method greedy), or greedy representatives then Leiden on the representatives' graph "
+         "(--method greedy-leiden)."
 )
 def cluster_database(
         db_path: Annotated[str, typer.Option(
             help='Path to the FAISS database.'
         )],
         method: Annotated[ClusterMethod, typer.Option(
-            help='Clustering method: leiden builds the similarity graph and runs Leiden (python-igraph, a fixed number '
-                 'of iterations, --leiden-iterations; memory grows with the edges); '
+            help='Clustering method: leiden builds the similarity graph and runs Leiden (python-igraph, or NetworKit '
+                 'with --leiden-backend networkit; a fixed number of iterations, --leiden-iterations; memory grows '
+                 'with the edges); '
                  'greedy picks representatives in one streamed pass over the database (memory grows with the chains, '
                  'searches only chains no representative has taken; for collections whose graph does not fit in '
-                 'memory).'
+                 'memory); '
+                 'greedy-leiden: greedy representatives at --greedy-threshold, then Leiden on the representatives\' '
+                 'similarity graph (--threshold, --max-neighbors, --resolution); every chain takes its '
+                 'representative\'s cluster. For collections whose direct graph does not fit in memory. Needs '
+                 '--work-folder and an ivf_pq or flat database.'
         )] = ClusterMethod.leiden,
         threshold: Annotated[float, typer.Option(
             help='Similarity threshold (cosine; identical chains score 1, or close to 1 on ivf_pq, where scores are PQ '
                  'estimates): with --method leiden, the edge threshold, and the kept scores must be at least 0 '
                  '(Leiden\'s modularity needs non-negative edge weights); with --method greedy, a representative takes '
-                 'the still-unclustered neighbours scoring at least this.'
+                 'the still-unclustered neighbours scoring at least this; with --method greedy-leiden, the edge '
+                 'threshold of the representatives\' graph (its kept scores must be at least 0).'
         )] = 0.8,
         resolution: Annotated[Optional[float], typer.Option(
-            help='Leiden resolution parameter (higher = more clusters). Default: 1.0. --method leiden only.'
+            help='Leiden resolution parameter (higher = more, smaller clusters). Default: 1.0 with --method leiden; '
+                 '20 with --method greedy-leiden (measured on TrEMBL samples of 1M-10M chains: largest cluster about '
+                 '2% of the chains or less; Pfam family agreement higher than at 10, best at 50, the top of the '
+                 'measured grid; a lower value such as 10 keeps more superfamilies whole). Refused with --method '
+                 'greedy.'
         )] = None,
         leiden_iterations: Annotated[Optional[int], typer.Option(
             help='Leiden iterations, a fixed count (at least 1). Default: 10, which on two measured 1M-chain graphs '
                  'agreed with Leiden run to convergence within seed noise; fewer are faster, with somewhat noisier '
-                 'partitions. --method leiden only.'
+                 'partitions. With --leiden-backend networkit, a maximum. Refused with --method greedy.'
         )] = None,
         output_file: Annotated[str, typer.Option(
             help='Path to save cluster assignments, as tab-separated rows with '
                  f'no header: {", ".join(CLUSTER_OUTPUT_FIELDS)} (--method leiden) or '
-                 f'{", ".join(GREEDY_CLUSTER_OUTPUT_FIELDS)} (--method greedy, the representative\'s chain id last); '
+                 f'{", ".join(GREEDY_CLUSTER_OUTPUT_FIELDS)} (--method greedy, the representative\'s chain id last; '
+                 '--method greedy-leiden, the final cluster and the chain\'s greedy representative); '
                  'cluster_id 0 is the largest cluster.'
         )] = "clusters.tsv",
-        max_neighbors: Annotated[int, typer.Option(
+        max_neighbors: Annotated[Optional[int], typer.Option(
             help='Maximum number of neighbors to consider per chain. With --method greedy, the neighbours a '
                  'representative takes from, so also a cluster\'s size cap (this + 1); when most representatives have '
                  'this many neighbours above --threshold, clusters are bounded by it rather than by --threshold (see '
-                 'the statistics).'
-        )] = 1000,
+                 'the statistics). Default: 1000; 100 with --method greedy-leiden, where it sets the representatives\' '
+                 'graph.'
+        )] = None,
+        greedy_threshold: Annotated[Optional[float], typer.Option(
+            help='With --method greedy-leiden, a representative takes the still-unclustered chains scoring at least '
+                 'this. Default: 0.9. Refused with the other methods (use --threshold).'
+        )] = None,
+        greedy_max_neighbors: Annotated[Optional[int], typer.Option(
+            help='With --method greedy-leiden, the neighbours a representative takes from, so also the greedy '
+                 'cluster-size cap. Default: 1000.'
+        )] = None,
+        edge_rule: Annotated[Optional[EdgeRule], typer.Option(
+            help=f'{_EDGE_RULE_HELP} --method leiden and greedy-leiden (greedy builds no graph).'
+        )] = None,
+        # The \\[ escapes the bracket: typer renders help as Rich markup, which would drop [networkit] as a style tag
+        leiden_backend: Annotated[Optional[LeidenBackend], typer.Option(
+            help='Leiden implementation. igraph (default): python-igraph\'s community_leiden, one thread, the same '
+                 '--seed gives the same clusters. networkit: NetworKit\'s ParallelLeiden on --leiden-threads threads, '
+                 '5-25x faster on large graphs (measured at 64 threads on Linux); needs pip install '
+                 '\'foldmatch\\[networkit]\' (NetworKit 11.3: wheels for Linux x86_64 and macOS 26 arm64, where it '
+                 'runs on 1 thread only; none for Linux aarch64). With more than one thread the same --seed does not '
+                 'give the same clusters. Refused with --method greedy.'
+        )] = None,
+        leiden_threads: Annotated[Optional[int], typer.Option(
+            help='With --leiden-backend networkit, the threads of ParallelLeiden and of its graph build (at least 1). '
+                 'Default: every OpenMP thread (NetworKit\'s maximum, OMP_NUM_THREADS when set); 1 on macOS, where '
+                 'more are refused (NetworKit\'s OpenMP runtime crashes there next to torch\'s and FAISS\'s). 1 gives '
+                 'the same clusters for the same --seed. Refused with --leiden-backend igraph and with --method '
+                 'greedy.'
+        )] = None,
+        nprobe: Annotated[Optional[int], typer.Option(
+            help=_CLUSTER_NPROBE_HELP
+        )] = None,
+        work_folder: Annotated[Optional[str], typer.Option(
+            help='A folder for the intermediate results of --method greedy-leiden (greedy labels, the '
+                 'representatives\' database, the representatives\' graph), so that a run that stops can be resumed '
+                 'by running the same command again, and Leiden can be run again at another --resolution without the '
+                 'searches. With --method greedy, it keeps the greedy labels for a resume. It may hold tens of GiB at '
+                 '200M chains: put it on scratch.'
+        )] = None,
         min_cluster_size: Annotated[Optional[int], typer.Option(
             help='Minimum cluster size to include in output (filters smaller clusters).'
         )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
-            help='Use GPU for FAISS operations (requires faiss-gpu).'
+            help=_CLUSTER_GPU_HELP
         )] = False,
         seed: Annotated[Optional[int], typer.Option(
-            help='Random seed of the Leiden step: the same seed gives the same clusters; without it each run may '
-                 'differ. At least 0. --method leiden only (greedy is deterministic).'
+            help='Random seed of the Leiden step: the same seed gives the same clusters (with --leiden-backend '
+                 'networkit only on one --leiden-threads; on more, a WARNING); without it each run may differ. At '
+                 'least 0. Refused with --method greedy (deterministic).'
         )] = None,
         format_mode: Annotated[FormatMode, typer.Option(
             help=_FORMAT_MODE_HELP
@@ -1593,52 +1668,122 @@ def cluster_database(
             help='Logging level.'
         )] = LogLevel.info
 ):
-    """Cluster database embeddings: Leiden on the similarity graph, or greedy representatives in one streamed pass."""
+    """Cluster database embeddings: Leiden on the similarity graph, greedy representatives in one streamed pass, or
+    greedy representatives then Leiden on the representatives' graph."""
 
     set_log_level(log_level)
-    method = _refuse_leiden_only_options(method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed)
+    # The options a method does not take, given (not None), in one message; then the per-method defaults; then the
+    # range checks; then the load (P9.CL D7)
+    method = _refuse_method_options(
+        method, resolution=resolution, leiden_iterations=leiden_iterations, seed=seed, edge_rule=edge_rule,
+        greedy_threshold=greedy_threshold, greedy_max_neighbors=greedy_max_neighbors, work_folder=work_folder,
+        leiden_backend=leiden_backend, leiden_threads=leiden_threads, use_gpu_index=use_gpu_index or None)
+    from foldmatch.search import clustering
+    greedy_leiden = method is ClusterMethod.greedy_leiden
+    if greedy_leiden and work_folder is None:
+        raise typer.BadParameter("--method greedy-leiden needs --work-folder: a folder for its intermediate results "
+                                 "(greedy labels, the representatives' database, the representatives' graph), from "
+                                 "which a run that stops is resumed.", param_hint="--work-folder")
+    if max_neighbors is None:
+        max_neighbors = clustering._GREEDY_LEIDEN_MAX_NEIGHBORS if greedy_leiden else 1000
+    if greedy_threshold is None:
+        greedy_threshold = clustering._GREEDY_LEIDEN_GREEDY_THRESHOLD
+    if greedy_max_neighbors is None:
+        greedy_max_neighbors = clustering._GREEDY_LEIDEN_GREEDY_MAX_NEIGHBORS
+    edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
+    leiden_backend = LeidenBackend.igraph if leiden_backend is None else LeidenBackend(leiden_backend)
+    networkit = leiden_backend is LeidenBackend.networkit
+    if leiden_threads is not None and not networkit:
+        raise typer.BadParameter("--leiden-threads applies to --leiden-backend networkit only; igraph runs on one "
+                                 "thread.", param_hint="--leiden-threads")
     if leiden_iterations is not None and leiden_iterations < 1:
         raise typer.BadParameter("--leiden-iterations must be at least 1.", param_hint="--leiden-iterations")
     if seed is not None and seed < 0:
         raise typer.BadParameter("--seed must be at least 0.", param_hint="--seed")
+    if networkit and seed is not None and seed > clustering._NETWORKIT_SEED_MAX:
+        raise typer.BadParameter("--seed must be below 2**64 with --leiden-backend networkit (NetworKit's seed is an "
+                                 "unsigned 64-bit integer).", param_hint="--seed")
+    if leiden_threads is not None and leiden_threads < 1:
+        raise typer.BadParameter("--leiden-threads must be at least 1.", param_hint="--leiden-threads")
+    if networkit and leiden_threads is not None and leiden_threads > 1 and sys.platform == "darwin":
+        raise typer.BadParameter(clustering._NETWORKIT_DARWIN_REFUSAL, param_hint="--leiden-threads")
     _refuse_max_neighbors_below_1(max_neighbors)
-    _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
+    if greedy_max_neighbors < 1:
+        raise typer.BadParameter("--greedy-max-neighbors must be at least 1.", param_hint="--greedy-max-neighbors")
+    _refuse_nprobe_below_1(nprobe)
+    if work_folder is not None and os.path.exists(work_folder) and not os.path.isdir(work_folder):
+        raise typer.BadParameter(f"{work_folder} is a file, not a folder.", param_hint="--work-folder")
+    _refuse_output_over_inputs(
+        output_file, databases=[("the database", db_path)],
+        files=[] if work_folder is None else [("the work file", Path(work_folder) / name)
+                                              for name in clustering.WORK_FOLDER_FILES])
+    # GPU search: k and nprobe within FAISS's GPU limit (exit status 2), then FAISS's GPU support (exit status 1)
+    _refuse_gpu_search(use_gpu_index, nprobe, **{"--max-neighbors": max_neighbors, "--greedy-max-neighbors":
+                                                 greedy_max_neighbors if greedy_leiden else None})
+    if networkit:
+        # NetworKit 11.3 installed, read from its package metadata (no import): exit status 1
+        clustering._check_networkit()
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
 
     # Initialize clusterer
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import EmbeddingClusterer, _LEIDEN_ITERATIONS
-    clusterer = EmbeddingClusterer(
-        db_path=db_path,
-        use_gpu=use_gpu_index
-    )
+    clusterer = _clusterer(db_path, use_gpu_index, nprobe)
+    if resolution is None:
+        resolution = clustering._GREEDY_LEIDEN_RESOLUTION if greedy_leiden else 1.0
+    leiden_iterations = clustering._LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations
 
-    if method is ClusterMethod.greedy:
-        # Greedy representatives, streamed: no graph
-        clusterer.cluster_greedy(
-            threshold=threshold,
-            max_neighbors=max_neighbors
-        )
-    else:
-        # Build similarity graph
-        clusterer.build_similarity_graph(
-            threshold=threshold,
-            max_neighbors=max_neighbors
-        )
-        # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
-        if clusterer.min_weight < 0:
-            raise typer.BadParameter(f"with --method leiden, Leiden's modularity needs non-negative edge weights, and "
-                                     f"this --threshold kept a score of {clusterer.min_weight:.4g}. Use a --threshold "
-                                     f"of 0 or more, or --method greedy.", param_hint="--threshold")
+    try:
+        if method is ClusterMethod.greedy:
+            # Greedy representatives, streamed: no graph
+            clusterer.cluster_greedy(
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                work_folder=work_folder
+            )
+        elif greedy_leiden:
+            clusterer.cluster_greedy_leiden(
+                work_folder=work_folder,
+                greedy_threshold=greedy_threshold,
+                greedy_max_neighbors=greedy_max_neighbors,
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                edge_rule=edge_rule,
+                resolution=resolution,
+                n_iterations=leiden_iterations,
+                seed=seed,
+                backend=leiden_backend,
+                threads=leiden_threads
+            )
+        else:
+            # The similarity graph's edges: an igraph graph for igraph, the edges alone for NetworKit
+            build = clusterer.build_similarity_edges if networkit else clusterer.build_similarity_graph
+            build(
+                threshold=threshold,
+                max_neighbors=max_neighbors,
+                edge_rule=edge_rule
+            )
+            # Leiden's modularity needs non-negative edge weights: refused on the kept scores, after the build
+            if clusterer.min_weight < 0:
+                _refuse_negative_weights(method, clusterer.min_weight)
 
-        # Perform clustering
-        clusterer.cluster_leiden(
-            resolution=1.0 if resolution is None else resolution,
-            n_iterations=_LEIDEN_ITERATIONS if leiden_iterations is None else leiden_iterations,
-            seed=seed
-        )
+            # Perform clustering
+            clusterer.cluster_leiden(
+                resolution=resolution,
+                n_iterations=leiden_iterations,
+                seed=seed,
+                backend=leiden_backend,
+                threads=leiden_threads
+            )
+    except clustering._MethodNotApplicable as exc:
+        raise typer.BadParameter(str(exc), param_hint="--method") from None
+    except clustering._GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
+    except clustering._WorkFolderRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint="--work-folder") from None
+    except clustering._NegativeEdgeWeights as exc:
+        _refuse_negative_weights(method, exc.min_weight)
 
     # Display statistics
     clusterer.print_statistics()
@@ -1649,6 +1794,18 @@ def cluster_database(
         min_cluster_size=min_cluster_size,
         format_mode=format_mode,
     )
+
+
+def _refuse_negative_weights(method: ClusterMethod, min_weight: float):
+    """Leiden's modularity needs non-negative edge weights: a graph (under greedy-leiden, the representatives') whose
+    kept scores include a negative one is refused after its build (exit status 2), naming --threshold. Under
+    greedy-leiden the work folder records this --threshold, so the message says that a rerun needs a new one."""
+    graph = "" if method is ClusterMethod.leiden else " on the representatives' graph"
+    folder = ("" if method is ClusterMethod.leiden else
+              " with a new --work-folder (this one records this --threshold, so greedy runs again)")
+    raise typer.BadParameter(f"with --method {method.value}, Leiden's modularity needs non-negative edge weights, and "
+                             f"this --threshold kept a score of {min_weight:.4g}{graph}. Use a --threshold of 0 or "
+                             f"more{folder}, or --method greedy.", param_hint="--threshold")
 
 
 @app.command(
@@ -1668,8 +1825,14 @@ def similarity_graph(
         max_neighbors: Annotated[int, typer.Option(
             help='Maximum number of neighbors to consider per chain.'
         )] = 1000,
+        edge_rule: Annotated[Optional[EdgeRule], typer.Option(
+            help=_EDGE_RULE_HELP
+        )] = None,
+        nprobe: Annotated[Optional[int], typer.Option(
+            help=_CLUSTER_NPROBE_HELP
+        )] = None,
         use_gpu_index: Annotated[bool, typer.Option(
-            help='Use GPU for FAISS operations (requires faiss-gpu).'
+            help=_CLUSTER_GPU_HELP
         )] = False,
         log_level: Annotated[LogLevel, typer.Option(
             help='Logging verbosity level.'
@@ -1678,23 +1841,27 @@ def similarity_graph(
     """Build and export a similarity graph from database embeddings."""
 
     set_log_level(log_level)
+    edge_rule = EdgeRule.rescue if edge_rule is None else EdgeRule(edge_rule)
     _refuse_max_neighbors_below_1(max_neighbors)
+    _refuse_nprobe_below_1(nprobe)
     _refuse_output_over_inputs(output_file, databases=[("the database", db_path)])
+    _refuse_gpu_search(use_gpu_index, nprobe, **{"--max-neighbors": max_neighbors})
 
     if use_gpu_index:
         logging.info("GPU acceleration for FAISS operations: enabled")
 
     logging.info("Initializing clusterer...")
-    from foldmatch.search.clustering import EmbeddingClusterer
-    clusterer = EmbeddingClusterer(
-        db_path=db_path,
-        use_gpu=use_gpu_index
-    )
+    clusterer = _clusterer(db_path, use_gpu_index, nprobe)
 
-    graph = clusterer.build_similarity_graph(
-        threshold=threshold,
-        max_neighbors=max_neighbors
-    )
+    from foldmatch.search import clustering
+    try:
+        graph = clusterer.build_similarity_graph(
+            threshold=threshold,
+            max_neighbors=max_neighbors,
+            edge_rule=edge_rule
+        )
+    except clustering._GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
 
     output_path = Path(output_file)
     graph.write_graphml(str(output_path))
@@ -3281,26 +3448,87 @@ def resolve_query_stage2_options(scoring=DEFAULT_SCORING, *, seq_identity: Optio
     return QueryStage2Options(scoring=scoring, **values)
 
 
-#: The ``cluster`` options of the Leiden route only, refused under ``--method greedy`` (T5: exit status 2).
-_LEIDEN_ONLY_OPTIONS = (("resolution", "--resolution"), ("leiden_iterations", "--leiden-iterations"),
-                        ("seed", "--seed"))
+#: ``cluster``'s options that only some ``--method`` values take (P9.CL D7): (parameter name, flag, the methods that
+#: take it). Every other option is taken by every method, ``--use-gpu-index`` included (P9.CL D10).
+_METHOD_OPTIONS = (
+    ("resolution", "--resolution", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_iterations", "--leiden-iterations", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("seed", "--seed", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("edge_rule", "--edge-rule", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_backend", "--leiden-backend", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("leiden_threads", "--leiden-threads", (ClusterMethod.leiden, ClusterMethod.greedy_leiden)),
+    ("greedy_threshold", "--greedy-threshold", (ClusterMethod.greedy_leiden,)),
+    ("greedy_max_neighbors", "--greedy-max-neighbors", (ClusterMethod.greedy_leiden,)),
+    ("work_folder", "--work-folder", (ClusterMethod.greedy, ClusterMethod.greedy_leiden)),
+)
+
+#: What a refused option's entry adds, by (method, parameter name)
+_METHOD_OPTION_NOTES = {
+    (ClusterMethod.greedy, "greedy_threshold"): "--method greedy takes its threshold from --threshold",
+    (ClusterMethod.greedy, "greedy_max_neighbors"): "--method greedy takes its neighbours from --max-neighbors",
+}
 
 
-def _refuse_leiden_only_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
-    """``cluster``'s ``--method``: under greedy, every Leiden-only option given (not None; :data:`_LEIDEN_ONLY_OPTIONS`)
-    is refused in one ``typer.BadParameter`` (exit status 2), before the database is loaded. Returns the method."""
+def _refuse_method_options(method=ClusterMethod.leiden, **given) -> ClusterMethod:
+    """``cluster``'s ``--method``, and every option of :data:`_METHOD_OPTIONS` given (not None) that it does not take,
+    refused in one ``typer.BadParameter`` (exit status 2) that names each one and the methods that take it, before the
+    database is loaded. Returns the method."""
     try:
         method = ClusterMethod(method)
     except ValueError:
         raise typer.BadParameter(f"{method!r} is not a clustering method; expected one of "
                                  f"{', '.join(m.value for m in ClusterMethod)}.", param_hint="--method") from None
-    refused = [flag for name, flag in _LEIDEN_ONLY_OPTIONS if given.get(name) is not None]
-    if method is ClusterMethod.greedy and refused:
-        raise typer.BadParameter(
-            f"{', '.join(refused)} {'is a Leiden option' if len(refused) == 1 else 'are Leiden options'}: "
-            f"--method greedy has no resolution or iteration count and is deterministic. "
-            f"Remove {'it' if len(refused) == 1 else 'them'}, or use --method leiden.", param_hint="--method")
+    refused = []
+    for name, flag, methods in _METHOD_OPTIONS:
+        if given.get(name) is None or method in methods:
+            continue
+        note = _METHOD_OPTION_NOTES.get((method, name))
+        refused.append(f"{flag} (--method {' or '.join(m.value for m in methods)}{'; ' + note if note else ''})")
+    if refused:
+        pronoun = "it" if len(refused) == 1 else "them"
+        raise typer.BadParameter(f"--method {method.value} does not take {', '.join(refused)}. Remove {pronoun}, or "
+                                 f"use a method that takes {pronoun}.", param_hint="--method")
     return method
+
+
+def _refuse_nprobe_below_1(nprobe: Optional[int]):
+    """``cluster`` and ``similarity-graph``: ``--nprobe`` below 1 is refused (exit status 2) before the database is
+    loaded."""
+    if nprobe is not None and nprobe < 1:
+        raise typer.BadParameter("--nprobe must be at least 1.", param_hint="--nprobe")
+
+
+def _clusterer(db_path: str, use_gpu_index: bool, nprobe: Optional[int]):
+    """``cluster`` and ``similarity-graph``: the ``EmbeddingClusterer`` of the database, its nprobe set before any move
+    to the GPU. ``--nprobe`` on a database that is not ivf_pq is refused after the load (exit status 2), and so are,
+    with ``--use-gpu-index``, a stored nprobe above the GPU limit and an hnsw database."""
+    from foldmatch.search.clustering import EmbeddingClusterer, _GpuSearchRefused, _NprobeNotApplicable
+    try:
+        return EmbeddingClusterer(db_path=db_path, use_gpu=use_gpu_index, nprobe=nprobe)
+    except _NprobeNotApplicable as exc:
+        raise typer.BadParameter(str(exc), param_hint="--nprobe") from None
+    except _GpuSearchRefused as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param) from None
+
+
+def _refuse_gpu_search(use_gpu_index: bool, nprobe: Optional[int], **neighbors: Optional[int]):
+    """``cluster`` and ``similarity-graph`` with ``--use-gpu-index`` (P9.CL D10), before the database is loaded: a
+    ``--nprobe`` or a neighbour count (``neighbors``: flag -> value) above what a FAISS GPU index takes is a usage
+    error (exit status 2); then FAISS without GPU support here is a refusal (exit status 1)."""
+    if not use_gpu_index:
+        return
+    from foldmatch.search import clustering, faiss_database
+    limit = faiss_database.GPU_MAX_K
+    for flag, value in neighbors.items():
+        if value is not None and value > limit:
+            raise typer.BadParameter(f"{flag} {value} is above {limit}, the most neighbours a FAISS GPU index "
+                                     f"returns: use at most {limit} with --use-gpu-index, or search on the CPU.",
+                                     param_hint=flag)
+    if nprobe is not None and nprobe > limit:
+        raise typer.BadParameter(f"--nprobe {nprobe} is above {limit}, the most cells a FAISS GPU index probes: give "
+                                 f"--nprobe {limit} or less with --use-gpu-index, or search on the CPU.",
+                                 param_hint="--nprobe")
+    clustering._check_gpu_search()
 
 
 def _refuse_max_neighbors_below_1(max_neighbors: int):

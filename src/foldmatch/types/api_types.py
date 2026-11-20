@@ -87,6 +87,19 @@ class ClusterMethod(str, Enum):
     """Clustering method of ``fm-search cluster``."""
     leiden = "leiden"    # Leiden on the similarity graph: memory grows with the edges (the default)
     greedy = "greedy"    # greedy representatives in one streamed pass: memory grows with the chains
+    greedy_leiden = "greedy-leiden"  # greedy representatives, then Leiden on the representatives' graph
+
+
+class EdgeRule(str, Enum):
+    """Which k-NN hits become edges of the similarity graph (``fm-search cluster`` and ``similarity-graph``)."""
+    rescue = "rescue"    # lower's edges, plus each chain with none of them to its own hits (the default)
+    lower = "lower"      # an edge (i, j), i < j, from the search of the lower chain i only (FoldMatch up to 0.12.0)
+
+
+class LeidenBackend(str, Enum):
+    """The Leiden implementation of ``fm-search cluster`` (``--leiden-backend``)."""
+    igraph = "igraph"        # python-igraph's community_leiden, one thread (the default)
+    networkit = "networkit"  # NetworKit's ParallelLeiden, multithreaded (optional extra foldmatch[networkit])
 
 
 class FormatMode(str, Enum):

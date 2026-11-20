@@ -6,6 +6,290 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Added
+
+- **`--edge-rule [rescue|lower]`** on `fm-search cluster` (`--method leiden`;
+  `greedy-leiden`, below, too) and `fm-search similarity-graph`: which k-NN
+  hits become edges. `lower` is the graph of FoldMatch up to 0.12.0: an edge
+  (i, j), i < j, is kept only from the search of the lower chain i.
+  `rescue`, the new default, keeps the same edges and, for each chain that
+  gets none of them (its own hits at or above `--threshold` are all lower
+  chains, and no lower chain's search keeps it; such chains sit mostly at
+  the end of the database), adds an edge to each of its own hits at or above
+  `--threshold`, weighted by its own score.
+  It is decided in the same pass over the database: a chain's edges are all
+  known once its block is searched, so there is no second search. On
+  Swiss-Prot (573,010 chains, `--threshold` 0.8) it removed 4,616 / 1,892 /
+  551 / 207 singletons at `--max-neighbors` 30 / 50 / 100 / 300, for +1.59% /
+  +0.62% / +0.14% / +0.012% edges: all but one of the singletons that adding
+  every reverse edge removes, at +63% / +56% / +43% / +28%. `--edge-rule`
+  with `--method greedy`, which builds no graph, is refused (exit status 2,
+  before the database is loaded). The log of the graph build gives the
+  rescued chains and edges. Library: `foldmatch.types.api_types.EdgeRule`,
+  `edge_rule=` on `EmbeddingClusterer.build_similarity_graph` (default
+  `rescue`), and **`EmbeddingClusterer.build_similarity_edges`**, which finds
+  the edges with no igraph graph and returns a
+  `foldmatch.search.clustering.SimilarityEdges` (`n`, the `pair_blocks` and
+  `weight_blocks` of the search, `n_edges`, `min_weight`, `n_rescued_chains`,
+  `n_rescued_edges`, and `chunks()`), kept as `clusterer.edges` (a graph
+  built before is dropped); `cluster_leiden` builds the igraph graph from
+  them when there is no graph.
+- **`--nprobe`** on `fm-search cluster` (every method) and `fm-search
+  similarity-graph`: the IVF cells probed per query of an `ivf_pq` database
+  (default: the value stored at build, `--ivf-nprobe` or `--ivf-nlist` //
+  64), as the query commands have it. Higher finds more neighbours and is
+  slower; above the cell count FAISS probes every cell. Below 1 it is
+  refused before the database is loaded, and on a `flat` or `hnsw` database
+  after the load (both exit status 2; the query commands ignore it there).
+  The log gives the cells probed per query on every `ivf_pq` run. Library:
+  `EmbeddingClusterer(db_path=None, use_gpu=False, nprobe=None,
+  database=None)`: `nprobe` is set on the CPU index before any move to the
+  GPU (`ValueError` below 1, before the load, and for a database that is not
+  `ivf_pq`), `clusterer.nprobe` is the value searched at (None on `flat` and
+  `hnsw`), and `database` takes a `FaissEmbeddingDatabase` already loaded on
+  the CPU instead of `db_path` (exactly one of the two).
+- **`FaissEmbeddingDatabase.subset(rows, db_folder, index_name,
+  parent_record=None, overwrite=False)`**: writes a database of some of a
+  loaded database's chains (`rows`: row numbers, strictly ascending) from
+  its stored data, with nothing trained or re-encoded, and returns it loaded
+  on the CPU; row r of the parent becomes row `rank(r)` of the subset. On an
+  `ivf_pq` database it copies each kept chain's PQ code, list by list, into
+  new on-disk lists under the parent's trained OPQ, coarse quantizer and PQ
+  (read from its `.index` file without the lists), so a search of the subset
+  is the parent's search restricted to the subset's chains (the same codes
+  and scores); the subset searches at the parent's current nprobe (as set by
+  `set_nprobe`, else the stored one), and its metadata stores that value, so
+  a load keeps it. On a `flat` database (or an `auto` one that is flat) it is
+  an exact `IndexFlatIP` of the kept stored vectors, held in memory, so for
+  small sets. The subset's metadata gains a `parent` block: the parent's
+  path, index name, chain count, the sha256 of its `.index` and `.metadata`
+  files, the size of its `.invlists` file, and the caller's `parent_record`
+  as `settings`. Refused (`ValueError`): rows that are not integers,
+  strictly ascending and in range, or no rows; an `hnsw` database (an
+  `auto` one that is hnsw included); a database not loaded, or on the GPU
+  without its CPU index (`move_to_gpu(clustering=True)`, below, keeps it);
+  the parent's own files as the target. A database already at the target is
+  refused (`FileExistsError`) unless `overwrite=True`.
+- **`fm-search cluster --method greedy-leiden`**: greedy representatives at
+  **`--greedy-threshold`** (default 0.9) with **`--greedy-max-neighbors`**
+  (default 1000, also the greedy cluster-size cap), then Leiden on the
+  representatives' similarity graph at `--threshold` (default 0.8),
+  `--max-neighbors` (default **100** under this method), `--edge-rule`,
+  `--resolution` (default **20** under this method, below),
+  `--leiden-iterations` and `--seed`; every chain takes its
+  representative's cluster. For collections whose direct graph does not fit
+  in memory. The representatives' database is copied from the parent
+  (`FaissEmbeddingDatabase.subset`, above: the parent's PQ codes, or its
+  vectors on `flat`) and searched at the same nprobe (`--nprobe` applies to
+  both searches); its graph's edges are written to the work folder and read
+  back memory-mapped; both FAISS indexes are released before Leiden. The
+  output has the four columns of `--method greedy`: `cluster_id` and
+  `cluster_size` are the final cluster, `representative` the chain's greedy
+  representative (its own id on a representative's row); clusters are
+  numbered over the chains by decreasing size, ties by the smallest chain
+  index. The statistics give the greedy step (representatives, chains
+  searched, saturated representatives over the representatives, greedy
+  clusters at the cap), the representatives' graph (nodes, edges, rescued
+  chains and edges) and its modularity, "Modularity (representatives'
+  graph)". With `--greedy-threshold` above every score every chain is its
+  own representative and the file's first three columns are `--method
+  leiden`'s at the same settings, byte for byte (checked on `flat` and
+  `ivf_pq` databases). An `hnsw` database (an `auto` one that is hnsw
+  included) is refused after the load (exit status 2). With
+  `--use-gpu-index` (below) both searches run on the GPUs: the
+  representatives' database is copied from the parent's CPU index, then
+  moved. Library: `EmbeddingClusterer.cluster_greedy_leiden(
+  work_folder, greedy_threshold=0.9, greedy_max_neighbors=1000,
+  threshold=0.8, max_neighbors=100, edge_rule=rescue, resolution=20.0,
+  n_iterations=10, seed=None)`, which sets `clusters`,
+  `chain_representatives` (each chain's representative, a chain index),
+  `modularity` and `graph_stats`, with `representatives` None.
+- **`--work-folder`** on `fm-search cluster`: required by `--method
+  greedy-leiden`, optional with `--method greedy`, refused with `--method
+  leiden`. It holds `run.json` (the FoldMatch and FAISS versions, the
+  parent's path, chain count, the sha256 of its `.index` and `.metadata`
+  files and its `.invlists` size, the effective nprobe (the cells probed:
+  an `--nprobe` above the cell count is recorded as the cell count), the
+  greedy and graph settings as resolved, and each run's steps with FAISS's
+  thread count and
+  the GPUs searched on),
+  `greedy.state.npz` (written every 900 s of greedy and at its end, to a
+  temporary name, fsynced, then renamed; each checkpoint logs the rate in
+  searched chains a second), the representatives' database with a
+  `representatives.done` marker, and the graph's edges (`graph.pairs.i32`,
+  `graph.weights.f32`, `graph.json`, `graph.done`). Running the same command
+  again resumes greedy from its last state, reuses every step with its
+  marker, rebuilds the representatives' database without its marker, and
+  restarts the graph from its first block without `graph.done`; Leiden,
+  propagation and export always run, so a rerun at another `--resolution`,
+  `--leiden-iterations` or `--seed` searches nothing. A work folder of
+  `--method greedy` can be continued by `--method greedy-leiden` at the same
+  greedy settings (`--greedy-threshold` and `--greedy-max-neighbors` equal
+  to its `--threshold` and `--max-neighbors`). Refused (exit status 2): a
+  recorded setting or parent file that differs (each named with both
+  values; `--nprobe` equal to the stored value is no difference), a folder
+  with work files but no `run.json`, or a `run.json` of another layout. A
+  moved parent with the same files is accepted; another FAISS thread count,
+  FoldMatch or FAISS version, or a change between CPU and GPU search is a
+  WARNING. `--output-file` may be inside
+  the work folder, but not one of its files (exit status 1). Library:
+  `work_folder=` on `EmbeddingClusterer.cluster_greedy` and on
+  `EmbeddingClusterer.build_similarity_edges` (the edges appended to the
+  files block by block and returned memory-mapped), and
+  `SimilarityEdges.from_folder`.
+
+- **`--leiden-backend [igraph|networkit]`** on `fm-search cluster`
+  (`--method leiden` and `greedy-leiden`): `igraph` (the default,
+  python-igraph's `community_leiden`, one thread, as before) or `networkit`,
+  NetworKit's ParallelLeiden (`ParallelLeiden(G, iterations, randomize=True,
+  gamma=--resolution)`), multithreaded: 5-25x faster than igraph on large
+  graphs at 64 threads on Linux (126 s against 2,111 s on a 10M-chain
+  graph), with partitions within igraph's seed band on CATH and Swiss-Prot.
+  It needs the new optional extra **`pip install 'foldmatch[networkit]'`**
+  (`networkit==11.3`; 11.2 has no `GraphFromCsr`; wheels for Linux x86_64,
+  macOS 26 arm64 and Windows, none for Linux aarch64 or macOS before 26);
+  without it, or with another version, `--leiden-backend networkit` is
+  refused before the database is loaded (exit status 1; read from the
+  package metadata, networkit is not imported until the Leiden step). On
+  macOS it runs on 1 thread, where a FAISS search, ParallelLeiden and the
+  same search again gave the same results in one process with torch
+  loaded; more threads crashed that process (NetworKit's own OpenMP
+  runtime next to torch's and FAISS's: a segmentation fault in
+  ParallelLeiden), so there `--leiden-threads` above 1 is refused.
+  **`--leiden-threads`** (networkit only, at least 1; default every OpenMP
+  thread, NetworKit's maximum; 1 on macOS) sets NetworKit's threads before
+  its graph is built, and NetworKit's and FAISS's thread counts are restored
+  afterwards (on Linux they share one OpenMP runtime). With
+  `--leiden-threads 1` the
+  same `--seed` gives the same clusters, also in another process; on more
+  threads it does not, and `--seed` then logs a WARNING. Without `--seed` a
+  seed is drawn from `os.urandom`. `--leiden-iterations` is a maximum under
+  NetworKit. Under `--method leiden` the graph's edges are kept as arrays
+  (`build_similarity_edges`), with no igraph graph; under `greedy-leiden`
+  NetworKit reads the memory-mapped edge files of the work folder, and a
+  rerun with another backend or thread count reuses the searches (the
+  backend and threads are recorded with each run's Leiden settings in
+  `run.json`). Refused (exit status 2, before the load): `--leiden-backend`
+  or `--leiden-threads` with `--method greedy`, `--leiden-threads` with the
+  igraph backend, below 1, or above 1 on macOS, and a `--seed` of 2**64 or
+  more with networkit. `fm-search similarity-graph` stays on igraph. Library:
+  `foldmatch.types.api_types.LeidenBackend`, and `backend=` (default
+  `igraph`) and `threads=` on `EmbeddingClusterer.cluster_leiden` (networkit
+  needs `build_similarity_edges` first: "Edges not built. Call
+  build_similarity_edges() first.") and `cluster_greedy_leiden` (checked
+  before greedy runs).
+- **GPU search for `fm-search cluster` (every `--method`) and `fm-search
+  similarity-graph`** (`--use-gpu-index`): one replica of the index on every
+  visible GPU (FAISS's `index_cpu_to_all_gpus`, not sharded: each search
+  call's queries are split between the GPUs), the PQ lookup tables of an
+  `ivf_pq` index in float16 (an `ivf_pq` index of 64 sub-quantizers of 8
+  bits is refused on an A100 with float32 tables; a `flat` index stays in
+  float32), and the CPU index kept in memory: the stored vectors are read
+  from it (`reconstruct_n`), and `--method greedy-leiden` copies the
+  representatives' database from it, then moves that database to the GPUs
+  too. nprobe is set on the CPU index before the move (a GPU index keeps the
+  value it was cloned with). On 4 A100s, FAISS searched 28,188-32,607
+  queries a second at nlist 16,384, nprobe 256, k = 1000 (30.4M chains),
+  against 1,011-1,752 on the node's 64 CPU cores. The float16 tables move
+  scores slightly: on a 10M-chain TrEMBL sample, `--method greedy-leiden`
+  on the GPUs kept 26 more representatives than on the CPU (1,886,496
+  against 1,886,470), its graph had an edge Jaccard of 0.992 with the CPU's,
+  and its label AMIs (Pfam clan and family, Gene3D, SUPERFAMILY, UniRef50)
+  were within 0.0007 of the CPU's at resolution 10 and 20, with greedy 7.5x
+  and the graph 9.9x faster on the GPUs than on the same node's CPU. Refused (exit status 2):
+  `--max-neighbors`, `--greedy-max-neighbors` or `--nprobe` above 2048, the
+  most FAISS's GPU indexes take (before the load; a stored nprobe above it
+  after the load), and an `hnsw` database (an `auto` one that is hnsw
+  included; after the load). Library:
+  `FaissEmbeddingDatabase.move_to_gpu(gpu_id=0, clustering=False)`, whose
+  `clustering=True` is this mode (refused without GPU support, an hnsw
+  index refused), `cpu_index`, `n_gpus`, `host_index()` (the CPU index) and
+  `release_index()`; `faiss_database.GPU_MAX_K`; and
+  `EmbeddingClusterer(use_gpu=True)` in this mode.
+
+### Changed
+
+- **BREAKING — `fm-search cluster` and `fm-search similarity-graph` build the
+  rescue graph by default** (`--edge-rule rescue`, above): wherever a chain
+  had no edge under the old rule but has hits at or above `--threshold`, the
+  graph, the GraphML file and the Leiden partition change. `--edge-rule
+  lower` gives the old graph, GraphML and partitions. On Swiss-Prot the two
+  rules' partitions agreed at AMI 0.987 at `--max-neighbors` 30 and 0.995 /
+  0.994 at 50 / 100, within seed noise at 50 and 100. Under `rescue` the
+  order of the edges in the graph (not the edges) depends on the block size
+  of the search, which `--max-neighbors` and the chain count fix: each
+  block's rescued edges follow its other edges. The same applies to
+  `EmbeddingClusterer.build_similarity_graph`, whose `edge_rule` defaults to
+  `rescue`.
+- **BREAKING — `fm-search cluster`'s refusals of options a method does not
+  take are one check with one message**: every such option given
+  (`--resolution`, `--leiden-iterations`, `--seed`, `--edge-rule`,
+  `--greedy-threshold`,
+  `--greedy-max-neighbors`, `--work-folder`) is named with the methods that
+  take it, for example
+  "--method greedy does not take --resolution (--method leiden or
+  greedy-leiden), --seed (--method leiden or greedy-leiden). Remove them, or
+  use a method that takes them." (exit status 2, before the database is
+  loaded). This replaces the message "... is a Leiden option: --method greedy
+  has no resolution or iteration count and is deterministic.". The help of
+  `--resolution`, `--leiden-iterations` and `--seed` now ends "Refused with
+  --method greedy." instead of "--method leiden only.".
+- **BREAKING — `fm-search cluster --use-gpu-index` and `fm-search
+  similarity-graph --use-gpu-index` are refused without GPU support** (exit
+  status 1, before the database is loaded: FAISS without its CUDA GPU layer,
+  no visible GPU, or macOS) instead of searching on the CPU after a message,
+  and they search in the GPU mode above (every GPU, float16 tables on
+  `ivf_pq`, the CPU index kept) instead of one GPU with default options and
+  the CPU index copied back for every pass. `EmbeddingClusterer(use_gpu=
+  True)` raises `RefusalError` there.
+- `fm-search cluster --max-neighbors` defaults to None, resolved by method:
+  1000 under `leiden` and `greedy` (unchanged), 100 under `greedy-leiden`.
+- `fm-search cluster --resolution` defaults to None, resolved by method: 1.0
+  under `leiden` (unchanged) and **20** under `greedy-leiden`
+  (`foldmatch.search.clustering._GREEDY_LEIDEN_RESOLUTION`). On
+  `greedy-leiden` over TrEMBL samples of 1M and 10M chains (greedy 0.9,
+  `--max-neighbors` 100), 20 left no cluster above 1.745% of the chains at
+  10M (at most one at 1M, against 4-7 at resolution 1) and agreed with Pfam
+  families better than 10 (+0.008 to +0.014 AMI), at a cost of up to 0.007
+  on Gene3D and SUPERFAMILY; a lower value such as 10 keeps more
+  superfamilies whole.
+  `EmbeddingClusterer.cluster_leiden` keeps 1.0.
+- The statistics log of `fm-search cluster` gains, under every method, the
+  largest cluster's size and share of the chains, the number of giant
+  clusters (more than 1.745% of the chains, compared in integers: size x
+  100,000 > 1,745 x chains, the rule of the cascade tables above) and the 10
+  largest cluster sizes with their shares, at INFO. Under `--method
+  greedy-leiden`, with 1,000,000 chains or more, giants are also a WARNING
+  that a higher `--resolution` splits large clusters; under `leiden` there
+  is no such warning (on direct graphs every measured run at the default
+  had giants, and a higher resolution there cost domain labels).
+  `get_cluster_statistics` gains `largest_cluster_share`,
+  `n_giant_clusters` and `largest_cluster_sizes`.
+- `EmbeddingClusterer.cluster_leiden` stores the partition's modularity
+  (`modularity`, python-igraph's or NetworKit's), and
+  `get_cluster_statistics` reads it after `cluster_leiden` and
+  `cluster_greedy_leiden` instead of computing it on the graph (a partition
+  set by the caller still gets its graph's). `fm-search cluster`'s option
+  table names `--leiden-backend` and `--leiden-threads` among the options
+  `--method greedy` does not take. The help of `--leiden-iterations` adds
+  "With --leiden-backend networkit, a maximum.", and that of `--seed` that
+  the same seed gives the same clusters with networkit only on one thread.
+- The greedy statistics (`get_cluster_statistics`) gain `n_representatives`,
+  and the saturated share is printed over it (under `--method greedy` it
+  equals the cluster count, so the log is unchanged).
+
+### Fixed
+
+- The `EmbeddingClusterer` constructor's docstring named an `index_name`
+  argument that does not exist; it now documents its arguments.
+- On macOS, FAISS's Metal backend (in the faiss-cpu wheel) counted as GPU
+  support, so a GPU request failed with an `AttributeError` in
+  `setTempMemory`. It no longer counts: the commands that fall back to the
+  CPU without GPU support (the query commands, the builds) do so on macOS
+  too.
+
 ## [0.12.0] - 2026-11-16
 
 ### Added

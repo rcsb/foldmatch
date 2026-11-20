@@ -1,8 +1,11 @@
 """EmbeddingClusterer.build_similarity_graph: blocks of chains read with reconstruct_n and searched many at a time give,
 on every database type, the expected graph: on hnsw the one-query-per-call graph bit for bit, on flat the same up to
-float rounding, and on ivf_pq the normalised decoded query against each code. Also cluster_leiden on python-igraph's
-Leiden (P9.U): the call, its private seeding, the cluster ids by size, and its refusals."""
+float rounding, and on ivf_pq the normalised decoded query against each code. Also the rescue edge rule, the default
+(P9.CL1): the two-pass graph bit for bit, planted lost chains, and build_similarity_edges; --nprobe and the
+EmbeddingClusterer constructor (P9.CL2); and cluster_leiden on python-igraph's Leiden (P9.U): the call, its private
+seeding, the cluster ids by size, and its refusals."""
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -16,6 +19,7 @@ import time
 import unittest
 import weakref
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -26,6 +30,7 @@ import lightning  # noqa: F401
 import faiss
 import igraph as ig
 import numpy as np
+import typer
 from tqdm import tqdm
 from typer.testing import CliRunner
 
@@ -35,7 +40,7 @@ from foldmatch.cli.search import cluster_database, similarity_graph
 from foldmatch.search import clustering
 from foldmatch.search.clustering import EmbeddingClusterer
 from foldmatch.search.faiss_database import FaissEmbeddingDatabase
-from foldmatch.types.api_types import FormatMode, IndexConfig, IndexType
+from foldmatch.types.api_types import EdgeRule, FormatMode, IndexConfig, IndexType
 
 
 def _clustered_vectors(seed: int, n: int, d: int, n_centers: int, noise: float) -> np.ndarray:
@@ -106,10 +111,12 @@ class _GraphCase(unittest.TestCase):
     def graph(self, db_path: str, threshold: float, max_neighbors: int, rows: int = None, k: int = None):
         clusterer = EmbeddingClusterer(db_path)
         if rows is None:
-            graph = clusterer.build_similarity_graph(threshold=threshold, max_neighbors=max_neighbors)
+            graph = clusterer.build_similarity_graph(threshold=threshold,
+                                                     max_neighbors=max_neighbors, edge_rule="lower")
         else:
             with mock.patch.object(clustering, "_GRAPH_RESULT_BYTES", _budget(rows, k)):
-                graph = clusterer.build_similarity_graph(threshold=threshold, max_neighbors=max_neighbors)
+                graph = clusterer.build_similarity_graph(threshold=threshold,
+                                                         max_neighbors=max_neighbors, edge_rule="lower")
         self.assertEqual(graph.vcount(), len(clusterer.chain_ids))
         self.assertEqual(graph.vs["name"], clusterer.chain_ids)
         self.assertTrue(all(type(w) is float for w in graph.es["weight"]))
@@ -194,7 +201,7 @@ class HnswGraphTest(_GraphCase):
                 # At k = 1 the budget alone would give blocks of 280 chains: the row cap makes them 13.
                 with mock.patch.object(clustering, "_GRAPH_RESULT_BYTES", _budget(7, 40)), \
                         mock.patch.object(clustering, "_GRAPH_MAX_ROWS", max_rows or clustering._GRAPH_MAX_ROWS):
-                    clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=k)
+                    clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=k, edge_rule="lower")
                 starts = list(range(0, self.n, rows))
                 expected = [(s, min(rows, self.n - s)) for s in starts]
                 self.assertEqual(recorder.reads, expected)
@@ -603,7 +610,7 @@ class _SameGraphAsK2:
             for chunk in (None, 1, 3, divisor):
                 with self.subTest(rows=rows, chunk=chunk), self.budget(rows), _patched("_GRAPH_EDGE_CHUNK", chunk):
                     graph = clusterer.build_similarity_graph(threshold=self.threshold,
-                                                             max_neighbors=self.max_neighbors)
+                                                             max_neighbors=self.max_neighbors, edge_rule="lower")
                     self.assert_same_graph(graph, ref)
 
     def test_int64_ids_when_the_largest_id_is_above_the_int32_limit(self):
@@ -624,7 +631,8 @@ class _SameGraphAsK2:
                 with self.budget(rows), _patched("_GRAPH_INT32_MAX_ID", max_id), \
                         mock.patch.object(clustering, "_edge_tuples", recording):
                     graphs[dtype] = clusterer.build_similarity_graph(threshold=self.threshold,
-                                                                     max_neighbors=self.max_neighbors)
+                                                                     max_neighbors=self.max_neighbors,
+                                                                     edge_rule="lower")
                 self.assertGreater(len(dtypes), 1)
                 self.assertEqual(set(dtypes), {np.dtype(dtype)})
                 self.assert_same_graph(graphs[dtype], ref)
@@ -655,7 +663,7 @@ class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
                 ref = _k2_way(clusterer, self.threshold, self.max_neighbors)
                 with mock.patch.object(clustering.np, "concatenate", side_effect=AssertionError("np.concatenate")):
                     graph = clusterer.build_similarity_graph(threshold=self.threshold,
-                                                             max_neighbors=self.max_neighbors)
+                                                             max_neighbors=self.max_neighbors, edge_rule="lower")
                 self.assert_same_graph(graph, ref)
 
     def test_igraph_is_given_no_ndarray(self):
@@ -670,7 +678,8 @@ class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
 
         with mock.patch.object(clustering.ig, "Graph", wraps=ig.Graph) as graph_class, \
                 mock.patch.object(clustering, "_edge_tuples", recording):
-            graph = clusterer.build_similarity_graph(threshold=self.threshold, max_neighbors=self.max_neighbors)
+            graph = clusterer.build_similarity_graph(threshold=self.threshold,
+                                                     max_neighbors=self.max_neighbors, edge_rule="lower")
         graph_class.assert_called_once()
         args = list(graph_class.call_args.args) + list(graph_class.call_args.kwargs.values())
         self.assertIn("edges", graph_class.call_args.kwargs)
@@ -746,7 +755,7 @@ class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
                 trim.reset_mock()
                 with mock.patch.object(clustering, "sys", platform), mock.patch.object(clustering, "ctypes", c_library):
                     graph = clusterer.build_similarity_graph(threshold=self.threshold,
-                                                             max_neighbors=self.max_neighbors)
+                                                             max_neighbors=self.max_neighbors, edge_rule="lower")
                 self.assert_same_graph(graph, ref)
                 if case == "malloc_trim on linux":
                     c_library.CDLL.assert_called_with(None)
@@ -773,7 +782,7 @@ class HnswSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
                 with self.subTest(cap=cap, chunk=chunk), _patched("_GRAPH_WEIGHT_TABLE_MAX", cap), \
                         _patched("_GRAPH_EDGE_CHUNK", chunk):
                     graph = clusterer.build_similarity_graph(threshold=self.threshold,
-                                                             max_neighbors=self.max_neighbors)
+                                                             max_neighbors=self.max_neighbors, edge_rule="lower")
                     self.assert_same_graph(graph, ref)
                     if shared:
                         self.assertTrue(_shares_equal_weights(graph.es["weight"]))
@@ -801,7 +810,7 @@ class FlatSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
         self.assertGreater(_float32_span(ref.es["weight"]), clustering._GRAPH_WEIGHT_TABLE_MAX)
         for chunk in (None, 1, 3, _exact_divisor([ref.ecount()])):
             with self.subTest(chunk=chunk), _patched("_GRAPH_EDGE_CHUNK", chunk):
-                graph = clusterer.build_similarity_graph(threshold=-1.0, max_neighbors=self.n)
+                graph = clusterer.build_similarity_graph(threshold=-1.0, max_neighbors=self.n, edge_rule="lower")
                 self.assert_same_graph(graph, ref)
 
 
@@ -819,11 +828,13 @@ class IvfPqSameGraphAsK2Test(_SameGraphAsK2, unittest.TestCase):
         return vectors
 
     def test_files_as_k2(self):
-        """similarity-graph writes the GraphML of K2's graph, and cluster with a seed the Leiden TSV on it (both
-        at the commands' default --max-neighbors, 1000)."""
+        """similarity-graph --edge-rule lower writes the GraphML of K2's graph, and cluster --edge-rule lower with a
+        seed the Leiden TSV on it (both at the commands' default --max-neighbors, 1000)."""
         out = Path(self.tmp.name)
-        similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.graphml"))
-        cluster_database(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.tsv"), seed=1)
+        similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.graphml"),
+                         edge_rule="lower")
+        cluster_database(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "q1.tsv"), seed=1,
+                         edge_rule="lower")
         clusterer = EmbeddingClusterer(self.db_path)
         ref = _k2_way(clusterer, self.threshold, 1000)
         self.assertIs(clusterer.graph, ref)
@@ -861,14 +872,14 @@ class GraphEdgeCaseAsK2Test(unittest.TestCase):
     def test_no_edge(self):
         clusterer = EmbeddingClusterer(self.db_path)
         ref = _k2_way(clusterer, 2.0, 10)
-        graph = clusterer.build_similarity_graph(threshold=2.0, max_neighbors=10)
+        graph = clusterer.build_similarity_graph(threshold=2.0, max_neighbors=10, edge_rule="lower")
         self.assertEqual((graph.vcount(), graph.ecount(), graph.es["weight"]), (self.n, 0, []))
         self.assert_same_graph(graph, ref)
 
     def test_one_chain(self):
         clusterer = EmbeddingClusterer(self.one_path)
         ref = _k2_way(clusterer, 0.0, 10)
-        graph = clusterer.build_similarity_graph(threshold=0.0, max_neighbors=10)
+        graph = clusterer.build_similarity_graph(threshold=0.0, max_neighbors=10, edge_rule="lower")
         self.assertEqual((graph.vcount(), graph.ecount()), (1, 0))
         self.assert_same_graph(graph, ref)
 
@@ -892,7 +903,7 @@ class GraphEdgeCaseAsK2Test(unittest.TestCase):
 
                 with mock.patch.object(clustering, "_edge_tuples", recording(edge_tuples)), \
                         mock.patch.object(clustering, "_weight_list", recording(weight_list)):
-                    graph = clusterer.build_similarity_graph(threshold=threshold, max_neighbors=k)
+                    graph = clusterer.build_similarity_graph(threshold=threshold, max_neighbors=k, edge_rule="lower")
                 self.assert_same_graph(graph, ref)
                 counts = np.bincount(np.array(ref.get_edgelist())[:, 0] // rows)
                 self.assertEqual(stored, [counts[with_edges].tolist()] * 2)
@@ -981,6 +992,721 @@ class GraphPiecesTest(unittest.TestCase):
                 self.assertTrue(all(type(w) is float for w in got))
                 if shared:
                     self.assertIs(got[0], got[1])
+
+
+# P9.CL1: the rescue edge rule, the default: the lower rule's edges, plus, for each chain with none of them, an edge
+# (j, i) to each of its own hits j at or above the threshold, weighted by its own score for j. Built in one pass over
+# the blocks; the reference makes two passes over the same block results.
+
+def _rescue_two_pass(clusterer: EmbeddingClusterer, threshold: float, max_neighbors: int) -> ig.Graph:
+    """The rescue graph in two passes, on ``clusterer``: _k2_way's blocks (the module's block budget and row cap, read
+    at the call), each block's search results kept, and the lower rule's edges of every block; then, over the kept
+    results, each chain in none of those edges, in chain order: its hits j with 0 <= j < i scoring at least the
+    threshold (compared in float32, as NumPy compares the float32 scores), in rank order, as edges (j, i) weighted by
+    its own score for j, after its block's lower-rule edges."""
+    n = len(clusterer.chain_ids)
+    k = min(max_neighbors, n)
+    rows = 1 if k < 1 else max(1, min(n, clustering._GRAPH_MAX_ROWS, clustering._GRAPH_RESULT_BYTES // (k * 12)))
+    normalize = clusterer.db.index_type == IndexType.ivf_pq
+    blocks = []
+    for start in range(0, n, rows):
+        end = min(start + rows, n)
+        embeddings = np.ascontiguousarray(clusterer.db.index.reconstruct_n(start, end - start), dtype=np.float32)
+        if normalize:
+            faiss.normalize_L2(embeddings)
+        scores, indices = clusterer.db.index.search(embeddings, k)
+        chains = np.arange(start, end, dtype=np.int64)[:, None]
+        block_rows, block_cols = np.nonzero((chains < indices) & (scores >= threshold))
+        lower = list(zip((block_rows + start).tolist(), indices[block_rows, block_cols].tolist()))
+        blocks.append((start, scores.tolist(), indices.tolist(), lower, scores[block_rows, block_cols].tolist()))
+    with_edge = {i for _, _, _, lower, _ in blocks for pair in lower for i in pair}
+    threshold = float(np.float32(threshold))
+    edges, weights = [], []
+    for start, scores, indices, lower, lower_weights in blocks:
+        edges += lower
+        weights += lower_weights
+        for r, (row_scores, row_ids) in enumerate(zip(scores, indices)):
+            i = start + r
+            if i in with_edge:
+                continue
+            for j, score in zip(row_ids, row_scores):
+                if 0 <= j < i and score >= threshold:
+                    edges.append((j, i))
+                    weights.append(score)
+    graph = ig.Graph(n=n, edges=edges, directed=False)
+    graph.es["weight"] = weights
+    graph.vs["name"] = clusterer.chain_ids
+    return graph
+
+
+def _pairs(edges) -> list:
+    """The stored pairs of a SimilarityEdges, in order, as tuples of ints."""
+    return [tuple(p) for b in edges.pair_blocks for p in b.tolist()]
+
+
+def _weights(edges) -> np.ndarray:
+    return np.concatenate(edges.weight_blocks) if edges.weight_blocks else np.empty(0, dtype=np.float32)
+
+
+def _load_db(db_path: str) -> FaissEmbeddingDatabase:
+    path = Path(db_path)
+    db = FaissEmbeddingDatabase(path.parent, path.name)
+    db.load_database()
+    return db
+
+
+class _FillingIndex:
+    """A flat index whose search returns its ``fill`` last columns as FAISS fills a short result row: id -1, score
+    -FLT_MAX."""
+
+    def __init__(self, index, fill: int):
+        self._index = index
+        self.fill = fill
+
+    def search(self, x, k):
+        scores, ids = self._index.search(x, k - self.fill)
+        n = len(x)
+        return (np.hstack([scores, np.full((n, self.fill), np.finfo(np.float32).min, dtype=np.float32)]),
+                np.hstack([ids, np.full((n, self.fill), -1, dtype=ids.dtype)]))
+
+    def __getattr__(self, name):
+        return getattr(self._index, name)
+
+
+class _SameGraphAsTwoPass:
+    """On a fixture database with chains to rescue, the default graph (the rescue rule) equals the two-pass reference
+    bit for bit at the same block size (the default, and blocks of 1 and 7 chains): edges in order, weights by bits,
+    names; build_similarity_edges counts its edges and the rescued ones; and the lower rule's graph is K2's."""
+
+    index_type = config = None
+    n = threshold = max_neighbors = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = _build(Path(cls.tmp.name), cls.index_type.value, cls.vectors(), cls.index_type, cls.config)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    assert_same_list = _SameGraphAsK2.assert_same_list
+    assert_same_graph = _SameGraphAsK2.assert_same_graph
+
+    def budget(self, rows):
+        return _patched("_GRAPH_RESULT_BYTES", None if rows is None else _budget(rows, min(self.max_neighbors, self.n)))
+
+    #: Across block sizes: the same edges with weights equal by bits (exact), else up to this float rounding
+    across_tol = 1e-6
+
+    def test_block_sizes(self):
+        """Across block sizes the edges are the same up to rounding (bit for bit on hnsw), but not in the same order:
+        each block's rescue edges follow the block's lower-rule edges."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = clusterer.build_similarity_graph(self.threshold, self.max_neighbors)
+        ref = (ref.get_edgelist(), ref.es["weight"])
+        orders = set()
+        for rows in (1, 7, self.n + 5):
+            with self.subTest(rows=rows), self.budget(rows):
+                graph = clusterer.build_similarity_graph(self.threshold, self.max_neighbors)
+                got = (graph.get_edgelist(), graph.es["weight"])
+                orders.add(tuple(got[0]))
+                if self.across_tol == 0:
+                    self.assertEqual(dict(zip(*got)), dict(zip(*ref)))
+                    self.assertEqual(len(got[0]), len(ref[0]))
+                else:
+                    _GraphCase.assert_same_up_to_rounding(self, got, ref, self.threshold, self.across_tol)
+        self.assertGreater(len(orders | {tuple(ref[0])}), 1)
+
+    def test_same_graph_as_two_pass(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        for rows in (None, 1, 7):
+            with self.subTest(rows=rows), self.budget(rows):
+                ref = _rescue_two_pass(clusterer, self.threshold, self.max_neighbors)
+                lower = _k2_way(clusterer, self.threshold, self.max_neighbors)
+                lower_set = set(lower.get_edgelist())
+                rescued = [e for e in ref.get_edgelist() if e not in lower_set]
+                self.assertEqual(ref.ecount(), lower.ecount() + len(rescued))
+                self.assertGreater(len(rescued), 3)
+                for rule in ((), ("rescue",), (EdgeRule.rescue,)):
+                    graph = clusterer.build_similarity_graph(self.threshold, self.max_neighbors, *rule)
+                    self.assert_same_graph(graph, ref)
+                    self.assertIsNone(clusterer.edges)
+                self.assert_same_graph(clusterer.build_similarity_graph(
+                    threshold=self.threshold, max_neighbors=self.max_neighbors, edge_rule=EdgeRule.lower), lower)
+                edges = clusterer.build_similarity_edges(threshold=self.threshold, max_neighbors=self.max_neighbors)
+                self.assertIs(edges, clusterer.edges)
+                self.assertEqual((edges.n, edges.n_edges, edges.n_rescued_edges, edges.n_rescued_chains),
+                                 (self.n, ref.ecount(), len(rescued), len({i for _, i in rescued})))
+                self.assertEqual(_pairs(edges), ref.get_edgelist())
+                self.assertEqual(edges.min_weight, min(ref.es["weight"]))
+                self.assertEqual(clusterer.min_weight, edges.min_weight)
+                lower_edges = clusterer.build_similarity_edges(threshold=self.threshold,
+                                                               max_neighbors=self.max_neighbors, edge_rule="lower")
+                self.assertEqual((lower_edges.n_edges, lower_edges.n_rescued_edges, lower_edges.n_rescued_chains),
+                                 (lower.ecount(), 0, 0))
+                self.assertEqual(_pairs(lower_edges), lower.get_edgelist())
+
+
+class HnswSameGraphAsTwoPassTest(_SameGraphAsTwoPass, unittest.TestCase):
+    """hnsw (HnswSameGraphAsK2Test's fixture at k 10): the same edges bit for bit whatever the block size; also
+    cluster --method leiden's file on the graph."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.hnsw, 2000, 1536, 0.6, 10
+    vectors = HnswSameGraphAsK2Test.vectors
+    across_tol = 0
+
+
+    def test_cluster_leiden_file_as_two_pass(self):
+        out = Path(self.tmp.name)
+        cluster_database(db_path=self.db_path, method="leiden", threshold=self.threshold,
+                         max_neighbors=self.max_neighbors, output_file=str(out / "cl1.tsv"), seed=2)
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.graph = _rescue_two_pass(clusterer, self.threshold, self.max_neighbors)
+        clusterer.cluster_leiden(seed=2)
+        clusterer.export_clusters(str(out / "two_pass.tsv"))
+        self.assertEqual((out / "cl1.tsv").read_bytes(), (out / "two_pass.tsv").read_bytes())
+
+
+class FlatSameGraphAsTwoPassTest(_SameGraphAsTwoPass, unittest.TestCase):
+    """flat (FlatSameGraphAsK2Test's fixture at k 10)."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.flat, 1500, 256, 0.6, 10
+    vectors = FlatSameGraphAsK2Test.vectors
+
+
+class IvfPqSameGraphAsTwoPassTest(_SameGraphAsTwoPass, unittest.TestCase):
+    """ivf_pq (IvfPqSameGraphAsK2Test's fixture at k 10): also the rescue weights are the rescued chain's own scores
+    (on ivf_pq a pair's two scores differ), and the similarity-graph and cluster files of the default rule at the
+    commands' default --max-neighbors, 1000, are those of the two-pass graph."""
+
+    index_type, n, d, threshold, max_neighbors = IndexType.ivf_pq, 1000, 64, 0.5, 10
+    config = IndexConfig(nlist=16, m=8, nbits=4, nprobe=16, opq_train_size=1000)
+    vectors = IvfPqSameGraphAsK2Test.vectors
+
+    def test_rescue_weights_are_the_rescued_chains_scores(self):
+        db = _load_db(self.db_path)
+        decoded = db.index.reconstruct_n(0, self.n)
+        # expected[i, j]: chain i's search scores chain j (the unit decoded query against j's code)
+        expected = (decoded / np.linalg.norm(decoded, axis=1)[:, None]) @ decoded.T
+        clusterer = EmbeddingClusterer(self.db_path)
+        rescue = clusterer.build_similarity_graph(self.threshold, self.max_neighbors)
+        lower = set(clusterer.build_similarity_graph(self.threshold, self.max_neighbors, "lower").get_edgelist())
+        rescued = [(e, w) for e, w in zip(rescue.get_edgelist(), rescue.es["weight"]) if e not in lower]
+        self.assertGreater(len(rescued), 20)
+        asymmetric = 0
+        for (j, i), weight in rescued:
+            self.assertLess(j, i)
+            self.assertAlmostEqual(weight, expected[i, j], delta=1e-5)
+            if abs(expected[i, j] - expected[j, i]) > 1e-3:
+                self.assertGreater(abs(weight - expected[j, i]), 1e-4)
+                asymmetric += 1
+        self.assertGreater(asymmetric, 5)
+
+    def test_files_as_two_pass(self):
+        """The twin of test_files_as_k2 on the default rule: similarity-graph writes the GraphML of the two-pass
+        graph, and cluster with a seed the Leiden TSV on it, at the default --max-neighbors (1000), where the rule
+        rescues chains."""
+        out = Path(self.tmp.name)
+        similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "cl1.graphml"))
+        cluster_database(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "cl1.tsv"), seed=1)
+        clusterer = EmbeddingClusterer(self.db_path)
+        lower = _k2_way(clusterer, self.threshold, 1000)
+        ref = _rescue_two_pass(clusterer, self.threshold, 1000)
+        self.assertGreater(ref.ecount(), lower.ecount())
+        ref.write_graphml(str(out / "two_pass.graphml"))
+        clusterer.graph = ref
+        clusterer.cluster_leiden(seed=1)
+        clusterer.export_clusters(str(out / "two_pass.tsv"))
+        self.assertEqual((out / "cl1.graphml").read_bytes(), (out / "two_pass.graphml").read_bytes())
+        self.assertEqual((out / "cl1.tsv").read_bytes(), (out / "two_pass.tsv").read_bytes())
+        # The explicit rule gives the same files
+        similarity_graph(db_path=self.db_path, threshold=self.threshold, output_file=str(out / "cl1r.graphml"),
+                         edge_rule=EdgeRule.rescue)
+        self.assertEqual((out / "cl1r.graphml").read_bytes(), (out / "two_pass.graphml").read_bytes())
+
+
+def _planted_lost_chains(n_groups: int, n_core: int, n_satellites: int) -> np.ndarray:
+    """Unit vectors in 64 dimensions: ``n_groups`` groups of ``n_core`` core chains (group g on axis 16 g, core chain t
+    leaning 0.05 + 0.01 t along an axis of its own), then ``n_satellites`` satellites a group (leaning 0.6 along an
+    axis of their own), then one chain on the last axis. A core chain scores above 0.98 with its group's other core
+    chains, a satellite about 0.85 with them and 0.735 with the other satellites, and the last chain 0 with all."""
+    d = 64
+    vectors = []
+    for g in range(n_groups):
+        for t in range(n_core):
+            v = np.zeros(d)
+            v[16 * g] = 1.0
+            v[16 * g + 1 + t] = 0.05 + 0.01 * t
+            vectors.append(v)
+    for g in range(n_groups):
+        for u in range(n_satellites):
+            v = np.zeros(d)
+            v[16 * g] = 1.0
+            v[16 * g + 1 + n_core + u] = 0.6
+            vectors.append(v)
+    lone = np.zeros(d)
+    lone[d - 1] = 1.0
+    vectors.append(lone)
+    vectors = np.array(vectors)
+    return (vectors / np.linalg.norm(vectors, axis=1, keepdims=True)).astype(np.float32)
+
+
+class PlantedLostChainsTest(unittest.TestCase):
+    """A flat database with lost chains planted at its end: three groups of 8 core chains, each core chain's k = 8
+    hits being its group's core chains (scores above 0.98), then 3 satellites a group, which score about 0.85 with
+    their group's core chains and 0.735 with each other, so no chain's search keeps a satellite and a satellite's own
+    hits at threshold 0.8 are all lower; and one last chain that scores 0 with every other chain. At threshold 0.8,
+    each satellite gets an edge (j, i) to each of the 7 core chains among its own hits, weighted by its own score; the
+    last chain stays a singleton; no rescue pair repeats a lower-rule pair."""
+
+    n_groups, n_core, n_satellites, k, threshold = 3, 8, 3, 8, 0.8
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.vectors = _planted_lost_chains(cls.n_groups, cls.n_core, cls.n_satellites)
+        cls.n = len(cls.vectors)
+        cls.first_satellite = cls.n_groups * cls.n_core
+        cls.db_path = _build(Path(cls.tmp.name), "planted", cls.vectors, IndexType.flat)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def satellites(self):
+        return range(self.first_satellite, self.n - 1)
+
+    def expected_rescue(self, k=None):
+        """Each satellite's own hits other than itself, from a one-query search: (j, i) pairs and scores."""
+        db = _load_db(self.db_path)
+        k = self.k if k is None else k
+        pairs, weights = [], []
+        for i in self.satellites():
+            scores, ids = db.index.search(self.vectors[i:i + 1], k)
+            for j, s in zip(ids[0].tolist(), scores[0].tolist()):
+                if j != i:
+                    pairs.append((j, i))
+                    weights.append(s)
+        return pairs, weights
+
+    def test_fixture(self):
+        db = _load_db(self.db_path)
+        scores, ids = db.index.search(self.vectors, self.k)
+        for c in range(self.first_satellite):
+            group = c // self.n_core
+            self.assertEqual(sorted(ids[c].tolist()), list(range(group * self.n_core, (group + 1) * self.n_core)))
+            self.assertGreater(scores[c].min(), 0.98)
+        for i in self.satellites():
+            group = (i - self.first_satellite) // self.n_satellites
+            self.assertEqual(ids[i, 0], i)
+            self.assertTrue(all(group * self.n_core <= j < (group + 1) * self.n_core for j in ids[i, 1:]))
+            self.assertTrue(np.all((scores[i, 1:] > self.threshold) & (scores[i, 1:] < 0.9)))
+        others = self.vectors[self.first_satellite:self.first_satellite + 2]
+        self.assertLess(float(others[0] @ others[1]), self.threshold)
+        self.assertEqual(float((self.vectors[:-1] @ self.vectors[-1]).max()), 0.0)
+
+    def test_rescue_edges(self):
+        for rows in (None, 1, 7):
+            with self.subTest(rows=rows), _patched("_GRAPH_RESULT_BYTES",
+                                                   None if rows is None else _budget(rows, self.k)):
+                clusterer = EmbeddingClusterer(self.db_path)
+                lower = clusterer.build_similarity_edges(self.threshold, self.k, EdgeRule.lower)
+                lower_pairs = _pairs(lower)
+                rescue = clusterer.build_similarity_edges(self.threshold, self.k)
+                pairs = _pairs(rescue)
+                rescued = pairs[len(lower_pairs):] if rows is None else [p for p in pairs if p not in lower_pairs]
+                self.assertEqual(len(pairs), len(lower_pairs) + len(rescued))
+                self.assertEqual(sorted(set(pairs) - set(rescued)), sorted(lower_pairs))
+                ref_pairs, ref_weights = self.expected_rescue()
+                self.assertEqual(rescued, ref_pairs)
+                weight_of = dict(zip(pairs, _weights(rescue).tolist()))
+                self.assertEqual([weight_of[p] for p in rescued], ref_weights)
+                self.assertEqual((rescue.n_rescued_chains, rescue.n_rescued_edges),
+                                 (self.n_groups * self.n_satellites, len(ref_pairs)))
+                # Orientation j < i, no self-pair, no pair twice, no lower-rule pair repeated
+                self.assertTrue(all(j < i for j, i in pairs))
+                self.assertEqual(len(set(pairs)), len(pairs))
+                self.assertFalse(set(rescued) & set(lower_pairs))
+                # No satellite has a lower-rule edge; each has its 4 rescue edges; the last chain has none
+                self.assertFalse({i for p in lower_pairs for i in p} & set(self.satellites()))
+                self.assertFalse(any(self.n - 1 in p for p in pairs))
+
+    def test_graph_and_leiden(self):
+        """The rescued satellites join their group's cluster; under the lower rule they are singletons."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.build_similarity_graph(self.threshold, self.k)
+        clusters = clusterer.cluster_leiden(seed=1)
+        for i in self.satellites():
+            group = (i - self.first_satellite) // self.n_satellites
+            self.assertEqual(clusters[i], clusters[group * self.n_core])
+        self.assertEqual(np.count_nonzero(clusters == clusters[-1]), 1)
+        clusterer.build_similarity_graph(self.threshold, self.k, EdgeRule.lower)
+        clusters = clusterer.cluster_leiden(seed=1)
+        sizes = np.bincount(clusters)
+        self.assertTrue(all(sizes[clusters[i]] == 1 for i in self.satellites()))
+
+    def test_fill_ids_make_no_rescue_edge(self):
+        """At threshold -inf, the -1 ids FAISS fills in (scored -FLT_MAX) are kept by no rule: the rescued chains get
+        edges to their real hits only, as in the two-pass reference."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.db.index = _FillingIndex(clusterer.db.index, 2)
+        ref = _rescue_two_pass(clusterer, float("-inf"), self.k)
+        edges = clusterer.build_similarity_edges(float("-inf"), self.k)
+        pairs = _pairs(edges)
+        self.assertEqual(pairs, ref.get_edgelist())
+        self.assertEqual(_weights(edges).tolist(), ref.es["weight"])
+        self.assertGreaterEqual(min(min(p) for p in pairs), 0)
+        self.assertGreater(edges.n_rescued_chains, 0)
+        self.assertGreater(min(_weights(edges)), np.finfo(np.float32).min)
+
+    def test_a_chain_with_no_hit_but_itself_stays_alone(self):
+        """At a threshold above every other score, no chain is rescued: self-hits make no edge."""
+        clusterer = EmbeddingClusterer(self.db_path)
+        edges = clusterer.build_similarity_edges(0.999, self.k)
+        self.assertEqual((edges.n_edges, edges.n_rescued_chains, edges.n_rescued_edges), (0, 0, 0))
+        self.assertEqual(edges.min_weight, float("inf"))
+        self.assertEqual((edges.pair_blocks, edges.weight_blocks), ([], []))
+
+    def test_log(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        with self.assertLogs(level="INFO") as logs:
+            clusterer.build_similarity_graph(self.threshold, self.k)
+        n_pairs = self.n_groups * self.n_satellites * (self.k - 1)
+        self.assertIn(f"INFO:root:Rescued {self.n_groups * self.n_satellites} chains with no edge from a lower "
+                      f"chain's search ({n_pairs} edges)", logs.output)
+        with self.assertLogs(level="INFO") as logs:
+            clusterer.build_similarity_graph(self.threshold, self.k, "lower")
+        self.assertFalse(any("Rescued" in line for line in logs.output))
+
+
+class SimilarityEdgesTest(unittest.TestCase):
+    """build_similarity_edges: the edges with no graph (a graph built before is dropped), cluster_leiden building the
+    graph from them, the chunk iterator, and the rule's values."""
+
+    k, threshold = 8, 0.8
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.vectors = _planted_lost_chains(3, 8, 3)
+        cls.n = len(cls.vectors)
+        cls.db_path = _build(Path(cls.tmp.name), "planted", cls.vectors, IndexType.flat)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_edges_then_leiden(self):
+        """cluster_leiden builds the graph from the edges: the graph and partition of build_similarity_graph."""
+        ref = EmbeddingClusterer(self.db_path)
+        ref_graph = ref.build_similarity_graph(self.threshold, self.k)
+        ref_clusters = ref.cluster_leiden(seed=3)
+        clusterer = EmbeddingClusterer(self.db_path)
+        clusterer.build_similarity_graph(self.threshold, self.k, EdgeRule.lower)
+        self.assertIsNotNone(clusterer.graph)
+        edges = clusterer.build_similarity_edges(self.threshold, self.k)
+        self.assertIsNone(clusterer.graph)
+        self.assertIsNone(clusterer._min_weight_graph)
+        self.assertIs(clusterer.edges, edges)
+        self.assertEqual(clusterer.min_weight, edges.min_weight)
+        self.assertGreater(edges.n_rescued_edges, 0)
+        clusters = clusterer.cluster_leiden(seed=3)
+        self.assertIsNone(clusterer.edges)
+        np.testing.assert_array_equal(clusters, ref_clusters)
+        self.assertEqual(clusterer.graph.get_edgelist(), ref_graph.get_edgelist())
+        self.assertEqual(clusterer.graph.es["weight"], ref_graph.es["weight"])
+        self.assertEqual(clusterer.graph.vs["name"], clusterer.chain_ids)
+        self.assertIs(clusterer._min_weight_graph(), clusterer.graph)
+        self.assertEqual(edges.pair_blocks, [])
+        self.assertEqual(edges.weight_blocks, [])
+
+    def test_negative_weights_from_edges_refused(self):
+        vectors = np.array([[1, 0, 0], [-0.8, 0.6, 0], [0, 0, 1]], dtype=np.float32)
+        clusterer = EmbeddingClusterer(_build(Path(self.tmp.name), "negative", vectors, IndexType.flat))
+        edges = clusterer.build_similarity_edges(-1.0, 3)
+        self.assertLess(edges.min_weight, 0)
+        with self.assertRaisesRegex(ValueError, r"^Leiden needs non-negative edge weights"):
+            clusterer.cluster_leiden(seed=1)
+        self.assertIsNone(clusterer.clusters)
+
+    def test_no_graph_nor_edges(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        with self.assertRaisesRegex(ValueError, r"^Graph not built\. Call build_similarity_graph\(\) first\.$"):
+            clusterer.cluster_leiden(seed=1)
+        # A build that fails records nothing
+        clusterer.build_similarity_edges(self.threshold, self.k)
+        clusterer.db.index = None
+        with self.assertRaisesRegex(ValueError, r"^Database not loaded"):
+            clusterer.build_similarity_edges(self.threshold, self.k)
+        self.assertEqual((clusterer.edges, clusterer.min_weight, clusterer._min_weight_graph), (None, None, None))
+
+    def test_chunks(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        with _patched("_GRAPH_RESULT_BYTES", _budget(7, self.k)):
+            edges = clusterer.build_similarity_edges(self.threshold, self.k)
+        self.assertGreater(len(edges.pair_blocks), 2)
+        pairs, weights = _pairs(edges), _weights(edges)
+        for size in (1, 3, None):
+            with self.subTest(size=size), _patched("_GRAPH_EDGE_CHUNK", 4 if size is None else None):
+                chunks = list(edges.chunks(size))
+                self.assertTrue(all(len(p) == len(w) <= (size or 4) for p, w in chunks))
+                self.assertEqual([tuple(e) for p, _ in chunks for e in p.tolist()], pairs)
+                self.assertEqual(np.concatenate([w for _, w in chunks]).tobytes(), weights.tobytes())
+                # A chunk never spans two blocks; the blocks are kept
+                bounds = np.cumsum([len(b) for b in edges.pair_blocks]).tolist()
+                ends = np.cumsum([len(p) for p, _ in chunks]).tolist()
+                self.assertTrue(set(bounds) <= set(ends))
+                self.assertEqual(_pairs(edges), pairs)
+
+    def test_rule_values(self):
+        clusterer = EmbeddingClusterer(self.db_path)
+        ref = clusterer.build_similarity_graph(self.threshold, self.k, EdgeRule.lower).get_edgelist()
+        self.assertEqual(clusterer.build_similarity_graph(self.threshold, self.k, "lower").get_edgelist(), ref)
+        with self.assertRaisesRegex(ValueError, "symmetric"):
+            clusterer.build_similarity_edges(self.threshold, self.k, "symmetric")
+        self.assertEqual([r.value for r in EdgeRule], ["rescue", "lower"])
+        # The default rule: rescue in the library; None (resolved to rescue) in the commands
+        for command, default in ((cluster_database, None), (similarity_graph, None),
+                                 (EmbeddingClusterer.build_similarity_edges, EdgeRule.rescue),
+                                 (EmbeddingClusterer.build_similarity_graph, EdgeRule.rescue)):
+            with self.subTest(command=command.__name__):
+                self.assertIs(inspect.signature(command).parameters["edge_rule"].default, default)
+
+
+# P9.CL2: --nprobe on cluster and similarity-graph. The EmbeddingClusterer constructor is the one source of nprobe: it
+# loads on the CPU, sets nprobe, then moves to the GPU.
+
+def _invoke(*args, patch_clusterer=False):
+    """fm-search through CliRunner, the logging state restored; with ``patch_clusterer``, loading a database fails the
+    test (an AssertionError as the exception)."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        with (mock.patch.object(clustering, "EmbeddingClusterer", side_effect=AssertionError("the database was loaded"))
+              if patch_clusterer else nullcontext()):
+            return CliRunner().invoke(search.app, [str(a) for a in args])
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+
+
+class NprobeTest(unittest.TestCase):
+    """EmbeddingClusterer(nprobe=...): the IVF's nprobe, the graph at it, a value above nlist, the refusals, the order
+    against the GPU move, a database given loaded; and --nprobe on cluster and similarity-graph."""
+
+    # At threshold 0.3 and k 100 the graph depends on nprobe (edges at nprobe 1 / 4 / 9 / 16: 31,325 / 32,738 /
+    # 32,791 / 32,792); at threshold 0.5 it does not
+    n, threshold, k, stored = 1000, 0.3, 100, 4
+    config = IndexConfig(nlist=16, m=8, nbits=4, nprobe=4, opq_train_size=1000)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        folder = Path(cls.tmp.name)
+        cls.pq_path = _build(folder, "pq", IvfPqSameGraphAsK2Test.vectors(), IndexType.ivf_pq, cls.config)
+        small = _clustered_vectors(seed=11, n=60, d=16, n_centers=6, noise=0.5)
+        cls.other_paths = {kind: _build(folder, kind.value, small, kind) for kind in
+                           (IndexType.flat, IndexType.hnsw, IndexType.auto)}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    assert_same_list = _SameGraphAsK2.assert_same_list
+    assert_same_graph = _SameGraphAsK2.assert_same_graph
+
+    def test_default_is_the_stored_value(self):
+        clusterer = EmbeddingClusterer(self.pq_path)
+        ivf = faiss.extract_index_ivf(clusterer.db.index)
+        self.assertEqual((clusterer.nprobe, ivf.nprobe, ivf.nlist), (self.stored, self.stored, 16))
+        self.assertEqual(ivf.parallel_mode, 3)
+        for path in self.other_paths.values():
+            self.assertIsNone(EmbeddingClusterer(path).nprobe)
+
+    def test_nprobe_reaches_the_index(self):
+        """The IVF searches at the given nprobe, parallel_mode 3 kept, and the graph is the one of set_nprobe after a
+        plain load, bit for bit."""
+        edge_counts = set()
+        for nprobe in (1, 9, 16):
+            with self.subTest(nprobe=nprobe):
+                clusterer = EmbeddingClusterer(self.pq_path, nprobe=nprobe)
+                ivf = faiss.extract_index_ivf(clusterer.db.index)
+                self.assertEqual((clusterer.nprobe, ivf.nprobe, ivf.parallel_mode), (nprobe, nprobe, 3))
+                graph = clusterer.build_similarity_graph(self.threshold, self.k)
+                ref = EmbeddingClusterer(self.pq_path)
+                ref.db.set_nprobe(nprobe)
+                self.assert_same_graph(graph, ref.build_similarity_graph(self.threshold, self.k))
+                edge_counts.add(graph.ecount())
+        self.assertEqual(len(edge_counts), 3)
+
+    def test_above_nlist_probes_every_cell(self):
+        """nprobe above nlist is kept as given and logged; FAISS probes every cell: the results and the graph of
+        nprobe = nlist, bit for bit."""
+        at_nlist = EmbeddingClusterer(self.pq_path, nprobe=16)
+        with self.assertLogs(level="INFO") as logs:
+            above = EmbeddingClusterer(self.pq_path, nprobe=21)
+        self.assertIn("INFO:root:IVF cells probed per query: 16 of 16 (nprobe 21 is above the cell count)",
+                      logs.output)
+        self.assertEqual((above.nprobe, faiss.extract_index_ivf(above.db.index).nprobe), (21, 21))
+        queries = above.db.index.reconstruct_n(0, self.n)
+        faiss.normalize_L2(queries)
+        for k in (10, self.n):
+            got, ref = above.db.index.search(queries, k), at_nlist.db.index.search(queries, k)
+            self.assertEqual(got[0].tobytes(), ref[0].tobytes())
+            self.assertTrue(np.array_equal(got[1], ref[1]))
+        self.assert_same_graph(above.build_similarity_graph(self.threshold, self.k),
+                               at_nlist.build_similarity_graph(self.threshold, self.k))
+        with self.assertLogs(level="INFO") as logs:
+            EmbeddingClusterer(self.pq_path)
+        self.assertIn(f"INFO:root:IVF cells probed per query: {self.stored} of 16", logs.output)
+
+    def test_below_1_refused_before_the_load(self):
+        with mock.patch.object(FaissEmbeddingDatabase, "load_database",
+                               side_effect=AssertionError("the database was loaded")):
+            for nprobe in (0, -3):
+                with self.subTest(nprobe=nprobe), \
+                        self.assertRaisesRegex(ValueError, r"^--nprobe must be at least 1\.$"):
+                    EmbeddingClusterer(self.pq_path, nprobe=nprobe)
+            with self.assertRaises(TypeError):
+                EmbeddingClusterer(self.pq_path, nprobe=2.0)
+        self.assertEqual(EmbeddingClusterer(self.pq_path, nprobe=np.int64(5)).nprobe, 5)
+
+    def test_flat_hnsw_auto_refused_after_the_load(self):
+        kinds = {IndexType.flat: "flat", IndexType.hnsw: "hnsw",
+                 IndexType.auto: "built with --index-type auto (flat or hnsw)"}
+        for kind, path in self.other_paths.items():
+            with self.subTest(kind=kind.value):
+                with mock.patch.object(FaissEmbeddingDatabase, "load_database", autospec=True,
+                                       side_effect=FaissEmbeddingDatabase.load_database) as load, \
+                        self.assertRaisesRegex(clustering._NprobeNotApplicable,
+                                               f"^--nprobe applies to ivf_pq databases only; this database is "
+                                               f"{re.escape(kinds[kind])}\\.$"):
+                    EmbeddingClusterer(path, nprobe=4)
+                load.assert_called_once()
+                self.assertTrue(issubclass(clustering._NprobeNotApplicable, ValueError))
+
+    def test_set_before_the_gpu_move(self):
+        """The load is on the CPU; nprobe is set on the CPU index, then the index moves to the GPU in the clustering
+        mode (the GPU support check and move_to_gpu recorded, not run: no GPU here)."""
+        for nprobe, use_gpu, expected in ((5, True, ["GPU check", "load", "set_nprobe 5", "move_to_gpu clustering"]),
+                                          (None, True, ["GPU check", "load", "move_to_gpu clustering"]),
+                                          (5, False, ["load", "set_nprobe 5"])):
+            with self.subTest(nprobe=nprobe, use_gpu=use_gpu):
+                calls = []
+                load, set_nprobe = FaissEmbeddingDatabase.load_database, FaissEmbeddingDatabase.set_nprobe
+
+                def record_load(db, use_gpu=False):
+                    calls.append("load" if use_gpu is False else "load on the GPU")
+                    return load(db, use_gpu=use_gpu)
+
+                def record_set(db, value):
+                    self.assertFalse(db.is_gpu_index)
+                    calls.append(f"set_nprobe {value}")
+                    return set_nprobe(db, value)
+
+                def record_move(db, gpu_id=0, clustering=False):
+                    calls.append("move_to_gpu clustering" if clustering else "move_to_gpu")
+
+                with mock.patch.object(FaissEmbeddingDatabase, "load_database", record_load), \
+                        mock.patch.object(FaissEmbeddingDatabase, "set_nprobe", record_set), \
+                        mock.patch.object(FaissEmbeddingDatabase, "move_to_gpu", record_move), \
+                        mock.patch.object(clustering, "_check_gpu_search", lambda: calls.append("GPU check")):
+                    clusterer = EmbeddingClusterer(self.pq_path, use_gpu=use_gpu, nprobe=nprobe)
+                self.assertEqual(calls, expected)
+                self.assertEqual(clusterer.nprobe, nprobe or self.stored)
+
+    def test_a_database_given_loaded(self):
+        db = _load_db(self.pq_path)
+        clusterer = EmbeddingClusterer(database=db, nprobe=7)
+        self.assertIs(clusterer.db, db)
+        self.assertEqual((clusterer.nprobe, faiss.extract_index_ivf(db.index).nprobe), (7, 7))
+        self.assertEqual(clusterer.chain_ids, db.chain_ids)
+        self.assert_same_graph(clusterer.build_similarity_graph(self.threshold, self.k),
+                               EmbeddingClusterer(self.pq_path, nprobe=7).build_similarity_graph(self.threshold,
+                                                                                                 self.k))
+        self.assertEqual(EmbeddingClusterer(database=_load_db(self.pq_path)).nprobe, self.stored)
+        cases = (
+            (dict(), r"^Give exactly one of db_path and database\.$"),
+            (dict(db_path=self.pq_path, database=db), r"^Give exactly one of db_path and database\.$"),
+            (dict(database=FaissEmbeddingDatabase(Path(self.tmp.name), "pq")),
+             r"^Database not loaded\. Call load_database\(\) first\.$"),
+        )
+        for kwargs, message in cases:
+            with self.subTest(kwargs=sorted(kwargs)), self.assertRaisesRegex(ValueError, message):
+                EmbeddingClusterer(**kwargs)
+        on_gpu = _load_db(self.pq_path)
+        on_gpu.is_gpu_index = True
+        with self.assertRaisesRegex(ValueError, r"^The database must be on the CPU: use_gpu=True moves it to the GPU "
+                                                r"once nprobe is set\.$"):
+            EmbeddingClusterer(database=on_gpu, nprobe=7)
+
+    # Through the CLI
+
+    def run_ok(self, *args):
+        result = _invoke(*args)
+        self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+
+    def test_cli_stored_value_gives_the_same_files(self):
+        out = Path(self.tmp.name)
+        base = ("--db-path", self.pq_path, "--threshold", self.threshold, "--max-neighbors", self.k)
+        # Every cell probed changes the graph and the greedy partition; the Leiden partition on this fixture is the
+        # same at both nprobe values
+        for command, extra, name, changes in ((("cluster",), ("--seed", 3), "leiden.tsv", False),
+                                              (("cluster", "--method", "greedy"), (), "greedy.tsv", True),
+                                              (("similarity-graph",), (), "graph.graphml", True)):
+            with self.subTest(command=command):
+                self.run_ok(*command, *base, *extra, "--output-file", out / f"none.{name}")
+                self.run_ok(*command, *base, *extra, "--nprobe", self.stored, "--output-file", out / f"given.{name}")
+                self.run_ok(*command, *base, *extra, "--nprobe", 16, "--output-file", out / f"all.{name}")
+                self.assertEqual((out / f"none.{name}").read_bytes(), (out / f"given.{name}").read_bytes())
+                if changes:
+                    self.assertNotEqual((out / f"none.{name}").read_bytes(), (out / f"all.{name}").read_bytes())
+
+    def test_cli_nprobe_reaches_the_index(self):
+        """cluster --nprobe 16 writes the file of a clusterer at nprobe 16; similarity-graph the GraphML."""
+        out = Path(self.tmp.name)
+        base = ("--db-path", self.pq_path, "--threshold", self.threshold, "--max-neighbors", self.k, "--nprobe", 16)
+        self.run_ok("cluster", *base, "--seed", 3, "--output-file", out / "np16.tsv")
+        self.run_ok("similarity-graph", *base, "--output-file", out / "np16.graphml")
+        clusterer = EmbeddingClusterer(self.pq_path, nprobe=16)
+        clusterer.build_similarity_graph(self.threshold, self.k).write_graphml(str(out / "np16_ref.graphml"))
+        clusterer.cluster_leiden(seed=3)
+        clusterer.export_clusters(str(out / "np16_ref.tsv"))
+        self.assertEqual((out / "np16.tsv").read_bytes(), (out / "np16_ref.tsv").read_bytes())
+        self.assertEqual((out / "np16.graphml").read_bytes(), (out / "np16_ref.graphml").read_bytes())
+
+    def test_cli_refusals(self):
+        out = Path(self.tmp.name) / "refused.out"
+        commands = (("cluster",), ("cluster", "--method", "leiden"), ("cluster", "--method", "greedy"),
+                    ("similarity-graph",))
+        for command in commands:
+            for value in ("0", "-3"):
+                with self.subTest(command=command, value=value):
+                    result = _invoke(*command, "--db-path", "no/such/db", "--nprobe", value, patch_clusterer=True)
+                    self.assertEqual(result.exit_code, 2, f"{result.output}\n{result.exception!r}")
+                    self.assertIn("Invalid value for --nprobe: --nprobe must be at least 1.", _flat(result.output))
+            for kind, path in self.other_paths.items():
+                with self.subTest(command=command, kind=kind.value):
+                    result = _invoke(*command, "--db-path", path, "--nprobe", 4, "--output-file", out)
+                    self.assertEqual(result.exit_code, 2, f"{result.output}\n{result.exception!r}")
+                    self.assertIn("Invalid value for --nprobe: --nprobe applies to ivf_pq databases only; this "
+                                  "database is", _flat(result.output))
+                    self.assertFalse(out.exists())
+        # Without --nprobe, or at 1 and above on ivf_pq, the database is loaded
+        for value in ((), ("--nprobe", "1")):
+            with self.subTest(value=value):
+                result = _invoke("cluster", "--db-path", "no/such/db", *value, patch_clusterer=True)
+                self.assertEqual(str(result.exception), "the database was loaded")
+
+    def test_cli_help(self):
+        for name in ("cluster", "similarity-graph"):
+            with self.subTest(command=name):
+                command = typer.main.get_command(search.app).commands[name]
+                text = next(p.help for p in command.params if p.name == "nprobe")
+                self.assertEqual(text, "IVF cells probed per query (ivf_pq databases only). Default: the value "
+                                       "stored at build (--ivf-nprobe, or --ivf-nlist // 64). Higher finds more "
+                                       "neighbours and is slower.")
 
 
 # P9.U: cluster_leiden runs python-igraph's community_leiden, a fixed number of iterations, seeded with a private
