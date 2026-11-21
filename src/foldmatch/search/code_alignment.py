@@ -324,6 +324,17 @@ def _task_record(st: _WorkerState, timer: stage2_profile.TaskTimer, kind: str, n
     return timer.record(kind, n, pairs, result, init)
 
 
+def _score_rows(qp: np.ndarray, codes: np.ndarray, pairs: np.ndarray, *, params, block_floats: int,
+                max_pair_cells: int, kernel, workspace, timings=None) -> "swkern.ScoreResult":
+    """Round 1's leaf, shared by the task function and the in-memory API: S_f, S_r and the skipped flags of the
+    prepared query ``qp`` against the targets ``codes[o:o + m]`` of ``pairs`` int64 ``[(o, m), ...]``, then the
+    workspace released above :data:`WORKSPACE_KEEP_BYTES`."""
+    r = swkern.score_fwd_rev(qp, codes, pairs[:, 0], params, lengths=pairs[:, 1], block_floats=block_floats,
+                             max_pair_cells=max_pair_cells, kernel=kernel, workspace=workspace, timings=timings)
+    workspace.release(WORKSPACE_KEEP_BYTES)
+    return r
+
+
 def _round1_task(task):
     """Round 1: ``(task id, S_f float32 [k], S_r float32 [k], skipped bool [k])`` of one query against a chunk of
     panel members or candidates (profiling mode: plus the task's timing record)."""
@@ -334,10 +345,9 @@ def _round1_task(task):
     if timer is not None:
         timer.lap("prep")
     codes = st.panel_codes if source == _PANEL else st.codes
-    r = swkern.score_fwd_rev(qp, codes, pairs[:, 0], st.params, lengths=pairs[:, 1],
-                             block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells,
-                             kernel=st.kernel, workspace=st.workspace, timings=None if timer is None else timer.t)
-    st.workspace.release(WORKSPACE_KEEP_BYTES)
+    r = _score_rows(qp, codes, pairs, params=st.params, block_floats=st.init.block_floats,
+                    max_pair_cells=st.init.max_pair_cells, kernel=st.kernel, workspace=st.workspace,
+                    timings=None if timer is None else timer.t)
     if timer is None:
         return tid, r.s_fwd, r.s_rev, r.skipped
     timer.lap("swkern")
@@ -378,22 +388,37 @@ def _round2_task(task):
     qp = _query_prep(st, q_off, n)
     if timer is not None:
         timer.lap("prep")
-    a = swkern.align(qp, st.codes, pairs[:, 0], st.params, lengths=pairs[:, 1], traceback=True,
-                     block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells, kernel=st.kernel,
-                     workspace=st.workspace, timings=None if timer is None else timer.t)
-    st.workspace.release(WORKSPACE_KEEP_BYTES)
-    if timer is not None:
-        timer.lap("swkern")
-    cap = st.init.spec.calibrated_domain.target_min_distinct_codes
-    distinct = np.array([_distinct_codes(st.codes[o:o + m], cap) for o, m in pairs.tolist()], np.int64)
-    if timer is not None:
-        timer.lap("distinct")
-    columns, end_ok, nonstd, strings = _path_outputs(a, qseq, t_seqs, pairs[:, 1], want)
-    out = (tid, a.scores, a.ends, columns, end_ok, nonstd, distinct, a.skipped, strings)
+    _aligned, outputs = _trace_rows(qp, st.codes, pairs, qseq, t_seqs, want, params=st.params,
+                                    block_floats=st.init.block_floats, max_pair_cells=st.init.max_pair_cells,
+                                    kernel=st.kernel, workspace=st.workspace,
+                                    cap=st.init.spec.calibrated_domain.target_min_distinct_codes, timer=timer)
+    out = (tid,) + outputs
     if timer is None:
         return out
     timer.lap("metrics")
     return out + (_task_record(st, timer, "round2", n, pairs, out),)
+
+
+def _trace_rows(qp: np.ndarray, codes: np.ndarray, pairs: np.ndarray, qseq: str, t_seqs: Sequence[str], want, *,
+                params, block_floats: int, max_pair_cells: int, kernel, workspace, cap: int,
+                timer: Optional[stage2_profile.TaskTimer] = None):
+    """Round 2's leaf, shared by the task function and the in-memory API: the forward traceback of the prepared
+    query ``qp`` against the targets ``codes[o:o + m]`` of ``pairs`` (the workspace released above
+    :data:`WORKSPACE_KEEP_BYTES`), the targets' distinct codes up to ``cap`` and :func:`_path_outputs`. Returns
+    ``(AlignResult, (S_f, ends, columns, end_ok, nonstd, distinct, skipped, strings))``: the second item is a
+    round-2 task's result after its task id; the task drops the ``AlignResult``, the API keeps its paths. ``timer``
+    (profiling mode) gets the task's ``swkern`` and ``distinct`` laps."""
+    a = swkern.align(qp, codes, pairs[:, 0], params, lengths=pairs[:, 1], traceback=True, block_floats=block_floats,
+                     max_pair_cells=max_pair_cells, kernel=kernel, workspace=workspace,
+                     timings=None if timer is None else timer.t)
+    workspace.release(WORKSPACE_KEEP_BYTES)
+    if timer is not None:
+        timer.lap("swkern")
+    distinct = np.array([_distinct_codes(codes[o:o + m], cap) for o, m in pairs.tolist()], np.int64)
+    if timer is not None:
+        timer.lap("distinct")
+    columns, end_ok, nonstd, strings = _path_outputs(a, qseq, t_seqs, pairs[:, 1], want)
+    return a, (a.scores, a.ends, columns, end_ok, nonstd, distinct, a.skipped, strings)
 
 
 def _path_outputs(a: "swkern.AlignResult", qseq: str, t_seqs: Sequence[str], lengths: np.ndarray, want):
@@ -1233,6 +1258,27 @@ def _is_degenerate(q16: np.ndarray) -> bool:
     return bool(np.all(rows == rows[0]))
 
 
+def _check_query_sequence(label: str, seq: str, length: int, sha1: Optional[bytes], *, rows: str = "encoding") -> str:
+    """S15 and the binding of a sequence to its rows: ``seq`` normalised (``ValueError`` naming ``label`` when it
+    cannot be), with ``length`` residues (the rows of its ``rows``, "encoding" or "codes") and, unless ``sha1`` is
+    None, that seq_sha1. Returns the normalised sequence."""
+    try:
+        seq = normalize_sequence(seq)                      # S15 (a no-op for the run's normalised sequences)
+    except ValueError as e:
+        raise ValueError(f"{label}: {e} (S15)") from e
+    if len(seq) != length:
+        raise ValueError(f"{label}: its sequence has {len(seq)} residues, its {rows} {length} rows")
+    if sha1 is not None and seq_sha1(seq) != sha1:
+        raise ValueError(f"{label}: its sequence is not the one its {rows} was computed from (seq_sha1 differs)")
+    return seq
+
+
+def _check_query_rows(label: str, q16: np.ndarray) -> None:
+    """S5: a query encoding must be finite."""
+    if not np.all(np.isfinite(q16)):
+        raise ValueError(f"{label}: its encoding contains NaN or Inf (S5)")
+
+
 def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run) -> List[_Query]:
     """The queries to align, in memmap order: checked against their encodings; those without candidates and the
     fully degenerate ones (S13b) left out (and counted)."""
@@ -1252,23 +1298,14 @@ def _collect_queries(query_index, prefilter_results, query_sequences, run: _Run)
         seq = query_sequences.get(qid)
         if seq is None:
             raise ValueError(f"query {qid!r} has no sequence")
-        try:
-            seq = normalize_sequence(seq)                  # S15 (a no-op for the run's normalised sequences)
-        except ValueError as e:
-            raise ValueError(f"query {qid!r}: {e} (S15)") from e
-        if len(seq) != entry.length:
-            raise ValueError(f"query {qid!r}: its sequence has {len(seq)} residues, its encoding {entry.length} rows")
-        if seq_sha1(seq) != bytes(entry.seq_sha1):
-            raise ValueError(f"query {qid!r}: its sequence is not the one its encoding was computed from (seq_sha1 "
-                             "differs)")
+        seq = _check_query_sequence(f"query {qid!r}", seq, entry.length, bytes(entry.seq_sha1))
         if not subject_ids:
             run.no_candidates += 1
             continue
         if memmap is None:
             memmap = query_index.memmap()
         q16 = memmap[entry.offset:entry.offset + entry.length]
-        if not np.all(np.isfinite(q16)):
-            raise ValueError(f"query {qid!r}: its encoding contains NaN or Inf (S5)")
+        _check_query_rows(f"query {qid!r}", q16)
         if _is_degenerate(q16):
             run.degenerate.append(qid)
             continue
@@ -1586,17 +1623,8 @@ class _Dataflow:
         _kind, b, qi, k0, k1 = tag
         tid, scores, ends, columns, end_ok, nonstd, distinct, skipped, strings = res
         q = b.queries[qi]
-        want = q.s_f[q.surv[k0:k1]]
-        if np.any(skipped) or not np.array_equal(np.asarray(scores, np.float32).view(np.uint32),
-                                                 want.view(np.uint32)):
-            bad = np.flatnonzero(np.asarray(scores, np.float32).view(np.uint32) != want.view(np.uint32))
-            raise InternalError(
-                f"esm-codes Stage 2: the round-2 traceback score of query {q.qid!r} differs from its round-1 S_f "
-                f"(targets {[q.cand_ids[int(q.surv[k0 + i])] for i in bad[:_EXAMPLES].tolist()]}: "
-                f"{np.asarray(scores)[bad[:_EXAMPLES]].tolist()} vs {want[bad[:_EXAMPLES]].tolist()}); the reported "
-                "raw score would not be the one behind the E-value")
-        part = (k0, np.asarray(ends), np.asarray(columns, np.int64), np.asarray(end_ok, bool),
-                np.asarray(nonstd, np.int64), np.asarray(distinct, np.int64), strings)
+        _check_round2(q, k0, k1, scores, skipped)
+        part = _round2_part(k0, ends, columns, end_ok, nonstd, distinct, strings)
         q.parts.append(part)
         q.r2_left -= 1
         b.r2_left -= 1
@@ -1610,6 +1638,26 @@ class _Dataflow:
             if prof is not None:
                 prof.round2_payload(-held, -int(q.surv.size))
             self._close_query(b)
+
+
+def _check_round2(q: _Query, k0: int, k1: int, scores, skipped) -> None:
+    """Survivors ``[k0, k1)`` of ``q``: their round-2 traceback scores must be their round-1 S_f bit for bit, and none
+    may be skipped (:class:`~foldmatch.errors.InternalError` otherwise)."""
+    want = q.s_f[q.surv[k0:k1]]
+    if np.any(skipped) or not np.array_equal(np.asarray(scores, np.float32).view(np.uint32),
+                                             want.view(np.uint32)):
+        bad = np.flatnonzero(np.asarray(scores, np.float32).view(np.uint32) != want.view(np.uint32))
+        raise InternalError(
+            f"esm-codes Stage 2: the round-2 traceback score of query {q.qid!r} differs from its round-1 S_f "
+            f"(targets {[q.cand_ids[int(q.surv[k0 + i])] for i in bad[:_EXAMPLES].tolist()]}: "
+            f"{np.asarray(scores)[bad[:_EXAMPLES]].tolist()} vs {want[bad[:_EXAMPLES]].tolist()}); the reported "
+            "raw score would not be the one behind the E-value")
+
+
+def _round2_part(k0: int, ends, columns, end_ok, nonstd, distinct, strings) -> tuple:
+    """One round-2 result as the part :func:`_assemble` reads (survivors from ``k0``)."""
+    return (k0, np.asarray(ends), np.asarray(columns, np.int64), np.asarray(end_ok, bool),
+            np.asarray(nonstd, np.int64), np.asarray(distinct, np.int64), strings)
 
 
 def _statistics(q: _Query, run: _Run):
