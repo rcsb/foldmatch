@@ -54,7 +54,8 @@ of targets given as arrays (:class:`CodeQuery`: the S5 encoding; :class:`CodeTar
 with no database, query memmap or code store: the same leaf helpers as the task functions (``_score_rows``,
 ``_trace_rows``), the same statistics and hits (``_statistics``, ``_hits``), so the hits are fm-search's bit for bit
 under the same BLAS regime, and each hit's path comes back as explicit row pairs (:class:`AlignedResidues`).
-:func:`panel_q90` computes a query's Q90 once for many calls.
+:func:`panel_q90` computes a query's Q90 once for many calls; :func:`load_code_targets` reads targets, N and the
+system from a database.
 """
 from __future__ import annotations
 
@@ -94,7 +95,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     # the in-memory API (provisional in 0.14)
     "CodeQuery", "CodeTarget", "Provenance", "PanelQ90", "AlignedResidues", "QueryCodeAlignment",
-    "align_query_codes", "panel_q90",
+    "CodeDatabaseTargets", "align_query_codes", "panel_q90", "load_code_targets",
     # fm-search's Stage 2
     "align_candidates_esm_codes", "CodeAlignmentPool", "OutputNeeds", "plan_chunks", "WorkerPoolError",
 ]
@@ -2585,3 +2586,64 @@ def panel_q90(query: CodeQuery, *, scoring_system) -> Optional[PanelQ90]:
                                                  workspace=workspace, task_cells=task_cells,
                                                  max_pair_cells=max_pair_cells)
     return PanelQ90(_panel_q90(panel_f, panel_r, spec), query.encoding_sha256, provenance)
+
+
+class CodeDatabaseTargets(NamedTuple):
+    """What :func:`load_code_targets` read from a database: the targets, N (the database's ``total_residues``, the
+    search space of fm-search's E-values) and the prepared scoring system the database names."""
+    targets: Dict[str, CodeTarget]
+    total_residues: int
+    prepared: Any                     # scoring_system.PreparedSystem
+
+
+def load_code_targets(db_path: str, ids: Sequence[str]) -> CodeDatabaseTargets:
+    """The :class:`CodeTarget` of every id in ``ids`` from a database built with ``fm-search build sequences
+    --residue-codes``, with its N and its system, for :func:`align_query_codes` to reproduce fm-search's Stage 2 on
+    it: ``align_query_codes(q, d.targets, scoring_system=d.prepared, db_residues=d.total_residues)``.
+
+    It runs fm-search's own read-only database resolution (``resolve_esm_codes_database``: complete stores, the
+    registry entry the manifest names, ``check_compatible``, the kernel, ``prepare``), with its
+    :class:`~foldmatch.errors.RefusalError` messages, then reads each id's codes (by id, a copy each), stored
+    sequence and seq_sha1. That resolution imports the inference module, and so torch. ``ids`` is required (a
+    database can hold hundreds of millions of residues) and may not repeat an id; an id the database lacks is a
+    RefusalError. The stores keep no residue keys: the targets have ``residue_keys=None``, and a row's identity is
+    ``(seq_sha1, row)``."""
+    if isinstance(ids, (str, bytes)) or not isinstance(ids, Iterable):
+        raise TypeError(f"ids must be a sequence of target ids (str), got {type(ids).__name__}")
+    ids = list(ids)
+    for i in ids:
+        if not isinstance(i, str):
+            raise TypeError(f"ids must be str target ids, got {i!r}")
+    if len(set(ids)) != len(ids):
+        seen, dup = set(), None
+        for i in ids:
+            if i in seen:
+                dup = i
+                break
+            seen.add(i)
+        raise ValueError(f"ids lists {dup!r} more than once: each target is one entry of the result")
+    from foldmatch.cli.search import resolve_esm_codes_database
+    from foldmatch.search.residue_code_store import ResidueCodeStoreError
+    database = resolve_esm_codes_database(str(db_path), None)
+    targets: Dict[str, CodeTarget] = {}
+    if ids:
+        try:
+            entries = database.code_store.lookup(ids)
+        except ResidueCodeStoreError as exc:
+            raise RefusalError(f"{db_path}: {exc}") from exc
+        sequences = database.sequence_store.fetch(ids)
+        missing = [i for i in ids if i not in sequences]
+        if missing:
+            raise RefusalError(f"{db_path}: {len(missing)} target(s) have residue codes but no sequence in the "
+                               f"sequence store (first: {', '.join(missing[:_EXAMPLES])}): the code store and the "
+                               "database disagree")
+        codes = database.code_store.open_memmap()
+        for i in ids:
+            e = entries[i]
+            try:
+                targets[i] = CodeTarget(sequences[i], codes[e.offset:e.offset + e.length],
+                                        seq_sha1=bytes(e.seq_sha1))
+            except RefusalError as exc:
+                raise RefusalError(f"{db_path}: target {i!r}: {exc}") from exc
+        del codes
+    return CodeDatabaseTargets(targets=targets, total_residues=database.total_residues, prepared=database.prepared)

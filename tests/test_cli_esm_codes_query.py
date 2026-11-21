@@ -1345,5 +1345,105 @@ class _Records(logging.Handler):
         self.records.append(record)
 
 
+# =====================================================================================================================
+# P9.PA: the in-memory API against the command line (T2) and load_code_targets
+# =====================================================================================================================
+def _stage2_spy(captured: dict):
+    """A wrapper of the real ``align_candidates_esm_codes`` that copies what the command line gives it (the query
+    encodings first: fm-search removes the query memmap when the run ends) and its result, then returns that."""
+    real = code_alignment.align_candidates_esm_codes
+
+    def spy(query_index, prefilter_results, code_store, fetch, prepared, db_residues, pool, **kwargs):
+        captured["queries"] = {qid: (np.array(query_index.get(qid), copy=True),
+                                     bytes(query_index.entries[qid].seq_sha1)) for qid in prefilter_results}
+        captured["prefilter"] = {qid: (list(ids), [float(x) for x in scores])
+                                 for qid, (ids, scores) in prefilter_results.items()}
+        captured["query_sequences"] = dict(kwargs["query_sequences"])
+        captured["db_residues"] = db_residues
+        captured["output_needs"] = list(kwargs["output_needs"])
+        captured["kwargs"] = {k: kwargs[k] for k in ("min_seq_identity", "min_coverage", "max_evalue")}
+        captured["results"] = real(query_index, prefilter_results, code_store, fetch, prepared, db_residues, pool,
+                                   **kwargs)
+        return captured["results"]
+    return spy
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class InMemoryApiTest(_DbCase):
+    """T2: ``fm-search query sequences --scoring esm-codes`` (fake ESM3 pass, real Stage 2) and the in-memory API
+    on the very arrays the command line aligned, with the targets, N and system from ``load_code_targets``: the
+    same hits bit for bit and the same output file."""
+
+    def _replay(self, db, out, captured, format_mode):
+        from foldmatch.search.code_alignment import CodeQuery, align_query_codes, load_code_targets
+        from test_code_alignment import _signature
+        for qid, (ids, _scores) in captured["prefilter"].items():
+            self.assertEqual(len(ids), len(set(ids)), f"{qid}: Stage 1 listed a candidate twice")
+        manifest = json.loads(Path(f"{db}.rescodes.json").read_text())
+        self.assertEqual(captured["db_residues"], manifest["total_residues"])
+        every = sorted({t for ids, _ in captured["prefilter"].values() for t in ids})
+        loaded = load_code_targets(str(db), every)
+        self.assertEqual(loaded.total_residues, manifest["total_residues"])
+        self.assertEqual(loaded.prepared.system, SYSTEM)
+        results = {}
+        for qid, (ids, scores) in captured["prefilter"].items():
+            q16, sha1 = captured["queries"][qid]
+            query = CodeQuery(captured["query_sequences"][qid], q16, seq_sha1=sha1)
+            res = align_query_codes(query, {t: loaded.targets[t] for t in ids}, scoring_system=loaded.prepared,
+                                    db_residues=loaded.total_residues, emb_scores=dict(zip(ids, scores)),
+                                    output_needs=captured["output_needs"], **captured["kwargs"])
+            results[qid] = res.hits
+            self.assertEqual(list(res.paths), [h.subject_id for h in res.hits])
+        self.assertEqual(_signature(results), _signature(captured["results"]))
+        api_out = self.tmp / "api.tsv"
+        output.write_aligned_results(results, captured["output_needs"], str(api_out), format_mode)
+        self.assertEqual(_sha256(api_out), _sha256(out))
+        return results
+
+    def test_the_api_on_the_command_lines_arrays_gives_its_hits_and_file(self):
+        db = self.database("codes")
+        for k, (extra, mode) in enumerate((
+                (("--format-output", ALL_FIELDS, "--format-mode", "tsv", "--max-evalue", "inf", "--threshold", "-2"),
+                 "tsv"),
+                ((), "headless_tsv"))):
+            with self.subTest(extra=extra):
+                captured = {}
+                with mock.patch.object(code_alignment, "align_candidates_esm_codes", _stage2_spy(captured)):
+                    result, out = self.query(db, *_esm("--align-workers", "0", *extra), out=self.tmp / f"o{k}.tsv",
+                                             run_id=f"api{k}")
+                self.assertEqual(result.exit_code, 0, (result.output, result.exception))
+                self.assertEqual(list(self.qshards.iterdir()), [])          # the run's memmap is gone, the copy is not
+                results = self._replay(db, out, captured, mode)
+                self.assertTrue(any(results.values()))
+                if k == 0:
+                    self.assertEqual(sum(map(len, results.values())), 4)     # every candidate, each pair aligned
+
+    def test_load_code_targets(self):
+        from foldmatch.search.code_alignment import CodeTarget, load_code_targets
+        db = self.database("codes")
+        records = dict(_fasta_records(_FASTA))
+        got = load_code_targets(str(db), list(records))
+        self.assertEqual(list(got.targets), list(records))
+        f2c = _f2c()[0]
+        for tid, t in got.targets.items():
+            self.assertIsInstance(t, CodeTarget)
+            self.assertEqual(t.sequence, records[tid])
+            self.assertEqual(t.seq_sha1, _sha1(records[tid]))
+            self.assertIsNone(t.residue_keys)
+            np.testing.assert_array_equal(t.codes, f2c[records[tid]])
+        self.assertEqual(got.total_residues, 303)
+        self.assertEqual(load_code_targets(str(db), []).targets, {})
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            load_code_targets(str(db), ["1acb_E", "1acb_E"])
+        with self.assertRaisesRegex(RefusalError, "no residue codes"):
+            load_code_targets(str(db), ["1acb_E", "nope"])
+        with self.assertRaises(TypeError):
+            load_code_targets(str(db), "1acb_E")
+        with self.assertRaises(TypeError):
+            load_code_targets(str(db), [1])
+        with self.assertRaisesRegex(RefusalError, "built without --residue-codes"):
+            load_code_targets(str(self.database("plain")), ["1acb_E"])
+
+
 if __name__ == "__main__":
     unittest.main()
