@@ -48,26 +48,40 @@ the same task functions in-process. A worker that ends without returning its tas
 with :class:`WorkerPoolError` instead of leaving it waiting. Spawn workers re-import the main module, so a script
 that runs this Stage 2 with a pool must guard its entry point with ``if __name__ == "__main__":`` (the ``fm-search``
 command does); without the guard the workers cannot start and the run fails with :class:`WorkerPoolError`.
+
+**In memory** (provisional in 0.14). :func:`align_query_codes` runs the same Stage 2 for one query against any number
+of targets given as arrays (:class:`CodeQuery`: the S5 encoding; :class:`CodeTarget`: the S4 codes), in this process,
+with no database, query memmap or code store: the same leaf helpers as the task functions (``_score_rows``,
+``_trace_rows``), the same statistics and hits (``_statistics``, ``_hits``), so the hits are fm-search's bit for bit
+under the same BLAS regime, and each hit's path comes back as explicit row pairs (:class:`AlignedResidues`).
+:func:`panel_q90` computes a query's Q90 once for many calls.
 """
 from __future__ import annotations
 
+import dataclasses
+import functools
+import hashlib
 import logging
 import math
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from contextlib import ExitStack, contextmanager
+from dataclasses import KW_ONLY, dataclass, field
+from typing import Any, Dict, Hashable, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-from foldmatch.errors import InternalError
+import foldmatch
+from foldmatch.errors import InternalError, RefusalError
 from foldmatch.search import code_statistics as cs
+from foldmatch.search import output
+from foldmatch.search import scoring_system as ss
 from foldmatch.search import stage2_profile
 from foldmatch.search import swkern
 from foldmatch.search.alignment import (
@@ -76,6 +90,14 @@ from foldmatch.search.alignment import (
 from foldmatch.utils.sequence import STANDARD_AMINO_ACIDS, normalize_sequence, seq_sha1
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    # the in-memory API (provisional in 0.14)
+    "CodeQuery", "CodeTarget", "Provenance", "PanelQ90", "AlignedResidues", "QueryCodeAlignment",
+    "align_query_codes", "panel_q90",
+    # fm-search's Stage 2
+    "align_candidates_esm_codes", "CodeAlignmentPool", "OutputNeeds", "plan_chunks", "WorkerPoolError",
+]
 
 PANEL_POLICIES = ("auto", "always", "never")
 #: Output fields whose values need the panel pass (Q90): with none of them requested and no finite ``max_evalue``,
@@ -525,6 +547,40 @@ def _swkern_skip_warning_dropped():
             log.removeFilter(_DROP_SKIP_WARNING)
 
 
+_REGIME_LOCK = threading.Lock()
+_REGIME_USERS = 0
+_REGIME_STACK: Optional[ExitStack] = None
+
+
+@contextmanager
+def _in_process_regime():
+    """The in-process regime of every in-process user (fm-search's in-process Stage 2 and the in-memory API):
+    :func:`_blas_one_thread_here` and :func:`_swkern_skip_warning_dropped`, entered by the first user and left by the
+    last. Both are process-wide and restore what they found at entry, so users overlapping in two threads must
+    share one entry: otherwise the first to leave would restore BLAS's thread count and drop the filter while the
+    other's tasks still run."""
+    global _REGIME_USERS, _REGIME_STACK
+    with _REGIME_LOCK:
+        if _REGIME_USERS == 0:
+            stack = ExitStack()
+            try:
+                stack.enter_context(_blas_one_thread_here())
+                stack.enter_context(_swkern_skip_warning_dropped())
+            except BaseException:
+                stack.close()
+                raise
+            _REGIME_STACK = stack
+        _REGIME_USERS += 1
+    try:
+        yield
+    finally:
+        with _REGIME_LOCK:
+            _REGIME_USERS -= 1
+            if _REGIME_USERS == 0:
+                stack, _REGIME_STACK = _REGIME_STACK, None
+                stack.close()
+
+
 def _stop_workers(executor: ProcessPoolExecutor) -> None:
     """Terminate an executor's worker processes now, without waiting for their tasks (``terminate_workers`` from
     Python 3.14; before it, through the executor's process table), then release the executor."""
@@ -655,7 +711,7 @@ class CodeAlignmentPool:
                         "count (set OMP/OPENBLAS/MKL/VECLIB_*_NUM_THREADS=1 for the bits of a worker pool; S16 holds "
                         "either way)")
         self._in_process = init
-        with _blas_one_thread_here(), _swkern_skip_warning_dropped():
+        with _in_process_regime():
             for task in tasks:
                 yield fn(task)
 
@@ -758,10 +814,9 @@ class _Session:
 
     def __enter__(self) -> "_Session":
         if self.in_process:
-            blas, warn = _blas_one_thread_here(), _swkern_skip_warning_dropped()
-            blas.__enter__()
-            warn.__enter__()
-            self._exit = (warn, blas)
+            regime = _in_process_regime()
+            regime.__enter__()
+            self._exit = (regime,)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -1826,3 +1881,707 @@ def _hits(q: _Query, run: _Run) -> List[Hit]:
     if prof is not None:
         prof.add("hits_sort", time.perf_counter() - t3)
     return hits
+
+
+# =====================================================================================================================
+# the in-memory API: one query against any number of targets, in-process (provisional in 0.14)
+# =====================================================================================================================
+#: The in-memory API's task size (cells per kernel call: both rounds and the panel run in chunks of at most this
+#: many similarity cells, so the kernel buffers and the round-2 path buffer stay bounded) and its oversize-pair limit
+#: (fm-search's default). Read at call time, so tests can patch them; neither changes a pair's bits.
+_API_TASK_CELLS = DEFAULT_TASK_CELLS
+_API_MAX_PAIR_CELLS = swkern.DEFAULT_MAX_PAIR_CELLS
+#: Serialises the API's calls (the panel cache; the one-thread regime is shared with fm-search through
+#: :func:`_in_process_regime`).
+_API_LOCK = threading.Lock()
+_API_QUERY_ID = "<query>"
+#: ``(system digest, scoring npz path) -> (panel codes, panel pairs [(offset, length)], lengths, longest)``, filled
+#: through :meth:`WorkerSpec.load_panel` (which re-hashes the 3 MB npz) once per system, at most two systems.
+_PANEL_CACHE: "OrderedDict[Tuple[str, str], tuple]" = OrderedDict()
+_PANEL_CACHE_SIZE = 2
+
+
+def _as_rows(value, what: str) -> np.ndarray:
+    """``np.asarray(value)``; a CUDA / MPS tensor or one that requires grad (torch raises TypeError or RuntimeError)
+    becomes one TypeError that says what to do."""
+    try:
+        return np.asarray(value)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise TypeError(f"{what} must be a numpy array or a CPU tensor without grad: call .detach().cpu() "
+                        f"({type(exc).__name__}: {exc})") from exc
+
+
+def _frozen_copy(rows: np.ndarray) -> np.ndarray:
+    out = np.array(rows, order="C", copy=True)
+    out.setflags(write=False)
+    return out
+
+
+def _check_record(owner: str, sequence, n_rows: int, sha1, keys, *, rows: str, empty: str):
+    """The checks shared by :class:`CodeQuery` and :class:`CodeTarget`: ``(normalised sequence, its seq_sha1, the
+    keys as a tuple or None)``. Wrong types are TypeError; data that cannot serve is RefusalError."""
+    if not isinstance(sequence, str):
+        raise TypeError(f"{owner}.sequence must be a str, got {type(sequence).__name__}")
+    if sha1 is not None:
+        if not isinstance(sha1, (bytes, bytearray, memoryview)):
+            raise TypeError(f"{owner}.seq_sha1 must be bytes (the 20-byte SHA-1 that predict() returns) or None, "
+                            f"got {type(sha1).__name__}")
+        sha1 = bytes(sha1)
+    if keys is not None:
+        if isinstance(keys, (str, bytes, bytearray)):
+            raise TypeError(f"{owner}.residue_keys must be a sequence of keys (one per row), not a "
+                            f"{type(keys).__name__}")
+        try:
+            keys = tuple(keys)
+        except TypeError:
+            raise TypeError(f"{owner}.residue_keys must be a sequence of hashable keys (one per row) or None, got "
+                            f"{type(keys).__name__}") from None
+    if n_rows == 0:
+        raise RefusalError(f"{owner}: {empty}")
+    try:
+        seq = _check_query_sequence(owner, sequence, n_rows, sha1, rows=rows)
+    except ValueError as exc:
+        raise RefusalError(str(exc)) from exc
+    if keys is not None:
+        if len(keys) != n_rows:
+            raise RefusalError(f"{owner}: {len(keys)} residue_keys for {n_rows} rows (one key per row)")
+        if any(k is None for k in keys):
+            raise RefusalError(f"{owner}: residue_keys may not contain None (None marks a gap in query_keys() / "
+                               "target_keys())")
+        try:
+            distinct = set(keys)
+        except TypeError as exc:
+            raise RefusalError(f"{owner}: residue_keys must be hashable ({exc})") from exc
+        if len(distinct) != n_rows:
+            seen, dup = set(), None
+            for k in keys:
+                if k in seen:
+                    dup = k
+                    break
+                seen.add(k)
+            raise RefusalError(f"{owner}: residue_keys must be unique; {dup!r} names more than one row")
+    return seq, seq_sha1(seq), keys
+
+
+@dataclass(frozen=True, eq=False)
+class CodeQuery:
+    """One query of :func:`align_query_codes`: its sequence and its S5 query encoding.
+
+    ``encoding``: native ``float16 [n, 64]``, ``n >= 1``, finite (never cast: float32 or a byte-swapped ``'>f2'``
+    is refused, as ``swkern.query_prep`` refuses it); 0-based row ``i`` is character ``i`` of the normalised
+    sequence. The record keeps a read-only C-contiguous copy. ``sequence`` is normalised (S15: ASCII whitespace
+    removed, ASCII letters upper-cased; non-ASCII refused) and must have ``n`` characters. ``seq_sha1`` (optional,
+    as ``predict`` returns it) must be the SHA-1 of the normalised sequence; after construction the field holds that
+    SHA-1 in any case. ``residue_keys`` (optional): one opaque, hashable, unique key per row (a mmCIF
+    ``(label_asym_id, label_seq_id)``, a UniProt position, ...; not None, which marks a gap, and not a str, which
+    would be one key per character), kept as a tuple. Fields after the first two are
+    keyword-only. Wrong types or shapes raise TypeError; anything else that cannot serve raises
+    :class:`~foldmatch.errors.RefusalError`."""
+    sequence: str
+    encoding: np.ndarray
+    _: KW_ONLY
+    seq_sha1: Optional[bytes] = None
+    residue_keys: Optional[Sequence[Hashable]] = None
+
+    def __post_init__(self):
+        enc = _as_rows(self.encoding, "CodeQuery.encoding")
+        if enc.ndim != 2 or enc.shape[1] != swkern.DIM or enc.dtype != np.dtype(np.float16):
+            raise TypeError(f"CodeQuery.encoding must be a native float16 [n, {swkern.DIM}] array (the S5 query "
+                            f"encoding, never cast), got {enc.dtype.str} {enc.shape}")
+        seq, sha1, keys = _check_record(
+            "CodeQuery", self.sequence, len(enc), self.seq_sha1, self.residue_keys, rows="encoding",
+            empty="its encoding has 0 rows: there is nothing to align (fm-search refuses an empty query encoding)")
+        try:
+            _check_query_rows("CodeQuery", enc)
+        except ValueError as exc:
+            raise RefusalError(str(exc)) from exc
+        enc = _frozen_copy(enc)
+        object.__setattr__(self, "sequence", seq)
+        object.__setattr__(self, "encoding", enc)
+        object.__setattr__(self, "seq_sha1", sha1)
+        object.__setattr__(self, "residue_keys", keys)
+        object.__setattr__(self, "_sha256", hashlib.sha256(enc.astype("<f2", copy=False).tobytes()).hexdigest())
+
+    @property
+    def encoding_sha256(self) -> str:
+        """sha256 hex of the encoding's ``'<f2'`` C-contiguous bytes (n x 128 B): what :class:`PanelQ90` is tied
+        to."""
+        return self._sha256
+
+    def __len__(self) -> int:
+        return len(self.encoding)
+
+    def __repr__(self):
+        return (f"CodeQuery(n={len(self.encoding)}, sequence={self.sequence[:20]!r}"
+                f"{'...' if len(self.sequence) > 20 else ''}, keys={self.residue_keys is not None})")
+
+
+@dataclass(frozen=True, eq=False)
+class CodeTarget:
+    """One target of :func:`align_query_codes`: its sequence and its S4 residue codes.
+
+    ``codes``: ``uint8 [m, 8]`` (64 bits per row, packbits MSB first), ``m >= 1``; 0-based row ``i`` is character
+    ``i`` of the normalised sequence. The ``[0, 8]`` table that ``predict`` returns for a sequence whose codes
+    failed (:class:`~foldmatch.errors.MissingResidueCodesError`) is refused. Otherwise as :class:`CodeQuery`
+    (``sequence``, ``seq_sha1``, ``residue_keys``, a read-only copy, keyword-only fields after the first two)."""
+    sequence: str
+    codes: np.ndarray
+    _: KW_ONLY
+    seq_sha1: Optional[bytes] = None
+    residue_keys: Optional[Sequence[Hashable]] = None
+
+    def __post_init__(self):
+        codes = _as_rows(self.codes, "CodeTarget.codes")
+        if codes.ndim != 2 or codes.shape[1] != swkern.CODE_BYTES or codes.dtype != np.uint8:
+            raise TypeError(f"CodeTarget.codes must be a uint8 [m, {swkern.CODE_BYTES}] array (the S4 residue "
+                            f"codes), got {codes.dtype.str} {codes.shape}")
+        seq, sha1, keys = _check_record(
+            "CodeTarget", self.sequence, len(codes), self.seq_sha1, self.residue_keys, rows="codes",
+            empty="its codes have 0 rows: the [0, 8] table predict() returns for a sequence whose residue codes "
+                  "could not be computed (MissingResidueCodesError); there is nothing to align")
+        object.__setattr__(self, "sequence", seq)
+        object.__setattr__(self, "codes", _frozen_copy(codes))
+        object.__setattr__(self, "seq_sha1", sha1)
+        object.__setattr__(self, "residue_keys", keys)
+
+    def __len__(self) -> int:
+        return len(self.codes)
+
+    def __repr__(self):
+        return (f"CodeTarget(m={len(self.codes)}, sequence={self.sequence[:20]!r}"
+                f"{'...' if len(self.sequence) > 20 else ''}, keys={self.residue_keys is not None})")
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """What the bits of a result depend on besides its inputs: the FoldMatch version, the scoring system (name,
+    digest, calibration), the kernel (ISA, DP id, source sha256, compiler), numpy and its BLAS (numpy's build
+    configuration: name, version), and whether the one-thread BLAS limit reaches numpy's own BLAS, the one the S6
+    GEMM runs on (``blas_limited``: False with Apple Accelerate, without threadpoolctl, or when numpy's BLAS cannot
+    be identified among the libraries threadpoolctl limits; another library's BLAS does not count; the bits are then
+    those of numpy's BLAS at its own thread count)."""
+    foldmatch_version: str
+    system_name: str
+    system_digest: str
+    calibration_version: str
+    kernel: str
+    numpy_version: str
+    blas: Tuple[Tuple[str, str], ...]
+    blas_limited: bool
+
+
+@dataclass(frozen=True)
+class PanelQ90:
+    """A query's Q90 (S10, float64, exactly as fm-search computes it), tied to its encoding (``encoding_sha256``,
+    :attr:`CodeQuery.encoding_sha256`) and to the setup that computed it (``provenance``). Pass it as
+    ``align_query_codes(..., q90=...)`` to skip the panel pass; another query's or another setup's is refused."""
+    value: float
+    encoding_sha256: str
+    provenance: Provenance
+
+    def __post_init__(self):
+        if not isinstance(self.provenance, Provenance):
+            raise TypeError(f"PanelQ90.provenance must be a Provenance, got {type(self.provenance).__name__}")
+        try:
+            value = float(self.value)
+        except (TypeError, ValueError):
+            raise TypeError(f"PanelQ90.value must be a float, got {self.value!r}") from None
+        if not math.isfinite(value):
+            raise ValueError(f"PanelQ90.value must be finite, got {self.value!r}")
+        object.__setattr__(self, "value", value)
+
+
+@dataclass(frozen=True, eq=False)
+class AlignedResidues:
+    """One hit's alignment path as explicit row pairs.
+
+    ``rows``: int32 ``[P, 2]``, read-only, the kernel's path in forward order: column ``c`` is ``(query row, target
+    row)``, 0-based indices into the arrays given (``CodeQuery.encoding``, ``CodeTarget.codes``), -1 for a gap. They
+    are row indices, not residue numbers: never join them to atom lists by position. Without residue keys a row's
+    identity is ``(seq_sha1 of the normalised sequence, row)``, hence ``query_seq_sha1`` and ``target_seq_sha1``;
+    with keys, :meth:`query_keys` / :meth:`target_keys` / :meth:`matched_keys` give each column's keys (built when
+    asked for). ``query_residue_keys`` / ``target_residue_keys`` are the records' per-row key tuples (or None)."""
+    rows: np.ndarray
+    query_seq_sha1: bytes
+    target_seq_sha1: bytes
+    _: KW_ONLY
+    query_residue_keys: Optional[Tuple[Hashable, ...]] = field(default=None, repr=False)
+    target_residue_keys: Optional[Tuple[Hashable, ...]] = field(default=None, repr=False)
+
+    @staticmethod
+    def _keys(keys, rows) -> Optional[tuple]:
+        if keys is None:
+            return None
+        return tuple(None if r < 0 else keys[r] for r in rows.tolist())
+
+    def query_keys(self) -> Optional[tuple]:
+        """The query key of every path column (None at a gap), or None without query keys."""
+        return self._keys(self.query_residue_keys, self.rows[:, 0])
+
+    def target_keys(self) -> Optional[tuple]:
+        """The target key of every path column (None at a gap), or None without target keys."""
+        return self._keys(self.target_residue_keys, self.rows[:, 1])
+
+    def matched(self) -> np.ndarray:
+        """int32 ``[A, 2]``: the aligned pairs (the columns with both rows >= 0), in path order."""
+        return self.rows[(self.rows[:, 0] >= 0) & (self.rows[:, 1] >= 0)]
+
+    def matched_keys(self) -> List[Tuple[Hashable, Hashable]]:
+        """``[(query key, target key), ...]`` of the aligned pairs; ValueError unless both records have keys."""
+        if self.query_residue_keys is None or self.target_residue_keys is None:
+            raise ValueError("matched_keys() needs residue_keys on both the query and the target; without keys use "
+                             "matched() (row pairs) with query_seq_sha1 / target_seq_sha1")
+        qk, tk = self.query_residue_keys, self.target_residue_keys
+        return [(qk[i], tk[j]) for i, j in self.matched().tolist()]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __eq__(self, other):
+        if not isinstance(other, AlignedResidues):
+            return NotImplemented
+        return (np.array_equal(self.rows, other.rows) and self.query_seq_sha1 == other.query_seq_sha1
+                and self.target_seq_sha1 == other.target_seq_sha1
+                and self.query_residue_keys == other.query_residue_keys
+                and self.target_residue_keys == other.target_residue_keys)
+
+    __hash__ = None
+
+
+@dataclass(frozen=True, eq=False)
+class QueryCodeAlignment:
+    """The result of :func:`align_query_codes`.
+
+    ``hits``: fm-search's hits for this query (``results[query_id]`` of ``align_candidates_esm_codes``): the same
+    :class:`~foldmatch.search.alignment.Hit` fields, bits and order (S14), ``subject_id`` the ``targets`` key;
+    ``output.format_row(query_id, hit, fields)`` renders fm-search's columns. ``paths``: target id ->
+    :class:`AlignedResidues`, exactly one entry per hit, in hit order. ``q90``: the query's :class:`PanelQ90` when
+    the panel was computed or reused; None when the call needs no panel (as ``Hit.q90``), for an empty ``targets``
+    (even with ``q90=`` given) and for a degenerate query. ``degenerate``: the query gets no hits by
+    rule (S13b: one row, or every row bitwise equal), not an error. ``skipped``: the targets whose pair exceeds the
+    oversize limit (n x m > 2^28 cells), in ``targets`` order: no score, no hit. ``db_residues``: the N the E-values
+    refer to (None: no E-values). ``provenance``: what the bits depend on besides the inputs."""
+    hits: List[Hit]
+    paths: Dict[str, AlignedResidues]
+    q90: Optional[PanelQ90]
+    degenerate: bool
+    skipped: Tuple[str, ...]
+    db_residues: Optional[int]
+    provenance: Provenance
+
+
+@functools.lru_cache(maxsize=1)
+def _numpy_blas() -> Tuple[Tuple[str, str], ...]:
+    """numpy's BLAS ``((name, version),)`` from its build configuration (``()`` when numpy cannot tell). numpy's
+    matmul is what the S6 GEMM runs on: other BLAS libraries in the process (FAISS's, torch's) do not enter."""
+    try:
+        blas = np.show_config(mode="dicts")["Build Dependencies"]["blas"]
+        return ((str(blas.get("name", "unknown")), str(blas.get("version", "unknown"))),)
+    except Exception:  # noqa: BLE001  (an older numpy without mode="dicts", or another layout)
+        return ()
+
+
+#: numpy's BLAS names (``show_config``) -> threadpoolctl's ``internal_api`` for them.
+_BLAS_FAMILIES = ("openblas", "mkl", "blis", "flexiblas")
+
+
+def _blas_family(name: str) -> Optional[str]:
+    """``openblas`` for numpy's ``scipy-openblas`` / ``openblas64`` / ``openblas``, ``mkl`` for ``mkl-sdl`` ..., the
+    same for BLIS and FlexiBLAS; None for any other name (Accelerate, a generic ``blas``, ``unknown``)."""
+    name = name.lower()
+    return next((family for family in _BLAS_FAMILIES if family in name), None)
+
+
+@functools.lru_cache(maxsize=1)
+def _numpy_blas_limited() -> bool:
+    """Whether the one-thread limit of :func:`_blas_one_thread_here` reaches numpy's own BLAS, the one the S6 GEMM
+    runs on: threadpoolctl lists a BLAS that is numpy's (its file inside numpy's install, as a wheel bundles it, or
+    of numpy's BLAS family). Another library's BLAS (FAISS's, torch's) does not count. False without threadpoolctl,
+    with Apple Accelerate (threadpoolctl cannot limit it) and whenever numpy's BLAS cannot be identified. numpy loads
+    its BLAS when it is imported, so the answer is fixed for the process (cached)."""
+    try:
+        import threadpoolctl
+        infos = [i for i in threadpoolctl.threadpool_info() if i.get("user_api") == "blas"]
+    except Exception:  # noqa: BLE001  (no threadpoolctl, or it cannot list the libraries)
+        return False
+    if not infos:
+        return False
+    names = _numpy_blas()
+    family = _blas_family(names[0][0]) if names else None
+    np_dir = os.path.dirname(os.path.realpath(np.__file__))
+    np_dirs = (np_dir + os.sep, np_dir + ".libs" + os.sep)   # numpy/ (numpy/.dylibs) and numpy.libs/ of a wheel
+    for info in infos:
+        path = os.path.realpath(str(info.get("filepath") or ""))
+        if path.startswith(np_dirs):
+            return True
+        if family is not None and str(info.get("internal_api", "")).lower() == family:
+            return True
+    return False
+
+
+def _provenance(system, kernel: "swkern.Kernel") -> Provenance:
+    return Provenance(
+        foldmatch_version=str(foldmatch.__version__), system_name=system.name, system_digest=system.digest(),
+        calibration_version=system.calibration_version,
+        kernel=f"isa={kernel.isa} dp={kernel.dp_id} source_sha256={kernel.source_sha256} compiler={kernel.compiler}",
+        numpy_version=np.__version__, blas=_numpy_blas(), blas_limited=_numpy_blas_limited())
+
+
+def _check_same_provenance(q90: PanelQ90, provenance: Provenance) -> None:
+    if q90.provenance != provenance:
+        diff = [f"{f.name} {getattr(q90.provenance, f.name)!r} (q90) vs {getattr(provenance, f.name)!r} (this call)"
+                for f in dataclasses.fields(Provenance)
+                if getattr(q90.provenance, f.name) != getattr(provenance, f.name)]
+        raise RefusalError("q90 was computed in another setup, so its bits need not be this call's: "
+                           + "; ".join(diff) + ". Recompute it here with panel_q90().")
+
+
+def _check_db_residues(db_residues) -> Optional[int]:
+    if db_residues is None:
+        return None
+    if isinstance(db_residues, bool) or not isinstance(db_residues, (int, np.integer)) or db_residues < 1:
+        raise ValueError(f"db_residues must be an int > 0 (N, the search space of the E-values in residues: the "
+                         f"database's total residues) or None, got {db_residues!r}; pass None for no E-values")
+    return int(db_residues)
+
+
+def _check_emb_scores(emb_scores, targets: Mapping) -> List[float]:
+    """The embedding scores in ``targets`` order (0.0 each without them)."""
+    if emb_scores is None:
+        return [0.0] * len(targets)
+    if not isinstance(emb_scores, Mapping):
+        raise TypeError(f"emb_scores must be a Mapping of target id (str) to score or None, got "
+                        f"{type(emb_scores).__name__}")
+    for key in emb_scores:
+        if not isinstance(key, str):
+            raise TypeError(f"emb_scores keys must be the str target ids, got {key!r}")
+    if len(emb_scores) != len(targets) or any(t not in emb_scores for t in targets):
+        missing = [t for t in targets if t not in emb_scores]
+        extra = [t for t in emb_scores if t not in targets]
+        raise ValueError(f"emb_scores must have exactly the targets' ids: {len(missing)} missing (first: "
+                         f"{missing[:_EXAMPLES]}), {len(extra)} not a target (first: {extra[:_EXAMPLES]})")
+    out = []
+    for t in targets:
+        v = emb_scores[t]
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"emb_scores[{t!r}] must be a number, got {v!r}") from None
+        if not math.isfinite(f):
+            raise ValueError(f"emb_scores[{t!r}] must be finite, got {v!r}")
+        out.append(f)
+    return out
+
+
+def _api_output_needs(output_needs) -> OutputNeeds:
+    """``output_needs`` as an :class:`OutputNeeds` (None: fm-search's default columns). Field names are checked as
+    ``output.parse_format_output`` checks fm-search's: a misspelt name would otherwise decide nothing, and a
+    misspelt ``bits`` would silently drop the panel pass."""
+    if output_needs is None:
+        return OutputNeeds.coerce(output.DEFAULT_OUTPUT_FIELDS)
+    if isinstance(output_needs, OutputNeeds):
+        return output_needs
+    if isinstance(output_needs, (str, bytes)) or not hasattr(output_needs, "__iter__"):
+        return OutputNeeds.coerce(output_needs)                  # its TypeError
+    fields = list(output_needs)
+    unknown = [f for f in fields if not isinstance(f, str) or f not in output.OUTPUT_FIELD_DESCRIPTIONS]
+    if unknown:
+        raise ValueError(f"unknown output_needs field(s): {', '.join(map(repr, unknown))}. Supported fields: "
+                         f"{', '.join(output.SUPPORTED_OUTPUT_FIELDS)}.")
+    return OutputNeeds.coerce(fields)
+
+
+def _api_query(query) -> None:
+    if not isinstance(query, CodeQuery):
+        raise TypeError(f"query must be a CodeQuery, got {type(query).__name__}")
+
+
+def _api_panel(prepared, spec) -> tuple:
+    """The system's panel from the module cache (call under :data:`_API_LOCK`)."""
+    key = (prepared.system.digest(), str(prepared.scoring_path))
+    hit = _PANEL_CACHE.get(key)
+    if hit is None:
+        codes, offsets = spec.load_panel()
+        offsets = np.asarray(offsets, np.int64)
+        lengths = np.diff(offsets)
+        pairs = np.column_stack((offsets[:-1], lengths)).astype(np.int64)
+        hit = (codes, pairs, lengths.tolist(), int(lengths.max()) if lengths.size else 0)
+        _PANEL_CACHE[key] = hit
+        while len(_PANEL_CACHE) > _PANEL_CACHE_SIZE:
+            _PANEL_CACHE.popitem(last=False)
+    else:
+        _PANEL_CACHE.move_to_end(key)
+    return hit
+
+
+def _check_panel_fits(n: int, longest: int, max_pair_cells: int) -> None:
+    if n * longest > max_pair_cells:
+        raise RefusalError(f"the query ({n} residues) is too long for the panel pass: its similarity with the "
+                           f"longest panel member ({longest} residues) exceeds max_pair_cells={max_pair_cells} "
+                           f"cells (fm-search refuses it too, after its panel pass)")
+
+
+def _api_score(qp, codes, pairs, lengths: List[int], *, params, kernel, workspace, task_cells: int,
+               max_pair_cells: int):
+    """Round 1 (or the panel) in chunks of at most ``task_cells`` cells, each chunk's results at its offset."""
+    k = len(lengths)
+    s_f, s_r = np.full(k, np.nan, np.float32), np.full(k, np.nan, np.float32)
+    skipped = np.zeros(k, bool)
+    for k0, k1 in plan_chunks(qp.shape[0], lengths, task_cells):
+        r = _score_rows(qp, codes, pairs[k0:k1], params=params, block_floats=swkern.DEFAULT_BLOCK_FLOATS,
+                        max_pair_cells=max_pair_cells, kernel=kernel, workspace=workspace)
+        s_f[k0:k1], s_r[k0:k1], skipped[k0:k1] = r.s_fwd, r.s_rev, r.skipped
+    return s_f, s_r, skipped
+
+
+def _api_panel_scores(qp, panel, *, params, kernel, workspace, task_cells: int, max_pair_cells: int):
+    codes, pairs, lengths, _longest = panel
+    panel_f, panel_r, skipped = _api_score(qp, codes, pairs, lengths, params=params, kernel=kernel,
+                                           workspace=workspace, task_cells=task_cells, max_pair_cells=max_pair_cells)
+    if skipped.any():                                 # the pre-check refuses these first
+        raise InternalError("esm-codes Stage 2: a panel pair was skipped after the panel pre-check passed")
+    return panel_f, panel_r
+
+
+def _empty_result(db_residues, provenance, degenerate: bool) -> QueryCodeAlignment:
+    return QueryCodeAlignment(hits=[], paths={}, q90=None, degenerate=degenerate, skipped=(),
+                              db_residues=db_residues, provenance=provenance)
+
+
+def align_query_codes(
+        query: CodeQuery,
+        targets: Mapping[str, CodeTarget],
+        *,
+        scoring_system,
+        db_residues: Optional[int],
+        emb_scores: Optional[Mapping[str, float]] = None,
+        q90: Optional[PanelQ90] = None,
+        min_seq_identity: float = 0.0,
+        min_coverage: float = 0.0,
+        max_evalue: Optional[float] = 1e-3,
+        output_needs=None,
+) -> QueryCodeAlignment:
+    """The esm-codes Stage 2 of ``fm-search query sequences --scoring esm-codes`` on arrays in memory: one query
+    against any number of targets, in this process, with no database, query-encoding file or residue-code store.
+    Provisional in 0.14 (a structure-conditioned system may change the records and the ``scoring_system`` type).
+
+    Args:
+        query: a :class:`CodeQuery` (sequence, S5 query encoding ``float16 [n, 64]``).
+        targets: target id (str, the ``Hit.subject_id``) -> :class:`CodeTarget` (sequence, S4 codes
+            ``uint8 [m, 8]``).
+        scoring_system: the system that made the encodings and codes: a name, an ``EsmCodesSystem`` (exactly the
+            registry entry) or a ``PreparedSystem``. Required. A name or a system is prepared on every call (the
+            ~26 MB bundle hashed, downloaded if not cached); ``ss.prepare(ss.get(name))`` once per process avoids
+            that, and with ``local_files_only=True`` it never downloads.
+        db_residues: N, the search space of the E-values in residues; required, no default. The database's
+            ``total_residues`` reproduces fm-search's E-values (``load_code_targets(...).total_residues``); for a
+            collection of one's own, the summed lengths of its distinct ids. None: no E-values (``log_evalue`` and
+            ``evalue`` None), but Q90, the adjusted score and the bit score are still computed when needed (the bit
+            score needs no N: E = n N 2^-bits); a finite ``max_evalue`` then is a ValueError.
+        emb_scores: target id -> Stage-1 embedding score (``Hit.emb_score`` and the S14 tie-break), exactly the
+            ``targets`` keys; None gives 0.0 to every target (ties then go by id).
+        q90: a :class:`PanelQ90` from :func:`panel_q90` or an earlier result, to skip the panel pass; refused
+            unless the panel is needed, and unless it is this query's (``encoding_sha256``) from this setup
+            (``provenance``).
+        min_seq_identity, min_coverage: keep a hit only if ``fident >= min_seq_identity`` and ``min(qcov, tcov) >=
+            min_coverage``.
+        max_evalue: keep a hit only if ``E <= max_evalue``; None or inf keeps every target with a non-empty
+            alignment.
+        output_needs: an ``OutputNeeds`` or the ``--format-output`` field names the caller will render (None:
+            ``output.DEFAULT_OUTPUT_FIELDS``, fm-search's default columns); a name ``--format-output`` does not
+            know is a ValueError. The cigar / qaln / taln / qseq / tseq strings are built only when named, and
+            render empty otherwise. The panel pass (Q90) runs when the panel is needed: a finite ``max_evalue`` or
+            one of evalue, bits, q90, rawadj among the fields.
+
+    Returns:
+        :class:`QueryCodeAlignment`: the hits, each hit's path (:class:`AlignedResidues`), the query's Q90, the
+        degenerate flag, the skipped targets, N and the provenance. A target missing from ``hits`` and ``skipped``
+        was filtered by the E-value, an empty path or the identity / coverage filters.
+
+    Residue indexing:
+        1. Rows. 0-based row i of ``CodeQuery.encoding`` or of ``CodeTarget.codes`` is character i of the normalised
+           sequence (residue i + 1, counting from 1) and 0-based row i + 1 of ESM3's ``[L + 2, 1536]`` table.
+           ESM3's rows 0 (BOS) and L + 1 (EOS) are never rows here. Paths are 0-based rows; ``q_start``, ``q_end``,
+           ``t_start`` and ``t_end`` are 1-based.
+        2. Input mode. esm-codes-v1 encodings and codes are defined only for sequence-only ESM3 (FASTA input); the
+           producer refuses structure input. Structure-conditioned ESM3 rows run through the head by hand are not
+           valid input, and nothing can detect them.
+        3. BOS / EOS. The producer drops them in one place (it refuses a table without L + 2 rows, then keeps
+           ``[1:-1]``); an array whose rows differ from the normalised length is refused here.
+        4. Paths. ``AlignedResidues.rows`` is the kernel path itself: 0-based rows into the arrays given, -1 for a
+           gap, in forward order; its last cell + 1 is the kernel's 1-based best cell (checked). Rows are indices
+           into the arrays, not residue numbers: never join them to atom lists by position.
+        5. Bounds. ``q_start = rows[rows[:, 0] >= 0, 0].min() + 1``, ``q_end = ... .max() + 1``, and the same for
+           the target with column 1.
+        6. Keys. With ``residue_keys``, the key of path column c is ``residue_keys[rows[c, side]]``, None at a gap.
+           Keys are opaque; the caller joins them to atoms or features. Without keys the identity of a row is
+           ``(seq_sha1 of the normalised sequence, row)``, which ``AlignedResidues`` carries.
+        7. Sequence use. The sequence enters only identity, the strings, the S13 non-standard fractions and the
+           length / sha1 checks; the scoring never reads letters.
+
+    Reproducibility:
+        For the same S5 encoding and S4 code arrays, sequences, emb scores, N, thresholds, output fields and
+        system, ``hits`` equals ``fm-search query sequences --scoring esm-codes``'s hits for that query bit for
+        bit (every ``AlignmentMetrics`` field, ``emb_score``, ``subject_id``, the order and the rendered row), for
+        the same FoldMatch install (kernel, numpy, BLAS), the same ``FOLDMATCH_SW_ISA`` and BLAS at one thread in
+        both, which ``provenance.blas_limited`` reports for this side, and for candidate lists without repeated
+        ids. threadpoolctl cannot limit Apple Accelerate: on macOS set ``VECLIB_MAXIMUM_THREADS=1`` before Python
+        starts for the bits of fm-search's worker pool. Arrays recomputed elsewhere agree within S16 only.
+
+    Threads: for the length of a call BLAS and OpenMP run at one thread process-wide (other threads, torch or
+    FAISS, too); calls are serialised by a module lock, and they share that one-thread regime with an in-process
+    fm-search Stage 2 in another thread (the last of them to finish restores the thread counts). There is no pool: for throughput run calls in a spawn
+    ``ProcessPoolExecutor`` whose initializer sets ``OMP/OPENBLAS/MKL/VECLIB_MAXIMUM/BLIS_NUM_THREADS=1`` before
+    importing foldmatch, with one ``PreparedSystem`` per worker and ``panel_q90`` once per query.
+
+    Raises:
+        TypeError / ValueError: the call is wrong (types, values, combinations of parameters), before the system
+            is prepared. :class:`~foldmatch.errors.RefusalError` (a ValueError): the data cannot serve (a Q90 of
+            another query or setup, a query too long for the panel pass). The system's own errors
+            (``UnknownScoringSystemError``, ``BundleUnavailableError``, ...) as ``scoring_system.prepare`` raises
+            them. :class:`~foldmatch.errors.InternalError`: a FoldMatch bug.
+    """
+    # 1. arguments (no system)
+    _api_query(query)
+    if not isinstance(targets, Mapping):
+        raise TypeError(f"targets must be a Mapping of target id (str) to CodeTarget, got {type(targets).__name__}")
+    for tid, target in targets.items():
+        if not isinstance(tid, str):
+            raise TypeError(f"targets keys must be str target ids, got {tid!r}")
+        if not isinstance(target, CodeTarget):
+            raise TypeError(f"targets[{tid!r}] must be a CodeTarget, got {type(target).__name__}")
+    cand_emb = _check_emb_scores(emb_scores, targets)
+    needs = _api_output_needs(output_needs)
+    min_seq_identity = _check_fraction("min_seq_identity", min_seq_identity)
+    min_coverage = _check_fraction("min_coverage", min_coverage)
+    ln_max = _log_threshold(max_evalue)
+    db_residues = _check_db_residues(db_residues)
+    need_panel = ln_max is not None or needs.significance
+    if db_residues is None and ln_max is not None:
+        raise ValueError(f"max_evalue={max_evalue!r} filters by E-value, which needs db_residues (N): pass the "
+                         "database's total residues, or max_evalue=None")
+    if q90 is not None:
+        if not isinstance(q90, PanelQ90):
+            raise TypeError(f"q90 must be a PanelQ90 (from panel_q90() or a result's .q90) or None, got "
+                            f"{type(q90).__name__}")
+        if not need_panel:
+            raise ValueError("q90 is given, but this call needs no panel (no finite max_evalue, and none of evalue, "
+                             "bits, q90, rawadj among the output fields), so it would be ignored: leave it out")
+        if q90.encoding_sha256 != query.encoding_sha256:
+            raise RefusalError("q90 is the panel quantile of another query encoding (its encoding_sha256 differs "
+                               "from this query's)")
+    # 2. the system, without the bundle
+    system = ss.resolve_system(scoring_system)
+    kernel = swkern.load()
+    provenance = _provenance(system, kernel)
+    if q90 is not None:
+        _check_same_provenance(q90, provenance)
+    # 3. no targets: no hits, no Q90 (fm-search skips a query without candidates before anything else)
+    if not targets:
+        return _empty_result(db_residues, provenance, False)
+    # 4. a fully degenerate query (S13b): no hits by rule
+    if _is_degenerate(query.encoding):
+        return _empty_result(db_residues, provenance, True)
+    # 5. the bundle
+    prepared = ss.resolve(scoring_system)
+    spec = prepared.for_worker()
+    params = spec.dp_params()
+    task_cells, max_pair_cells = _API_TASK_CELLS, _API_MAX_PAIR_CELLS
+    run = _Run(spec, needs, need_panel, ln_max, min_seq_identity, min_coverage, db_residues, task_cells)
+    ids = list(targets)
+    records = [targets[t] for t in ids]
+    n = len(query.encoding)
+    q = _Query(_API_QUERY_ID, 0, n, query.sequence, ids, cand_emb, run.query_inside(query.sequence))
+    q.cand_len = np.fromiter((len(t.codes) for t in records), np.int64, len(records))
+    q.cand_off = np.zeros(len(records), np.int64)
+    if len(records) > 1:
+        np.cumsum(q.cand_len[:-1], out=q.cand_off[1:])
+    q.q90_preset = None if q90 is None else q90.value
+    run_panel = need_panel and q90 is None
+    paths_by_k: Dict[int, np.ndarray] = {}
+    with _API_LOCK:
+        panel = None
+        if run_panel:
+            panel = _api_panel(prepared, spec)
+            # 6. the panel pre-check (fm-search refuses the same condition after its panel pass)
+            _check_panel_fits(n, panel[3], max_pair_cells)
+        codes = np.concatenate([t.codes for t in records])
+        pairs = np.column_stack((q.cand_off, q.cand_len))
+        # 7. the kernel work: the same leaves as fm-search's task functions, BLAS at one thread as in-process
+        with _in_process_regime():
+            workspace = swkern.Workspace()
+            qp = swkern.query_prep(query.encoding, kernel)
+            kw = dict(params=params, kernel=kernel, workspace=workspace, task_cells=task_cells,
+                      max_pair_cells=max_pair_cells)
+            if run_panel:
+                q.panel_f, q.panel_r = _api_panel_scores(qp, panel, **kw)
+            q.s_f, q.s_r, q.skipped = _api_score(qp, codes, pairs, q.cand_len.tolist(), **kw)
+            _statistics(q, run)
+            q.panel_f = q.panel_r = None
+            surv = q.surv
+            q.parts = []
+            if surv.size:
+                want = (needs.cigar, needs.qaln, needs.taln, needs.tseq)
+                surv_l = surv.tolist()
+                t_seqs = [records[k].sequence for k in surv_l]
+                off, ln = q.cand_off[surv], q.cand_len[surv]
+                cap = spec.calibrated_domain.target_min_distinct_codes
+                for k0, k1 in plan_chunks(n, ln.tolist(), task_cells):
+                    chunk = np.column_stack((off[k0:k1], ln[k0:k1]))
+                    a, (scores, ends, columns, end_ok, nonstd, distinct, skipped, strings) = _trace_rows(
+                        qp, codes, chunk, q.seq, t_seqs[k0:k1], want, params=params,
+                        block_floats=swkern.DEFAULT_BLOCK_FLOATS, max_pair_cells=max_pair_cells, kernel=kernel,
+                        workspace=workspace, cap=cap)
+                    _check_round2(q, k0, k1, scores, skipped)
+                    q.parts.append(_round2_part(k0, ends, columns, end_ok, nonstd, distinct, strings))
+                    for i, k in enumerate(surv_l[k0:k1]):
+                        path = a.path_of(i).copy()
+                        path.setflags(write=False)
+                        paths_by_k[k] = path
+                    del a
+            del codes, workspace
+    hits = _hits(q, run) if surv.size else []
+    position = {tid: k for k, tid in enumerate(ids)}
+    paths: Dict[str, AlignedResidues] = {}
+    for h in hits:
+        k = position[h.subject_id]
+        t = records[k]
+        paths[h.subject_id] = AlignedResidues(paths_by_k[k], query.seq_sha1, t.seq_sha1,
+                                              query_residue_keys=query.residue_keys,
+                                              target_residue_keys=t.residue_keys)
+    if not need_panel:
+        q90_out = None
+    elif q90 is not None:
+        q90_out = q90
+    else:
+        q90_out = PanelQ90(q.q90, query.encoding_sha256, provenance)
+    return QueryCodeAlignment(hits=hits, paths=paths, q90=q90_out, degenerate=False,
+                              skipped=tuple(ids[k] for k in np.flatnonzero(q.skipped).tolist()),
+                              db_residues=db_residues, provenance=provenance)
+
+
+def panel_q90(query: CodeQuery, *, scoring_system) -> Optional[PanelQ90]:
+    """The panel pass of :func:`align_query_codes` alone (the same chunks and the same ``cs.q90`` call): the
+    query's :class:`PanelQ90`, to pass as ``q90=`` to many calls with the same query (the pass costs n x 355,626
+    similarity cells for esm-codes-v1, whatever the targets). None for a fully degenerate query (S13b), which never
+    needs a Q90. ``scoring_system`` as for :func:`align_query_codes`. A query too long for the panel pass is a
+    :class:`~foldmatch.errors.RefusalError`."""
+    _api_query(query)
+    system = ss.resolve_system(scoring_system)
+    kernel = swkern.load()
+    provenance = _provenance(system, kernel)
+    if _is_degenerate(query.encoding):
+        return None
+    prepared = ss.resolve(scoring_system)
+    spec = prepared.for_worker()
+    task_cells, max_pair_cells = _API_TASK_CELLS, _API_MAX_PAIR_CELLS
+    with _API_LOCK:
+        panel = _api_panel(prepared, spec)
+        _check_panel_fits(len(query.encoding), panel[3], max_pair_cells)
+        with _in_process_regime():
+            workspace = swkern.Workspace()
+            qp = swkern.query_prep(query.encoding, kernel)
+            panel_f, panel_r = _api_panel_scores(qp, panel, params=spec.dp_params(), kernel=kernel,
+                                                 workspace=workspace, task_cells=task_cells,
+                                                 max_pair_cells=max_pair_cells)
+    return PanelQ90(_panel_q90(panel_f, panel_r, spec), query.encoding_sha256, provenance)
