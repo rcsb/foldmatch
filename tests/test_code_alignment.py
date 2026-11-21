@@ -1711,5 +1711,59 @@ class EsmCodesOutputTest(_WorldCase):
         self.assertEqual(output.format_row("q", res["q"][0], ["ecal"]), "0")
 
 
+# =====================================================================================================================
+# _statistics: the preset Q90 and the optional N (used by the in-memory API only)
+# =====================================================================================================================
+@pytest.mark.usefixtures("fmsw_libs")
+class StatisticsPresetTest(_WorldCase):
+
+    def test_fm_search_q90_is_the_panel_quantile_of_its_own_panel_pass(self):
+        """fm-search presets no Q90: stats["q90"] is, bit for bit, the quantile of a direct panel pass."""
+        f1 = _f1()
+        pre = _f1_mixed([4, 7, 48], per_query=3)
+        _, stats = self.f1_world().align(pre, max_evalue=None)
+        spec = _prepared().for_worker()
+        codes, offsets = spec.load_panel()
+        for a in (4, 7, 48):
+            with ca._blas_one_thread_here():
+                r = swkern.score_fwd_rev(swkern.query_prep(f1[a]["q16"]), codes, offsets, swkern.SETTING_D)
+            want = cs.q90(r.s_fwd.astype(np.float64) - r.s_rev.astype(np.float64), spec.panel_quantile,
+                          spec.quantile_method)
+            self.assertEqual(float(stats["q90"][f1[a]["qid"]]).hex(), float(want).hex())
+
+    def _query(self, run, preset=None):
+        rng = np.random.default_rng(5)
+        q = ca._Query("q", 0, 50, "A" * 50, ["a", "b", "c"], [0.0, 0.0, 0.0], True)
+        self.assertIsNone(q.panel_f)
+        self.assertIsNone(q.q90_preset)
+        q.cand_len = np.array([40, 60, 80], np.int64)
+        q.s_f = rng.normal(30, 5, 3).astype(np.float32)
+        q.s_r = rng.normal(20, 5, 3).astype(np.float32)
+        q.skipped = np.zeros(3, bool)
+        q.q90_preset = preset
+        return q
+
+    def test_a_preset_q90_and_no_n(self):
+        spec = _prepared().for_worker()
+        needs = ca.OutputNeeds.from_fields(ALL_FIELDS)
+        run = ca._Run(spec, needs, True, None, 0.0, 0.0, None, ca.DEFAULT_TASK_CELLS)
+        q = self._query(run, preset=7.25)
+        ca._statistics(q, run)
+        s = q.s_f.astype(np.float64) - q.s_r.astype(np.float64)
+        self.assertEqual(q.q90, 7.25)
+        self.assertIsNone(q.lne)
+        np.testing.assert_array_equal(q.bits, cs.bit_score(s - 7.25, 50, spec))
+        np.testing.assert_array_equal(q.surv, [0, 1, 2])
+        with_n = ca._Run(spec, needs, True, None, 0.0, 0.0, N_F1, ca.DEFAULT_TASK_CELLS)
+        q2 = self._query(with_n, preset=7.25)
+        ca._statistics(q2, with_n)
+        np.testing.assert_array_equal(q2.bits, q.bits)
+        np.testing.assert_array_equal(q2.lne, cs.log_evalue(s - 7.25, 50, N_F1, spec))
+        q3 = self._query(run, preset=7.25)
+        q3.panel_f = q3.panel_r = np.zeros(3, np.float32)
+        with self.assertRaisesRegex(InternalError, "both a preset Q90 and panel scores"):
+            ca._statistics(q3, run)
+
+
 if __name__ == "__main__":
     unittest.main()

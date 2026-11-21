@@ -986,16 +986,18 @@ class _PathStrings:
 # the aligner
 # =====================================================================================================================
 class _Query:
-    """One query of a batch: its encoding rows, candidates and the results of both rounds."""
+    """One query of a batch: its encoding rows, candidates and the results of both rounds. ``q90_preset`` (the
+    in-memory API's reused Q90; fm-search never sets it) replaces the panel pass's Q90 in :func:`_statistics`."""
     __slots__ = ("qid", "off", "n", "seq", "cand_ids", "cand_emb", "cand_off", "cand_len", "s_f", "s_r", "skipped",
-                 "panel_f", "panel_r", "q90", "s", "s_prime", "lne", "bits", "surv", "parts", "inside", "r1_left",
-                 "r2_left")
+                 "panel_f", "panel_r", "q90", "q90_preset", "s", "s_prime", "lne", "bits", "surv", "parts", "inside",
+                 "r1_left", "r2_left")
 
     def __init__(self, qid, off, n, seq, cand_ids, cand_emb, inside: bool):
         self.qid, self.off, self.n, self.seq = qid, off, n, seq
         self.cand_ids, self.cand_emb = cand_ids, cand_emb
         self.inside = inside           # the query side of S13
-        self.q90 = None
+        self.panel_f = self.panel_r = None
+        self.q90 = self.q90_preset = None
         self.parts: list = []
         self.r1_left = self.r2_left = 0
 
@@ -1660,8 +1662,14 @@ def _round2_part(k0: int, ends, columns, end_ok, nonstd, distinct, strings) -> t
             np.asarray(nonstd, np.int64), np.asarray(distinct, np.int64), strings)
 
 
+def _panel_q90(panel_f: np.ndarray, panel_r: np.ndarray, spec) -> float:
+    """S10: Q90, the ``panel_quantile`` of the panel scores S = fp64(S_f) - fp64(S_r)."""
+    return cs.q90(panel_f.astype(np.float64) - panel_r.astype(np.float64), spec.panel_quantile, spec.quantile_method)
+
+
 def _statistics(q: _Query, run: _Run):
-    """S9-S11 in the parent: S, Q90, S', ln E, bits; then the survivors."""
+    """S9-S11 in the parent: S, Q90 (or the query's preset Q90), S', ln E (only with N: ``run.db_residues`` None
+    leaves it None), bits; then the survivors."""
     spec = run.spec
     valid = ~q.skipped
     if q.skipped.any():
@@ -1672,14 +1680,19 @@ def _statistics(q: _Query, run: _Run):
     q.s = q.s_f.astype(np.float64) - q.s_r.astype(np.float64)
     q.s_prime = q.lne = q.bits = None
     if run.need_panel:
-        q.q90 = cs.q90(q.panel_f.astype(np.float64) - q.panel_r.astype(np.float64), spec.panel_quantile,
-                       spec.quantile_method)
+        if q.q90_preset is None:
+            q.q90 = _panel_q90(q.panel_f, q.panel_r, spec)
+        elif q.panel_f is not None:
+            raise InternalError(f"esm-codes Stage 2: query {q.qid!r} has both a preset Q90 and panel scores")
+        else:
+            q.q90 = q.q90_preset
         run.q90[q.qid] = q.q90
         q.s_prime = q.s - q.q90
-        q.lne = np.full(len(q.s), np.nan)
+        q.lne = None if run.db_residues is None else np.full(len(q.s), np.nan)
         q.bits = np.full(len(q.s), np.nan)
         if valid.any():
-            q.lne[valid] = cs.log_evalue(q.s_prime[valid], q.n, run.db_residues, spec)
+            if q.lne is not None:
+                q.lne[valid] = cs.log_evalue(q.s_prime[valid], q.n, run.db_residues, spec)
             q.bits[valid] = cs.bit_score(q.s_prime[valid], q.n, spec)
     if run.ln_max is None:
         surv = valid
@@ -1759,7 +1772,8 @@ def _hits(q: _Query, run: _Run) -> List[Hit]:
         sf_l, sr_l, dist_l = q.s_f[ks].tolist(), q.s_r[ks].tolist(), distinct[kidx].tolist()
         ns_l = nonstd[kidx].tolist()
         if run.need_panel:
-            lne_l, bits_l, sp_l = q.lne[ks].tolist(), q.bits[ks].tolist(), q.s_prime[ks].tolist()
+            lne_l = None if q.lne is None else q.lne[ks].tolist()
+            bits_l, sp_l = q.bits[ks].tolist(), q.s_prime[ks].tolist()
     if prof is not None:
         t2 = time.perf_counter()
         prof.add("hits_metrics", t2 - t1)
@@ -1788,8 +1802,9 @@ def _hits(q: _Query, run: _Run) -> List[Hit]:
             q_aln = qaln_l[i] if needs.qaln else None
             t_aln = taln_l[i] if needs.taln else None
             if run.need_panel:
-                lne = lne_l[j]
-                evalue = float(np.exp(lne))
+                if lne_l is not None:                # without N (the in-memory API): no ln E, no E-value
+                    lne = lne_l[j]
+                    evalue = float(np.exp(lne))
                 bit_score, s_prime = bits_l[j], sp_l[j]
             n_ident = nid_l[j]
             metrics = AlignmentMetrics(
