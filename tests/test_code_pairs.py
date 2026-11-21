@@ -5,8 +5,10 @@ No ESM3: the arrays are the F1 fixtures' (``pairs_v1.npz``) and the F-deg ones, 
 helpers (``World``, ``_signature``, ``_path_from_hit``, the invariance workloads) this file reuses. The reference is
 fm-search's own Stage 2, ``align_candidates_esm_codes``, on the same arrays.
 """
+import contextlib
 import dataclasses
 import hashlib
+import io
 import logging
 import os
 import pickle
@@ -596,7 +598,7 @@ class RecordTest(unittest.TestCase):
         self.assertIn("n=", repr(q))
 
     def test_the_worked_example_of_the_indexing_convention(self):
-        """SPEC/README §2.6: query "mkT AYw" (n = 6), target "KTYW" (m = 4), the path [[1,0],[2,1],[3,-1],[4,2],
+        """README, "Residue indexing": query "mkT AYw" (n = 6), target "KTYW" (m = 4), the path [[1,0],[2,1],[3,-1],[4,2],
         [5,3]] (illustrative): CIGAR 2M1I2M, bounds 2-6 / 1-4, 5 columns, 4 identities, 1 gap open."""
         rng = np.random.default_rng(2)
         q = CodeQuery("mkT AYw", rng.normal(size=(6, 64)).astype(np.float16),
@@ -1148,3 +1150,82 @@ class PublicNamesTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"threadpoolctl": None}):
             ca._numpy_blas_limited.cache_clear()
             self.assertIs(ca._numpy_blas_limited(), False)
+
+
+# =====================================================================================================================
+# the README example, on the F1 arrays through a stand-in for predict()
+# =====================================================================================================================
+def _readme_example() -> str:
+    """The ``#### Example`` code block of the README's residue-code alignment section."""
+    text = (_TESTS.parent / "README.md").read_text()
+    section = text[text.index("### Residue-code alignment"):]
+    section = section[section.index("#### Example"):]
+    start = section.index("```python\n") + len("```python\n")
+    return section[start:section.index("\n```", start)]
+
+
+def _predict_parameters() -> set:
+    """``chain_complete_inference.predict``'s parameter names, read from its source (importing it loads torch)."""
+    import ast
+    src = (_TESTS.parent / "src" / "foldmatch" / "inference" / "chain_complete_inference.py").read_text()
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "predict")
+    return {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+
+
+@pytest.mark.usefixtures("fmsw_libs")
+class ReadmeExampleTest(unittest.TestCase):
+
+    def test_the_readme_example_runs(self):
+        """The README example as written, with ``predict`` replaced by a stand-in that yields the F1 arrays as
+        ``predict(..., out_folder=None)`` yields its payloads (one target's codes failed: ``b""``). The stand-in
+        takes only ``predict``'s own parameters and refuses a multi-process (DDP) call, which Lightning refuses on
+        Apple MPS."""
+        from foldmatch.inference.utils import is_distributed
+        code = _readme_example()
+        self.assertIn("seqs = {...}", code)
+        f1 = _f1()
+        query, tids = f1[0], list(dict.fromkeys(p["tid"] for p in f1[:5]))
+        tseq = {p["tid"]: p["tseq"] for p in f1}
+        tcodes = {p["tid"]: p["codes"] for p in f1}
+        failed = "failed_target"
+        fasta = {
+            "queries.fasta": [("Q", query["qseq"], np.ascontiguousarray(query["q16"], "<f2").tobytes())],
+            "targets.fasta": [(t, tseq[t], np.ascontiguousarray(tcodes[t]).tobytes()) for t in tids]
+                             + [(failed, "MKV", b"")],
+        }
+        params, calls = _predict_parameters(), []
+
+        def predict(src_stream, **kw):
+            unknown = set(kw) - params
+            self.assertFalse(unknown, f"predict() has no parameter {unknown}")
+            self.assertFalse(is_distributed(kw.get("devices", "auto"), kw.get("num_nodes", 1)),
+                             "devices='auto' starts DDP, which Lightning refuses on Apple MPS")
+            self.assertIsNone(kw.get("out_folder", "unset"))
+            calls.append((src_stream, kw["residue_output"]))
+            rows = fasta[src_stream]
+            for k in range(0, len(rows), 2):                         # batches of two
+                batch = rows[k:k + 2]
+                yield (None, [r[0] for r in batch], [r[2] for r in batch], [seq_sha1(r[1]) for r in batch])
+
+        class Chunks:                                                # the example's chunks, from its targets
+            def __iter__(self):
+                items = list(ns["targets"].items())
+                return iter([dict(items[:2]), dict(items[2:])])
+
+        module = type(sys)("foldmatch.inference.chain_complete_inference")
+        module.predict = predict
+        seqs = {"Q": query["qseq"], **{t: tseq[t] for t in tids}, failed: "MKV"}
+        ns = {"SEQS": seqs, "N": N_F1, "chunks": Chunks()}
+        out, prepared = io.StringIO(), _prepared()
+        with mock.patch.dict(sys.modules, {"foldmatch.inference.chain_complete_inference": module}), \
+                mock.patch.object(ss, "prepare", lambda system, **kw: prepared), \
+                contextlib.redirect_stdout(out):
+            exec(compile(code.replace("seqs = {...}", "seqs = SEQS"), "README.md", "exec"), ns)
+        self.assertEqual(calls, [("queries.fasta", "query_encoding"), ("targets.fasta", "residue_codes")])
+        self.assertEqual(sorted(ns["targets"]), sorted(tids))           # the failed row skipped
+        hits = align_query_codes(ns["q"], ns["targets"], scoring_system=_prepared(), db_residues=N_F1,
+                                 output_needs=ns["fields"]).hits
+        self.assertTrue(hits)
+        self.assertEqual(out.getvalue().splitlines(), [output.format_row("Q", h, ns["fields"]) for h in hits])
+        self.assertIn("pairs", ns)
+        self.assertTrue(all(isinstance(k, tuple) and k[0][0] == "A" for k in ns["pairs"]))

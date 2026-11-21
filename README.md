@@ -193,7 +193,7 @@ Assembly-level embeddings are only available under `from-structures` — there i
 
 Each FASTA record's embedding is stored under its id, the first word of its header, so `from-sequences` refuses a repeated id before ESM3 is loaded. With `--output-format csv` or `pt` (one file per record or chain), an id is a file name: one that holds `/` or cannot name a file, ids that the output folder takes for one file (`abc` and `ABC` on macOS's default file system), and a `--fasta-file` named like an output are refused too, and a run stops at a second write of one file (chains `A` and `a` of one structure on macOS). Parquet and JSON keep any id. A rerun into the same folder replaces its own files, as before.
 
-`from-sequences residue` and `from-sequences chain` take `--output-codes-folder FOLDER`: the same ESM3 pass also computes each sequence's residue codes, the 8-byte per-residue ESM3 codes that `fm-search build sequences --residue-codes` stores (esm-codes-v1 target codes: 8 integers, 0-255, per residue), and writes them to that folder. ESM3 runs once; the embedding files are byte for byte those of a run without the option, and the output folder holds them only, so `fm-search build embeddings` and `query embedding` read it as before (for chain embeddings). The codes folder must exist and must not be `--output-folder` (compared as folders on disk: a symbolic link, `.`, or another case of the name on macOS are the same folder; a usage error, exit status 2); a subfolder of it, or a folder that holds it, will do (`fm-search` reads the files of a folder, not its subfolders), unless it is named as a file of the other folder's output. The codes follow `--output-format`, in the layout of the embeddings, one `[L, 8]` table per sequence of `L` residues, one row per residue: row `i` of the codes is residue `i`, which is row `i + 1` of the residue embeddings (`[L + 2, 1536]`, ESM3's BOS and EOS rows included):
+`from-sequences residue` and `from-sequences chain` take `--output-codes-folder FOLDER`: the same ESM3 pass also computes each sequence's residue codes, the 8-byte per-residue ESM3 codes that `fm-search build sequences --residue-codes` stores (esm-codes-v1 target codes: 8 integers, 0-255, per residue), and writes them to that folder. ESM3 runs once; the embedding files are byte for byte those of a run without the option, and the output folder holds them only, so `fm-search build embeddings` and `query embedding` read it as before (for chain embeddings). The codes folder must exist and must not be `--output-folder` (compared as folders on disk: a symbolic link, `.`, or another case of the name on macOS are the same folder; a usage error, exit status 2); a subfolder of it, or a folder that holds it, will do (`fm-search` reads the files of a folder, not its subfolders), unless it is named as a file of the other folder's output. The codes follow `--output-format`, in the layout of the embeddings, one `[L, 8]` table per sequence of `L` residues, one row per residue: 0-based row `i` of the codes is character `i` of the normalised sequence (residue `i + 1`, counting from 1) and 0-based row `i + 1` of the residue embeddings (`[L + 2, 1536]`, ESM3's BOS and EOS rows included; BOS and EOS are never rows of the codes):
 
 | Format | Residue-code files in the codes folder | Layout |
 |---|---|---|
@@ -589,6 +589,132 @@ structure_from_seq = model.aggregator_embedding(seq_emb)
 ```
 
 See the `examples/` and `tests/` directories for more use cases.
+
+---
+
+### Residue-code alignment (esm-codes Stage 2)
+
+`foldmatch.search.code_alignment` runs the esm-codes Stage 2 of `fm-search query sequences --scoring esm-codes` on arrays in memory: one query against any number of targets, in this process, with no database, query-encoding file or residue-code store. The hits are fm-search's, field for field and bit for bit (see *Reproducibility*), and each hit's alignment comes back as explicit pairs of rows. The API is **provisional in 0.14**: a structure-conditioned scoring system may change the records and the type of `scoring_system`; the indexing convention and the bit-identity guarantee below are the stable part. Import by module path (nothing is added to `foldmatch.__all__`); `code_alignment.__all__` lists the public names. The module needs numpy only (no torch, no biotite), except `load_code_targets`, which runs fm-search's database checks.
+
+#### Inputs: `CodeQuery` and `CodeTarget`
+
+```python
+CodeQuery(sequence, encoding, *, seq_sha1=None, residue_keys=None)
+CodeTarget(sequence, codes, *, seq_sha1=None, residue_keys=None)
+```
+
+- `CodeQuery.encoding`: the query's S5 query encoding, a native `float16` array `[n, 64]`, `n >= 1`, finite. It is never cast: float32 or byte-swapped `'>f2'` is a `TypeError`.
+- `CodeTarget.codes`: the target's S4 residue codes, `uint8 [m, 8]` (64 bits per residue, packbits, most significant bit first), `m >= 1`. The `[0, 8]` table `predict` returns for a sequence whose codes failed is refused.
+- `sequence`: normalised on construction (ASCII whitespace removed, ASCII letters upper-cased, non-ASCII refused) and it must have exactly one character per row. `seq_sha1` (optional, as `predict` returns it) must be the SHA-1 of the normalised sequence; after construction the field holds that SHA-1 in any case.
+- `residue_keys` (optional): one opaque, hashable, unique key per row (not None, which marks a gap; a str is refused, since it would be one key per character), for example a mmCIF `(label_asym_id, label_seq_id)`, a model file's `(chain, resSeq, iCode)` or a UniProt position.
+- Each record keeps a read-only, C-contiguous copy of its array. A CUDA/MPS tensor or one that requires grad is a `TypeError` ("call `.detach().cpu()`"); a CPU tensor without grad is accepted. Wrong dtypes or shapes are a `TypeError`; a row count other than the normalised length, an empty array, a `seq_sha1` mismatch, a non-finite encoding and bad keys are a `RefusalError`.
+
+**Where the arrays come from.** `inference.chain_complete_inference.predict` makes both in memory, in the same ESM3 pass as the chain embedding, from FASTA input only (esm-codes-v1 encodings and codes are defined for sequence-only ESM3; the producer refuses structure input). With `out_folder=None` nothing is written. Each prediction batch is `(chain_embeddings, ids, payloads, seq_sha1s)`, each payload the raw bytes of one sequence: `'<f2'` `[L, 64]` for `residue_output="query_encoding"`, `uint8 [L, 8]` for `residue_output="residue_codes"` (an empty payload: that row failed). The score is directional (the query side is an encoding, the target side codes), so align(A, B) is not align(B, A), and each side needs its own pass. The 0.12.0 route `sequence_inference.predict(out_codes_folder=...)` also returns target codes, as CPU tensors (`CodeTarget(seq, codes[i], seq_sha1=sha1s[i])`, the sequence read from the FASTA), but it writes code files too; when some rows fail it raises `MissingResidueCodesError` at the end, and `except MissingResidueCodesError as e: preds = e.predictions` keeps the others. Structure-conditioned ESM3 rows (`FoldMatch.residue_embedding`, `residue_embedding_by_chain`) run through the encoders by hand are not valid input, and nothing can detect them; a multi-chain `residue_embedding()` table is not one table either (it concatenates per-chain `[L_c + 2]` tables).
+
+#### `align_query_codes(query, targets, *, scoring_system, db_residues, emb_scores=None, q90=None, min_seq_identity=0.0, min_coverage=0.0, max_evalue=1e-3, output_needs=None)`
+
+**Parameters:**
+- `query`: a `CodeQuery`.
+- `targets`: `Mapping[str, CodeTarget]`, target id to record; the ids are the hits' `subject_id`.
+- `scoring_system` (required): the system that made the encodings and codes, as a name (`"esm-codes-v1"`), an `EsmCodesSystem` (exactly the registry entry) or a `PreparedSystem`. A name or a system is prepared on every call (the ~26 MB bundle is hashed, and downloaded if it is not cached); prepare it once per process with `scoring_system.prepare(scoring_system.get(name))`, with `local_files_only=True` to never download.
+- `db_residues` (required, no default): N, the search space of the E-values in residues (see *Choosing N*). `None`: no E-values (`evalue` and `log_evalue` None, rendered empty), but Q90, the adjusted score and the bit score are still computed when needed; a finite `max_evalue` with `None` is a `ValueError`. An int > 0 (numpy integers too); 0, negative numbers and `bool` are refused.
+- `emb_scores`: target id to Stage-1 embedding score (`Hit.emb_score` and the tie-break of the order), exactly the `targets` ids; `None` gives every target 0.0, so ties then go by id.
+- `q90`: a `PanelQ90` from `panel_q90()` or an earlier result's `.q90`, to skip the panel pass. Refused when the call needs no panel (`ValueError`), and when it is another query's or another setup's (`RefusalError`).
+- `min_seq_identity`, `min_coverage`, `max_evalue`: fm-search's filters and defaults (`fident >= min_seq_identity`, `min(qcov, tcov) >= min_coverage`, `E <= max_evalue`; `max_evalue=None` or `inf` keeps every target with a non-empty alignment).
+- `output_needs`: the `--format-output` field names you will render, or an `OutputNeeds`; `None` is fm-search's default columns (`output.DEFAULT_OUTPUT_FIELDS`). A name `--format-output` does not know is a `ValueError`. The `cigar`, `qaln`, `taln`, `qseq` and `tseq` strings are built only when named, and render empty otherwise. The panel pass (Q90, about n x 355,626 similarity cells) runs when a finite `max_evalue` or one of `evalue`, `bits`, `q90`, `rawadj` asks for it.
+
+**Returns:** a `QueryCodeAlignment`:
+- `hits`: fm-search's `Hit` objects for this query, same fields, bits and order (S descending, then `emb_score` descending, then id); `output.format_row("Q", hit, fields)` renders fm-search's columns and `output.write_aligned_results({"Q": res.hits}, fields, path)` its file;
+- `paths`: target id to `AlignedResidues`, one per hit, in hit order;
+- `q90`: the query's `PanelQ90` when the panel was computed or reused; None when the call needs no panel, for an empty `targets` (even with `q90=` given) and for a degenerate query;
+- `degenerate`: True when the query gets no hits by rule (one row, or every row bitwise equal), not an error;
+- `skipped`: the targets whose pair exceeds 2^28 similarity cells, in `targets` order (no score, no hit);
+- `db_residues`, and `provenance`: what the bits depend on besides the inputs (FoldMatch version, system name, digest and calibration, kernel ISA, DP id, source and compiler, numpy and its BLAS, and `blas_limited`, whether numpy's own BLAS, the one the scoring's matrix product runs on, ran at one thread; another library's BLAS does not count).
+
+A target in neither `hits` nor `skipped` was filtered by the E-value, an empty alignment, or the identity / coverage filters (pass `max_evalue=None` to keep them).
+
+Every refusal of the arguments (`TypeError`, `ValueError`, or `RefusalError` for a Q90 of another query or setup) comes before the system is prepared; a query too long for the panel pass (over 268,973 residues for esm-codes-v1) is a `RefusalError` before any alignment. `RefusalError` is a `ValueError`.
+
+#### `panel_q90(query, *, scoring_system)`
+
+The panel pass alone: the query's `PanelQ90(value, encoding_sha256, provenance)`, to pass as `q90=` to many calls with the same query (it depends on the query and the system only, not on the targets or N). None for a degenerate query.
+
+#### `load_code_targets(db_path, ids)`
+
+Reads the `CodeTarget` of each id from a database built with `fm-search build sequences --residue-codes`, through fm-search's own database checks, and returns `CodeDatabaseTargets(targets, total_residues, prepared)`: the targets (no residue keys: the stores keep none), N, and the prepared system the database names. `ids` is required and may not repeat an id. It imports torch (through those checks).
+
+#### Residue indexing
+
+1. **Rows.** 0-based row `i` of `CodeQuery.encoding` or of `CodeTarget.codes` is character `i` of the normalised sequence (residue `i + 1`, counting from 1) and 0-based row `i + 1` of ESM3's `[L + 2, 1536]` table. ESM3's rows 0 (BOS) and L + 1 (EOS) are never rows here. Paths are 0-based rows; `qstart`, `qend`, `tstart` and `tend` are 1-based.
+2. **Input mode.** esm-codes-v1 encodings and codes are defined only for sequence-only ESM3 (FASTA input).
+3. **BOS and EOS.** The producer drops them in one place (it refuses a table without L + 2 rows, then keeps `[1:-1]`); an array whose rows differ from the normalised length is refused.
+4. **Paths.** `AlignedResidues.rows` is the kernel's path itself, `int32 [P, 2]`, read-only: column `c` is `(query row, target row)`, 0-based indices into the arrays given, -1 for a gap, in forward order. Rows are indices into the arrays, not residue numbers: never join them to atom lists by position.
+5. **Bounds.** `qstart = rows[rows[:, 0] >= 0, 0].min() + 1`, `qend = ... .max() + 1`, and the same for the target with column 1.
+6. **Keys.** With `residue_keys`, the key of path column `c` is `residue_keys[rows[c, side]]`, None at a gap: `query_keys()`, `target_keys()`, and `matched_keys()` for the aligned pairs (`matched()` gives their rows). Keys are opaque; you join them to atoms or features. Without keys a row's identity is `(seq_sha1 of the normalised sequence, row)`, which `AlignedResidues` carries as `query_seq_sha1` and `target_seq_sha1`.
+7. **Sequence use.** The sequence enters only identity, the strings, the calibrated-domain checks of non-standard residues and the length / SHA-1 checks. The scoring never reads letters.
+
+Worked example: query input `"mkT AYw"` normalises to `"MKTAYW"` (n = 6): ESM3 rows 1-6 are encoding rows 0-5, residues 1-6, with the keys `(A,1) ... (A,6)` of a model file. Target `"KTYW"` (m = 4) has codes rows 0-3 and the keys `P12345:101 ... P12345:104` (UniProt positions: a key is not a position in the array). An (illustrative) path `[[1,0], [2,1], [3,-1], [4,2], [5,3]]` is the CIGAR `2M1I2M`, `qstart` 2, `qend` 6, `tstart` 1, `tend` 4, `alnlen` 5, `nident` 4, `gapopen` 1; `matched()` is `[[1,0], [2,1], [4,2], [5,3]]` and `matched_keys()` is `[((A,2), P12345:101), ((A,3), P12345:102), ((A,5), P12345:103), ((A,6), P12345:104)]`. ESM3's own row numbers (2, 3, 5, 6 for the query) appear nowhere.
+
+#### Choosing N, and what an E-value means
+
+- E is the expected number of chance hits with an adjusted score at least this large when one query of length n searches N residues of unrelated targets. The bit score does not depend on N: E = n x N x 2^-bits.
+- **To reproduce fm-search on database D**: N is the database's `total_residues` (`load_code_targets(D, ids).total_residues`, or `ResidueCodeStore.from_db_path(D).manifest()["total_residues"]`), the residues of the first kept record of each id: two ids with one sequence count twice.
+- **For a collection of your own**: the summed lengths of the distinct ids you would search.
+- **One pair alone**: the bit score is the pairwise statistic; call with `db_residues=None` and `max_evalue=None`, and compute E for the N you choose. N = m, that pair only, is far below the calibration's search space, so such an E-value is an extrapolation.
+- Rescaling ln E to another N afterwards agrees with a call at that N within rounding, not bit for bit, and a finite `max_evalue` filters at the N of the call.
+- Outside the calibrated domain (queries of 21-966 residues, targets up to 3,000, at most 1% non-standard residues, targets with at least 2 distinct codes) hits are reported with `ecal=0`, not refused.
+
+#### Reproducibility
+
+For the same encoding and code arrays, sequences, embedding scores, N, thresholds, output fields and system, `align_query_codes(...).hits` equals `fm-search query sequences --scoring esm-codes`'s hits for that query bit for bit: every metrics field, `emb_score`, `subject_id`, the order and the rendered row. This holds for the same FoldMatch install (kernel library, numpy, BLAS), the same `FOLDMATCH_SW_ISA` and BLAS at one thread in both, which `result.provenance.blas_limited` reports for the API, and for candidate lists without repeated ids (a `targets` mapping cannot repeat one; fm-search's builds refuse repeated ids). It holds by construction: the API runs fm-search's own kernel calls, statistics and hit assembly. Arrays recomputed on another device, machine or BLAS build agree within the method's tolerances only.
+
+- threadpoolctl cannot limit Apple Accelerate (numpy's BLAS on macOS): there the API uses Accelerate's own thread count and `blas_limited` is False. For the bits of fm-search's worker pool set `VECLIB_MAXIMUM_THREADS=1` before Python starts.
+- **Threads.** For the length of a call BLAS and OpenMP run at one thread process-wide, so torch or FAISS running in other threads do too; calls are serialised by a lock. A call overlapping an in-process fm-search Stage 2 (`align_candidates_esm_codes`) in another thread shares that one-thread setting with it, and the last of them to finish restores the thread counts.
+- **Parallel use.** The API has no worker pool: one call uses one core. For throughput, run calls in a `spawn` `concurrent.futures.ProcessPoolExecutor` whose initializer sets `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and `BLIS_NUM_THREADS` to 1 before importing foldmatch, with the worker function in an importable module and the script guarded by `if __name__ == "__main__":`; prepare one `PreparedSystem` per worker, and compute `panel_q90` once per query in the same environment (a `PanelQ90` is accepted only where its provenance matches).
+
+#### Example
+
+```python
+import numpy as np
+from foldmatch.inference.chain_complete_inference import predict
+from foldmatch.types.api_types import SrcEsmFrom
+from foldmatch.search import scoring_system as ss, output
+from foldmatch.search.code_alignment import CodeQuery, CodeTarget, align_query_codes, panel_q90
+
+prepared = ss.prepare(ss.get("esm-codes-v1"))           # once per process
+
+def payloads(fasta, kind):                               # kind: "query_encoding" or "residue_codes"
+    out = {}
+    for _emb, ids, blobs, sha1s in predict(fasta, src_from=SrcEsmFrom.fasta, residue_output=kind,
+                                           scoring_system=prepared, out_folder=None, return_predictions=True,
+                                           accelerator="cpu", devices=1):   # one process (see below)
+        out.update(zip(ids, zip(blobs, sha1s)))          # b"" = that row failed
+    return out
+
+seqs = {...}                                             # id -> sequence, from the same FASTA files
+qb, qsha = payloads("queries.fasta", "query_encoding")["Q"]
+q = CodeQuery(seqs["Q"], np.frombuffer(qb, "<f2").reshape(-1, 64), seq_sha1=qsha,
+              residue_keys=[("A", i) for i in range(1, len(seqs["Q"]) + 1)])
+targets = {tid: CodeTarget(seqs[tid], np.frombuffer(b, np.uint8).reshape(-1, 8), seq_sha1=s,
+                           residue_keys=[(tid, i) for i in range(1, len(seqs[tid]) + 1)])
+           for tid, (b, s) in payloads("targets.fasta", "residue_codes").items()
+           if b}                                         # skip the rows that failed
+
+fields = output.parse_format_output("query,target,evalue,bits,cigar")
+res = align_query_codes(q, targets, scoring_system=prepared, db_residues=N, output_needs=fields)
+for h in res.hits:
+    print(output.format_row("Q", h, fields))             # fm-search's columns
+    rows = res.paths[h.subject_id].rows                  # (query row, target row), -1 = gap
+    pairs = res.paths[h.subject_id].matched_keys()       # [(("A", i), (tid, j)), ...]: keys on both sides
+    # without keys on a side, .matched() gives the aligned (query row, target row) pairs
+
+# many targets over several calls: the panel pass once
+pq = panel_q90(q, scoring_system=prepared)
+for chunk in chunks:                                     # dicts of id -> CodeTarget
+    res = align_query_codes(q, chunk, scoring_system=prepared, db_residues=N, q90=pq, output_needs=fields)
+```
+
+`predict`'s defaults (`accelerator="auto"`, `devices="auto"`) start a DDP strategy, which Lightning refuses on Apple MPS; `devices=1` keeps the pass in this process (with `accelerator="cpu"`, or the device of your choice). `N` is as in *Choosing N*; `chunks` are dicts of target id to `CodeTarget`.
 
 ---
 

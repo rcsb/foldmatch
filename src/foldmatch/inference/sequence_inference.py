@@ -42,8 +42,9 @@ def predict(
     the same ESM3 pass, the esm-codes target codes ``uint8 [L, 8]`` that ``fm-search build sequences
     --residue-codes`` stores, and writes them to that folder, which is not ``out_folder``, in ``out_format``:
     ``<id>.csv`` or ``<id>.pt``, else ``<out_codes_name>-<rank>.parquet`` or ``.json.gz`` (``out_codes_name`` by
-    default ``<out_name>-codes``; :func:`~foldmatch.inference.chain_complete_inference.residue_codes_pass`). Row ``i``
-    of a sequence's codes is residue ``i``, row ``i + 1`` of its embeddings. Each prediction is then ``(embeddings,
+    default ``<out_name>-codes``; :func:`~foldmatch.inference.chain_complete_inference.residue_codes_pass`). 0-based
+    row ``i`` of a sequence's codes is character ``i`` of the normalised sequence (residue ``i + 1``, counting from 1)
+    and 0-based row ``i + 1`` of its embeddings. Each prediction is then ``(embeddings,
     ids, codes, seq_sha1s)``: ``codes`` one CPU ``uint8`` tensor ``[L, 8]`` per id, the object that its ``.pt`` code
     file holds (``[0, 8]`` for a sequence without codes), and ``seq_sha1s`` the 20-byte SHA-1 of each normalised
     sequence. The embeddings and their files are those of a run without it. An ``out_codes_folder`` that is

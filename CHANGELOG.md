@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Added
+
+- **`foldmatch.search.code_alignment.align_query_codes(query, targets, *,
+  scoring_system, db_residues, emb_scores=None, q90=None,
+  min_seq_identity=0.0, min_coverage=0.0, max_evalue=1e-3,
+  output_needs=None)`** (provisional): the esm-codes Stage 2 of `fm-search
+  query sequences --scoring esm-codes` on arrays in memory, one query
+  against any number of targets, with no database, query-encoding file or
+  residue-code store. `query` is a `CodeQuery(sequence, encoding)` (S5
+  query encoding, `float16 [n, 64]`), each target a `CodeTarget(sequence,
+  codes)` (residue codes, `uint8 [m, 8]`); both take an optional
+  `seq_sha1` and `residue_keys`. `predict(..., residue_output=
+  "query_encoding" or "residue_codes", out_folder=None)` makes both in
+  memory, from FASTA input only (esm-codes-v1 is sequence-only). 0-based
+  row `i` of an encoding or of the codes is character `i` of the
+  normalised sequence (residue `i + 1`, counting from 1) and 0-based row
+  `i + 1` of ESM3's `[L + 2, 1536]` table; ESM3's BOS and EOS rows are
+  never rows, and an array of another length is refused. It returns a
+  `QueryCodeAlignment`: the hits in fm-search's fields and order
+  (`output.format_row` renders them), each hit's path as 0-based
+  `(query row, target row)` pairs (-1 for a gap) with the residue keys of
+  its rows, the query's Q90, the degenerate flag, the skipped targets and
+  the provenance of the bits. `db_residues` (N, the E-value search space)
+  has no default: the database's `total_residues` reproduces fm-search's
+  E-values; None keeps Q90, the adjusted score and the bit score and
+  leaves the E-values empty. `panel_q90(query, *, scoring_system)`
+  computes a query's panel quantile once, for `q90=`;
+  `load_code_targets(db_path, ids)` reads targets, N and the system from a
+  database. With BLAS at one thread the hits are bit for bit those of
+  fm-search's Stage 2 (on macOS set `VECLIB_MAXIMUM_THREADS=1` before
+  Python starts). Refused before any alignment: wrong dtypes or shapes
+  (`TypeError`); sequences that do not normalise or do not match the rows,
+  empty or non-finite arrays, and a Q90 of another query or setup
+  (`RefusalError`); bad parameters (`ValueError`).
+
+### Changed
+
+- `foldmatch.search.scoring_system.resolve` and `resolve_system`: the
+  scoring-system argument of a residue pass, now also used by
+  `align_query_codes`; `prepare_scoring_system` behaves as before.
+
 ## [0.13.0] - 2026-11-20
 
 ### Added
