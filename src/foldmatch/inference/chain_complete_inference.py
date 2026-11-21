@@ -269,20 +269,16 @@ def prepare_scoring_system(scoring_system=None, *, residue_output: str = "residu
     """
     residue_output = check_residue_output(residue_output)
     if isinstance(scoring_system, _ss.PreparedSystem):
-        _ss.registered(scoring_system.system)
-        return scoring_system
+        return _ss.resolve(scoring_system)
     if scoring_system is None:
         if residue_output == QUERY_ENCODING:
             raise ValueError("a query-encoding pass needs the scoring system of the database it searches (the one "
                              "its residue-code manifest names); there is no default")
-        system = _ss.get(_ss.DEFAULT_ESM_CODES)
-    elif isinstance(scoring_system, str):
-        system = _ss.get(scoring_system)
-    else:
-        system = _ss.registered(scoring_system)
+        scoring_system = _ss.DEFAULT_ESM_CODES
+    system = _ss.resolve_system(scoring_system)
     if local_files_only is None:
         local_files_only = not bundle_fetch_allowed(num_nodes)
-    return _ss.prepare(system, local_files_only=local_files_only)
+    return _ss.resolve(system, local_files_only=local_files_only)
 
 
 def check_residue_pass(residue_output, scoring_system=None, *, src_from=SrcEsmFrom.fasta, out_folder=None,

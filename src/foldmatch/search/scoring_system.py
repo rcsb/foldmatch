@@ -914,3 +914,32 @@ def prepare(system: EsmCodesSystem, *, cache_dir=None, local_files_only: bool = 
     _raise_problems(system, problems)
     return PreparedSystem(system=system, files=MappingProxyType(dict(files)), bundle=bundle,
                           encoders_file=roles[ENCODERS_FORMAT], scoring_file=roles[SCORING_FORMAT])
+
+
+#: The refusal of a missing scoring system where there is no default (the in-memory Stage 2, a query pass).
+SCORING_SYSTEM_REQUIRED = ("scoring_system is required: pass the name, EsmCodesSystem or PreparedSystem of the "
+                           "system that made the encodings and codes")
+
+
+def resolve_system(scoring_system) -> EsmCodesSystem:
+    """The registered :class:`EsmCodesSystem` that ``scoring_system`` names, without I/O: a name (:func:`get`), an
+    ``EsmCodesSystem`` (:func:`registered`: exactly the registry entry of its name) or a :class:`PreparedSystem`
+    (its system, :func:`registered`). ``None`` raises ``ValueError`` (there is no default here); any other type
+    ``TypeError`` (from :func:`registered`); an unknown name or an edited system :class:`UnknownScoringSystemError`."""
+    if scoring_system is None:
+        raise ValueError(SCORING_SYSTEM_REQUIRED)
+    if isinstance(scoring_system, PreparedSystem):
+        return registered(scoring_system.system)
+    if isinstance(scoring_system, str):
+        return get(scoring_system)
+    return registered(scoring_system)
+
+
+def resolve(scoring_system, *, local_files_only: bool = False) -> PreparedSystem:
+    """The :class:`PreparedSystem` of ``scoring_system`` (as :func:`resolve_system`): a ``PreparedSystem`` as it is
+    (its system re-checked against the registry, nothing fetched or hashed again), else :func:`prepare` of the
+    registered system, which hashes the bundle and, unless ``local_files_only``, downloads what is not cached."""
+    if isinstance(scoring_system, PreparedSystem):
+        resolve_system(scoring_system)
+        return scoring_system
+    return prepare(resolve_system(scoring_system), local_files_only=local_files_only)
