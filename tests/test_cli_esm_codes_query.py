@@ -1445,5 +1445,81 @@ class InMemoryApiTest(_DbCase):
             load_code_targets(str(self.database("plain")), ["1acb_E"])
 
 
+@unittest.skipUnless(os.environ.get("FOLDMATCH_SLOW_TESTS") == "1",
+                     "slow: real ESM3 for a build, a query and two in-memory passes; set FOLDMATCH_SLOW_TESTS=1 to run")
+@pytest.mark.usefixtures("fmsw_libs")
+class RealEsm3InMemoryApiTest(unittest.TestCase):
+    """T11 with real ESM3 (CPU): a database of the fixture built with --residue-codes, ``query sequences --scoring
+    esm-codes`` with the T2 spy, and the in-memory API on the arrays the command line aligned gives its hits and its
+    file bit for bit. Then the in-memory producer route of the API's docs, ``chain_complete_inference.predict(...,
+    residue_output=..., out_folder=None)``, gives the same encoding and code bytes as the run's shards and store."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        esm_codes_bundle.registry_files()
+        swkern.load()
+        gc.collect()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        for folder in ("codes", "bshards", "qshards"):
+            (cls.tmp / folder).mkdir()
+        cls.db = cls.tmp / "codes" / "db"
+        cls.out = cls.tmp / "esm.tsv"
+        cls.captured = {}
+        with launch_env(FOLDMATCH_RUN_ID="t11b"):
+            cls.build = invoke(*_build_args(_FASTA, cls.db, cls.tmp / "bshards", "--residue-codes"))
+        gc.collect()
+        with launch_env(FOLDMATCH_RUN_ID="t11q"), \
+                mock.patch.object(code_alignment, "align_candidates_esm_codes", _stage2_spy(cls.captured)):
+            cls.query = invoke(*_query_args(cls.db, _FASTA, cls.tmp / "qshards", cls.out,
+                                            *_esm("--format-output", ALL_FIELDS, "--format-mode", "tsv",
+                                                  "--max-evalue", "inf", "--threshold", "-2", "--align-workers",
+                                                  "0")))
+        gc.collect()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def setUp(self):
+        for name, result in (("build", self.build), ("query", self.query)):
+            self.assertEqual(result.exit_code, 0, f"{name}: {result.output[-4000:]} {result.exception!r}")
+
+    def test_the_api_on_the_command_lines_arrays(self):
+        results = InMemoryApiTest._replay(self, self.db, self.out, self.captured, "tsv")
+        self.assertEqual(sum(map(len, results.values())), 4)
+
+    def test_the_in_memory_producer_route_gives_the_runs_bytes(self):
+        from foldmatch.inference.chain_complete_inference import predict
+        from foldmatch.search.code_alignment import load_code_targets
+        from foldmatch.types.api_types import SrcEsmFrom
+        records = dict(_fasta_records(_FASTA))
+        loaded = load_code_targets(str(self.db), list(records))
+
+        def payloads(kind):
+            out = {}
+            with launch_env():
+                for _emb, ids, blobs, sha1s in predict(str(_FASTA), src_from=SrcEsmFrom.fasta, residue_output=kind,
+                                                       scoring_system=loaded.prepared, out_folder=None,
+                                                       return_predictions=True, accelerator="cpu", devices=1):
+                    out.update(zip(ids, zip(blobs, sha1s)))
+            gc.collect()
+            return out
+
+        enc = payloads("query_encoding")
+        self.assertEqual(sorted(enc), sorted(self.captured["queries"]))
+        for qid, (blob, sha1) in enc.items():
+            q16, run_sha1 = self.captured["queries"][qid]
+            self.assertEqual(sha1, run_sha1, qid)
+            self.assertEqual(blob, np.ascontiguousarray(q16, "<f2").tobytes(), f"{qid}: query encoding bytes")
+        codes = payloads("residue_codes")
+        self.assertEqual(sorted(codes), sorted(records))
+        for tid, (blob, sha1) in codes.items():
+            self.assertEqual(sha1, loaded.targets[tid].seq_sha1, tid)
+            self.assertEqual(blob, loaded.targets[tid].codes.tobytes(), f"{tid}: residue code bytes")
+
+
 if __name__ == "__main__":
     unittest.main()
