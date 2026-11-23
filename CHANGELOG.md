@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Changed
+
+- A structure file that cannot be read (malformed, truncated, of another
+  format) is refused: `structure_parser.get_structure_from_src` and
+  `structure_parser.get_assemblies` raise `RefusalError` (a `ValueError`)
+  instead of `RuntimeError`, with the same message and the parser's error
+  as its `__cause__`. Callers that report a `ValueError` as the input's
+  fault now do so for these files: the embedding calculator web service
+  answers HTTP 400 instead of 500, and the command-line tools print a
+  one-line `Error: ...` (exit status 1) instead of a traceback.
+
 ## [0.14.0] - 2026-11-23
 
 ### Added

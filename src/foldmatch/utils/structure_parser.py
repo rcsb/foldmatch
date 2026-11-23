@@ -8,6 +8,8 @@ from biotite.structure import filter_amino_acids, filter_polymer, get_chain_star
 from biotite.structure.io.pdb import PDBFile, get_structure as get_pdb_structure, get_assembly as get_pdb_assembly, list_assemblies as list_pdb_assemblies
 from biotite.structure.io.pdbx import CIFFile, get_structure, get_assembly, BinaryCIFFile, list_assemblies
 
+from foldmatch.errors import RefusalError
+
 
 def get_structure_from_src(
         src_structure,
@@ -36,7 +38,9 @@ def get_structure_from_src(
         else:
             raise RuntimeError(f"Unknown file format {structure_format}")
     except Exception as e:
-        raise RuntimeError(f"Error reading structure from {src_structure}: {e}")
+        # The file cannot serve the request (malformed, truncated, wrong format): a refusal, so that callers that
+        # report ValueError as the input's fault (e.g. the web service's HTTP 400) do so
+        raise RefusalError(f"Error reading structure from {src_structure}: {e}") from e
 
     return structure
 
@@ -89,7 +93,7 @@ def get_assemblies(structure, structure_format="mmcif"):
         else:
             raise RuntimeError(f"Unknown file format {structure_format}")
     except Exception as e:
-        raise RuntimeError(f"Error reading assemblies from {structure}: {e}")
+        raise RefusalError(f"Error reading assemblies from {structure}: {e}") from e
 
 
 def rename_atom_attr(atom_ch):
