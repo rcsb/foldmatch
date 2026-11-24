@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, breaking changes are released in a minor bump.
 
+## [Unreleased]
+
+### Changed
+
+- **`structure_parser.get_structure_from_src` and `get_assemblies` refuse a
+  structure file that cannot be read, and only such a file** (breaking for
+  callers that caught `RuntimeError`). A file that is not a valid structure
+  file of its format (malformed, truncated, of another format, wrongly
+  compressed or encoded, without the assembly asked for, or without
+  assemblies to list) raises `RefusalError` (a `ValueError`) with
+  biotite's error as its `__cause__`; the command-line tools print it after
+  `Error: ` (exit status 1), on one line when structures are read in the
+  main process (`--num-workers 0`, the default), followed by the worker's
+  traceback otherwise. This includes a non-ASCII character across a fixed
+  column of a PDB file, on which biotite's PDB reader panics (a
+  `PanicException`, which no `except Exception` caught). Before, every
+  exception was wrapped in a `RuntimeError`. The other errors are no longer
+  wrapped, so they are not mistaken for the file's fault: an unknown
+  `structure_format` is a `ValueError`; a stream of the wrong mode (text for
+  BinaryCIF, binary for mmCIF and PDB), `bytes`, a `str` holding a file's
+  content instead of a path, or an `assembly_id` that is not a `str` a
+  `TypeError`; a path that cannot be opened its `OSError`
+  (`FileNotFoundError`, `PermissionError`, ...); and a failure in
+  FoldMatch's own processing (numbering the copies of a PDB assembly) an
+  `InternalError`. `MemoryError` and unexpected error types propagate
+  unchanged, with their tracebacks, also when biotite wraps them in a
+  `DeserializationError` while parsing a category.
+- The message keeps its `Error reading structure from ...` (or `Error
+  reading assemblies from ...`) prefix but names the source by its path, or
+  by a stream's file name, or as `a <type> stream`: no longer by the
+  stream's repr (`<_io.StringIO object at 0x...>`), nor, for a `.gz` path,
+  by the decompressing stream's.
+
+### Fixed
+
+- A path ending in `.GZ` (or any case of `.gz`) is decompressed, as one
+  ending in `.gz` is; it was read as uncompressed text and failed.
+- A path read by `get_structure_from_src` or `get_assemblies` is closed
+  after the read: a `.gz` path's decompressing stream was left open.
+
 ## [0.14.0] - 2026-11-23
 
 ### Added
