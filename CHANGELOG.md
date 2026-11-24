@@ -45,6 +45,22 @@ While the major version is `0`, breaking changes are released in a minor bump.
   ending in `.gz` is; it was read as uncompressed text and failed.
 - A path read by `get_structure_from_src` or `get_assemblies` is closed
   after the read: a `.gz` path's decompressing stream was left open.
+- **A remote BinaryCIF file is read at any URL** (structure lists of the
+  `fm-embedding`, `fm-search build` and inference commands with
+  `--structure-format binarycif`). `data.stringio_from_url` chose the
+  stream by the URL's ending: only a URL ending in `.bcif.gz` gave a
+  binary stream, so every other BinaryCIF URL
+  (`https://models.rcsb.org/1acb.bcif`, an upper-case suffix, a query
+  string) became text and failed. It now takes the structure format
+  (`stringio_from_url(url, structure_format=None)`; without it, a URL
+  path ending in `.bcif` or `.bcif.gz`, in any case, is BinaryCIF), and
+  recognises gzip by its content rather than by a `.gz` suffix, so a
+  `.gz` URL whose body the server already decompressed is read too. Text
+  is decoded as UTF-8, as a local file is (it was decoded by the
+  server's declared or guessed charset), so a text file that is not
+  UTF-8 is refused. A refused download is named by its URL, and a
+  downloaded gzip file that cannot be decompressed is refused at once
+  instead of being downloaded again five times over about 30 minutes.
 
 ## [0.14.0] - 2026-11-23
 

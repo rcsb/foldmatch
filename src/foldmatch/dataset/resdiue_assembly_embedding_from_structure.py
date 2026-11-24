@@ -62,7 +62,7 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
             src_name = row[ResidueAssemblyDatasetFromStructure.STREAM_NAME_ATTR]
             src_structure = row[ResidueAssemblyDatasetFromStructure.STREAM_ATTR]
             progress.set_postfix_str(src_structure)
-            structure = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
+            structure = stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
             item_name = row[ResidueAssemblyDatasetFromStructure.ITEM_NAME_ATTR]
             for assembly_id in get_assemblies(structure=structure, structure_format=self.structure_format):
                 assemblies.append((src_name, src_structure, str(assembly_id), f"{item_name}-{assembly_id}"))

@@ -9,7 +9,9 @@ import re
 
 import typer
 from requests import RequestException, ConnectTimeout
-from io import StringIO, BytesIO
+from io import BytesIO, TextIOWrapper
+from urllib.parse import urlparse
+import zlib
 
 import numpy as np
 import pyarrow as pa
@@ -129,35 +131,49 @@ def collate_embeddings(emb):
         tuple([z for x, z in emb])
     )
 
-def stringio_from_url(url):
+def stringio_from_url(url, structure_format=None):
+    """The structure file at url, downloaded (with retries on network errors) as the stream get_structure_from_src
+    reads: binary (a BytesIO) for binarycif, UTF-8 text otherwise, gunzipped if the file is gzip (recognised by its
+    content, whatever the URL ends with). The stream is named by the URL, so that a refusal of the file names it.
+    Without structure_format, a URL whose path ends in .bcif or .bcif.gz (in any case) is taken for BinaryCIF.
+
+    A downloaded file that is gzip but cannot be decompressed is refused (RefusalError), without retrying: downloading
+    it again gives the same file."""
     return run_with_retries(
         __stringio_from_url,
         url,
+        structure_format,
         retries=5,
         delay=60,
         backoff=2,
         exceptions=(RequestException, IOError)
     )
 
-def __stringio_from_url(url):
+def __stringio_from_url(url, structure_format=None):
+    binary = __is_binarycif(url, structure_format)
     try:
         response = requests.get(url, timeout=60)
         response.raise_for_status()
         data = response.content
-        if url.endswith('.bcif.gz'):
-            with gzip.GzipFile(fileobj=BytesIO(data), mode='rb') as gz:
-                decompressed_data = gz.read()
-                return BytesIO(decompressed_data)
-        if url.endswith('.gz'):
-            compressed = BytesIO(data)
-            with gzip.open(compressed, 'rt') as f:
-                return StringIO(f.read())
-        else:
-            return StringIO(response.text)
     except (RequestException, ConnectTimeout) as e:
         raise RequestException(f"Error fetching URL {url}: {e}")
-    except (OSError, gzip.BadGzipFile) as e:
-        raise IOError(f"Error decompressing gzip file {url}: {e}")
+    if data[:2] == b"\x1f\x8b":  # gzip's magic number: neither text nor BinaryCIF (a msgpack map) starts with it
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError, zlib.error) as e:
+            raise RefusalError(f"Error reading structure from {url}: not a valid gzip file: {e}") from e
+    stream = BytesIO(data)
+    stream.name = url
+    # Text is decoded as it is read, by the structure reader: a file that is not UTF-8 is refused as unreadable, as a
+    # local file is
+    return stream if binary else TextIOWrapper(stream, encoding="utf-8")
+
+
+def __is_binarycif(url, structure_format):
+    if structure_format is not None:
+        return getattr(structure_format, "value", structure_format) == StructureFormat.bciff.value
+    path = urlparse(url).path.lower()
+    return path.endswith(".bcif") or path.endswith(".bcif.gz")
 
 
 def concatenate_tensors(file_list, max_residues, dim=0, res_embedding_format=ResEmbeddingFormat.pt):

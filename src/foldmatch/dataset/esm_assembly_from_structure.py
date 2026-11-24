@@ -86,7 +86,7 @@ class EsmAssemblyFromStructure(IterableDataset):
             src_structure = row[EsmAssemblyFromStructure.STREAM_ATTR]
             item_name = row[EsmAssemblyFromStructure.ITEM_NAME_ATTR]
 
-            src = stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
+            src = stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
             for assembly_id in get_assemblies(structure=src, structure_format=self.structure_format):
                 structure = self.__structure_provider.get_structure(
                     src_name=src_name,
