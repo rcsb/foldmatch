@@ -47,6 +47,13 @@ class EsmProtFromChain(Dataset):
         refuse_repeated_names(self.data, list_source(src_stream, self.src_location, "chain list"),
                               CHAIN_LIST_DEFAULT_NAME)
 
+    def __source(self, src_structure):
+        # A URL is given lazily: the provider downloads it only if it holds neither its structure nor its file, so that
+        # the chains or the assemblies of an entry, read one after the other, share one download
+        if get_structure_location(src_structure) == StructureLocation.remote:
+            return lambda: stringio_from_url(src_structure, self.structure_format)
+        return src_structure
+
     def __len__(self):
         return len(self.data)
 
@@ -57,7 +64,7 @@ class EsmProtFromChain(Dataset):
         item_name = self.data.iloc[idx][EsmProtFromChain.ITEM_NAME_ATTR]
         structure = self.__structure_provider.get_structure(
             src_name=src_name,
-            src_structure=stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
+            src_structure=self.__source(src_structure),
             structure_format=self.structure_format
         )
         # The protein chain with that chain ID, its pieces joined: found in the whole structure, because the atoms with
