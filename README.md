@@ -786,5 +786,4 @@ Segura, J., et al. (2026). *Multi-scale structural similarity embedding search a
 
 ## License
 
-This project uses the EvolutionaryScale ESM-3 model and is distributed under the
-[Cambrian Non-Commercial License Agreement](https://www.evolutionaryscale.ai/policies/cambrian-non-commercial-license-agreement).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
