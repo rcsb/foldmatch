@@ -36,8 +36,11 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
         self.structure_format = structure_format
         self.min_res_n = min_res_n
         self.max_res_n = max_res_n
+        # One provider for the listing of the assemblies and the reading of each: the last file downloaded to list its
+        # assemblies is not downloaded again to read them
+        structure_provider = structure_provider if structure_provider is not None else StructureProvider()
         super().__init__(
-            src_stream=self.__get_assemblies(src_stream),
+            src_stream=self.__get_assemblies(src_stream, structure_provider),
             res_embedding_location=res_embedding_location,
             src_location=SrcLocation.stream,
             structure_format=structure_format,
@@ -47,7 +50,7 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
             structure_provider=structure_provider
         )
 
-    def __get_assemblies(self, src_stream):
+    def __get_assemblies(self, src_stream, structure_provider):
         assemblies = []
         # The structure list, whose columns are COLUMNS: a row of more than 3 fields is refused, a missing or empty
         # embedding name is the structure name, and an embedding name given to more than one row is refused
@@ -62,7 +65,11 @@ class ResidueAssemblyDatasetFromStructure(ResidueAssemblyEmbeddingFromTensorFile
             src_name = row[ResidueAssemblyDatasetFromStructure.STREAM_NAME_ATTR]
             src_structure = row[ResidueAssemblyDatasetFromStructure.STREAM_ATTR]
             progress.set_postfix_str(src_structure)
-            structure = stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure
+            structure = structure_provider.get_source(
+                src_name,
+                (lambda: stringio_from_url(src_structure, self.structure_format)) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
+                self.structure_format
+            )
             item_name = row[ResidueAssemblyDatasetFromStructure.ITEM_NAME_ATTR]
             for assembly_id in get_assemblies(structure=structure, structure_format=self.structure_format):
                 assemblies.append((src_name, src_structure, str(assembly_id), f"{item_name}-{assembly_id}"))

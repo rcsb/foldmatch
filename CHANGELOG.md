@@ -61,6 +61,25 @@ While the major version is `0`, breaking changes are released in a minor bump.
   UTF-8 is refused. A refused download is named by its URL, and a
   downloaded gzip file that cannot be decompressed is refused at once
   instead of being downloaded again five times over about 30 minutes.
+- **A remote structure file is downloaded once per entry**, not once per
+  chain or per assembly (`inference residue-embedding`,
+  `structure-embedding`, `assembly-embedding` and `complete-embedding` on
+  chain and assembly lists of URLs). The datasets passed the download to
+  `StructureProvider.get_structure` as an argument, so it ran before the
+  provider looked at the structure it held: `EsmProtFromChain` downloaded
+  an entry once per chain (and parsed it once),
+  `ResidueAssemblyEmbeddingFromTensorFile` and
+  `ResidueAssemblyEmbeddingFromParquet` once per assembly, and
+  `ResidueAssemblyDatasetFromStructure` once to list an entry's assemblies
+  and again for each of them (it now downloads an entry at most twice: to
+  list its assemblies, and to read them). `StructureProvider.get_structure`
+  now also takes the source as a callable that returns the path or stream
+  to read, called only when the provider does not hold the structure; it
+  keeps the last stream so returned, for the other assemblies of the entry,
+  and drops what it holds when pickled. Each DataLoader worker (and each
+  DDP process) has its own provider: with `--num-workers` above 0, the
+  batches are dealt to the workers in turn, so the rows of an entry may go
+  to several workers, each of which downloads the entry once.
 
 ## [0.14.0] - 2026-11-23
 
