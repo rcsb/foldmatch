@@ -221,7 +221,7 @@ class AssemblyDatasetTest(unittest.TestCase):
         for source in (str(self.cif), url):
             with self.subTest(source=source), mock.patch.object(
                     esm_assembly_from_structure, "stringio_from_url",
-                    side_effect=lambda u: io.StringIO(self.cif.read_text())) as download:
+                    side_effect=lambda u, *_: io.StringIO(self.cif.read_text())) as download:
                 items = dict((name, proteins) for proteins, name in EsmAssemblyFromStructure(
                     src_stream=[("1acb", source, "1acb")], src_location=SrcLocation.stream))
                 self.assertEqual(download.call_count, int(source == url))
@@ -294,7 +294,7 @@ class AssemblyCopiesTest(unittest.TestCase):
         for source in (str(self.cif), url):
             with self.subTest(source=source), mock.patch.object(
                     esm_assembly_from_structure, "stringio_from_url",
-                    side_effect=lambda u: io.StringIO(self.cif.read_text())):
+                    side_effect=lambda u, *_: io.StringIO(self.cif.read_text())):
                 self.assert_copies(self.proteins(source), [_copy(a, 0), _copy(b, 0), _copy(a, 1), _copy(b, 1)])
 
     def test_min_res_n_between_the_chain_lengths(self):

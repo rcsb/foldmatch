@@ -1,12 +1,39 @@
 import gzip
 import os
+import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+from biotite import DeserializationError, InvalidFileError
+from biotite.file import is_binary, is_text
 from biotite.structure import filter_amino_acids, filter_polymer, get_chain_starts, get_residue_count, \
-    filter_peptide_backbone, residue_iter, array
+    filter_peptide_backbone, residue_iter, array, BadStructureError
 from biotite.structure.io.pdb import PDBFile, get_structure as get_pdb_structure, get_assembly as get_pdb_assembly, list_assemblies as list_pdb_assemblies
 from biotite.structure.io.pdbx import CIFFile, get_structure, get_assembly, BinaryCIFFile, list_assemblies
+
+from foldmatch.errors import InternalError, RefusalError
+
+STRUCTURE_FORMATS = ("mmcif", "pdb", "binarycif")
+
+# What reading a file that is not a valid structure file of its format raises, in the calls made under _refusing alone
+# (biotite's readers and the decompression and decoding below them). Measured on biotite 1.7.1 with truncated,
+# byte-flipped and line-edited mmCIF, PDB and BinaryCIF files, and with damaged assembly records: biotite's own errors;
+# ValueError (a number or hybrid-36 string that does not parse, no data block, invalid UTF-8, msgpack's unpack errors,
+# all ValueErrors); OverflowError (an integer too large for its column); KeyError (a missing column, an unknown
+# assembly ID); IndexError (an incomplete REMARK 300 in a PDB file); and, for .gz files, gzip's, zlib's and EOFError.
+# Anything else (TypeError, AttributeError, MemoryError, an OSError other than a bad gzip stream) is not taken as the
+# file's fault: it propagates unchanged.
+_MALFORMED = (
+    InvalidFileError, DeserializationError, BadStructureError,
+    ValueError, LookupError, OverflowError,
+    gzip.BadGzipFile, zlib.error, EOFError,
+)
+# A BinaryCIF file is msgpack, which biotite indexes without checking what it unpacked to: a file that unpacks to a
+# value of another shape (a single byte unpacks to a number; a list; a map without its data blocks) raises TypeError
+# or AttributeError. For binarycif these are the file's fault too: the stream's mode, the other source of a TypeError,
+# is checked before the read (_check_source).
+_MALFORMED_BINARYCIF = _MALFORMED + (TypeError, AttributeError)
 
 
 def get_structure_from_src(
@@ -15,29 +42,37 @@ def get_structure_from_src(
         *,
         assembly_id=None
 ):
-    try:
-        __rewind(src_structure)
-        if __is_path(src_structure) and Path(src_structure).suffix == ".gz":
-            if structure_format == "mmcif" or structure_format == "pdb":
-                src_structure = gzip.open(src_structure, "rt")
-            elif structure_format == "binarycif":
-                src_structure = gzip.open(src_structure, "rb")
-            else:
-                raise RuntimeError(f"Unknown file format {structure_format}")
-        if structure_format == "pdb":
-            pdb_file = PDBFile.read(src_structure) if assembly_id is None else _IndexedPDBFile.read(src_structure)
-            structure = __get_pdb_structure(pdb_file, assembly_id)
-        elif structure_format == "mmcif":
-            cif_file = CIFFile.read(src_structure)
-            structure = __get_structure(cif_file, assembly_id)
-        elif structure_format == "binarycif":
-            cif_file = BinaryCIFFile.read(src_structure)
-            structure = __get_structure(cif_file, assembly_id)
-        else:
-            raise RuntimeError(f"Unknown file format {structure_format}")
-    except Exception as e:
-        raise RuntimeError(f"Error reading structure from {src_structure}: {e}")
+    """The structure (its first model) of a file, or of its assembly assembly_id: an AtomArray, in an assembly with
+    each copy of a chain numbered by its sym_id.
 
+    src_structure is a path (a str or a PathLike, decompressed if it ends in .gz) or an open stream, text for mmcif and
+    pdb, binary for binarycif; a seekable stream is read from its start. assembly_id is a str.
+
+    A file that is not a valid structure file of that format (malformed, truncated, of another format, without that
+    assembly) is refused: RefusalError (a ValueError), with biotite's error as its __cause__. Everything else
+    propagates unchanged, so that it is not mistaken for the input's fault: ValueError for an unknown
+    structure_format; TypeError for a stream of the wrong mode, bytes, a str holding a file's content or an
+    assembly_id that is not a str; OSError from opening a path (FileNotFoundError, PermissionError); MemoryError;
+    InternalError for a failure in FoldMatch's own processing."""
+    structure_format = _check_format(structure_format)
+    _check_source(src_structure, structure_format)
+    _check_assembly_id(assembly_id)
+    with _opened(src_structure, structure_format) as src, _refusing("structure", src_structure, structure_format):
+        # biotite's calls alone: only what they raise can be the file's fault
+        if structure_format == "pdb":
+            if assembly_id is None:
+                structure = get_pdb_structure(PDBFile.read(src), model=1)
+            else:
+                structure = get_pdb_assembly(_IndexedPDBFile.read(src), assembly_id=assembly_id, model=1)
+        else:
+            cif_file = (CIFFile if structure_format == "mmcif" else BinaryCIFFile).read(src)
+            if assembly_id is None:
+                structure = get_structure(cif_file, model=1, use_author_fields=False)
+            else:
+                structure = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
+
+    if structure_format == "pdb" and assembly_id is not None:
+        structure = _number_pdb_copies(structure)
     return structure
 
 
@@ -71,25 +106,16 @@ def get_protein_chains(structure, min_res_n=0):
 
 
 def get_assemblies(structure, structure_format="mmcif"):
-    try:
-        __rewind(structure)
-        if __is_path(structure) and Path(structure).suffix == ".gz":
-            if structure_format == "mmcif" or structure_format == "pdb":
-                structure = gzip.open(structure, "rt")
-            elif structure_format == "binarycif":
-                structure = gzip.open(structure, "rb")
-            else:
-                raise RuntimeError(f"Unknown file format {structure_format}")
+    """The assembly IDs of a file (a path or a stream, as get_structure_from_src reads it), in file order. A file that
+    is not a valid structure file of that format, or lists no assemblies, is refused (RefusalError); other errors
+    propagate unchanged, as get_structure_from_src's do."""
+    structure_format = _check_format(structure_format)
+    _check_source(structure, structure_format)
+    with _opened(structure, structure_format) as src, _refusing("assemblies", structure, structure_format):
         if structure_format == "pdb":
-            return tuple(list_pdb_assemblies(PDBFile.read(structure)))
-        elif structure_format == "mmcif":
-            return tuple(list_assemblies(CIFFile.read(structure)).keys())
-        elif structure_format == "binarycif":
-            return tuple(list_assemblies(BinaryCIFFile.read(structure)))
-        else:
-            raise RuntimeError(f"Unknown file format {structure_format}")
-    except Exception as e:
-        raise RuntimeError(f"Error reading assemblies from {structure}: {e}")
+            return tuple(list_pdb_assemblies(PDBFile.read(src)))
+        cif_file = (CIFFile if structure_format == "mmcif" else BinaryCIFFile).read(src)
+        return tuple(list_assemblies(cif_file).keys())
 
 
 def rename_atom_attr(atom_ch):
@@ -141,29 +167,23 @@ class _IndexedPDBFile(PDBFile):
     file order, once for each of its operators."""
 
     def get_structure(self, *args, **kwargs):
+        # biotite's reading, whose errors can be the file's fault (get_structure_from_src refuses them); then FoldMatch's
+        # own step, which biotite's get_assembly runs from inside: a failure there is FoldMatch's, never the file's
         structure = super().get_structure(*args, **kwargs)
-        structure.set_annotation("au_index", np.arange(structure.array_length()))
+        with _internal("indexing the atoms of a PDB file's asymmetric unit"):
+            structure.set_annotation("au_index", np.arange(structure.array_length()))
         return structure
 
 
-def __get_pdb_structure(pdb_file, assembly_id=None):
-    if assembly_id is None:
-        return get_pdb_structure(
-            pdb_file,
-            model=1
-        )
-    assembly = get_pdb_assembly(
-        pdb_file,
-        assembly_id=assembly_id,
-        model=1
-    )
+def _number_pdb_copies(assembly):
     # biotite numbers the copies (sym_id) of each REMARK 350 list ('APPLY THE FOLLOWING TO CHAINS') from 0, so a chain
     # in two lists has two copies with one sym_id. The index in the asymmetric unit (_IndexedPDBFile) rises within a
     # copy, and two copies of a chain repeat its atoms, so it stops rising between them: counting where it stops gives
     # each copy of a chain a sym_id of its own (biotite's, in an assembly of one list)
-    starts = np.concatenate(([0], np.flatnonzero(np.diff(assembly.au_index) <= 0) + 1, [assembly.array_length()]))
-    assembly.set_annotation("sym_id", np.repeat(np.arange(len(starts) - 1), np.diff(starts)))
-    assembly.del_annotation("au_index")
+    with _internal("numbering the copies of a PDB assembly"):
+        starts = np.concatenate(([0], np.flatnonzero(np.diff(assembly.au_index) <= 0) + 1, [assembly.array_length()]))
+        assembly.set_annotation("sym_id", np.repeat(np.arange(len(starts) - 1), np.diff(starts)))
+        assembly.del_annotation("au_index")
     return assembly
 
 
@@ -175,27 +195,127 @@ def __rename_atom(atom):
     return atom
 
 
-def __get_structure(cif_file, assembly_id=None):
-    return get_structure(
-        cif_file,
-        model=1,
-        use_author_fields=False
-    ) if assembly_id is None else get_assembly(
-        cif_file,
-        assembly_id=assembly_id,
-        model=1,
-        use_author_fields=False
-    )
+def _check_format(structure_format):
+    # A format FoldMatch does not read is the caller's error, not the file's: a plain ValueError, never a refusal
+    value = getattr(structure_format, "value", structure_format)  # a StructureFormat, or its value
+    if value not in STRUCTURE_FORMATS:
+        raise ValueError(f"Unknown structure format {value!r}: expected one of {', '.join(STRUCTURE_FORMATS)}")
+    return value
 
-def __rewind(src):
+
+def _check_source(src, structure_format):
+    # The caller's mistakes in the source, before any reading: so that a TypeError biotite raises while reading never
+    # means one of them. bytes would reach biotite, which opens them as a path inside _refusing (BinaryCIF content
+    # would be refused as "embedded null byte"); a str with line breaks that names no file is a file's content passed
+    # by mistake, which open() would reject with the whole content in its message
+    if isinstance(src, (bytes, bytearray, memoryview)):
+        raise TypeError("A structure source is a path (a str or a PathLike) or an open stream, not bytes: wrap a "
+                        "file's content in io.BytesIO or io.StringIO")
+    if isinstance(src, str):
+        if ("\n" in src or "\r" in src) and not os.path.exists(src):
+            raise TypeError("A structure file's content was given where a path or an open stream is expected")
+        return
+    if isinstance(src, os.PathLike):
+        return
+    # A stream, of the mode its format is read in (biotite's own test, made here rather than during the read)
+    if structure_format == "binarycif":
+        if not is_binary(src):
+            raise TypeError("A file opened in 'binary' mode is required for binarycif")
+    elif not is_text(src):
+        raise TypeError(f"A file opened in 'text' mode is required for {structure_format}")
+
+
+def _check_assembly_id(assembly_id):
+    # An assembly ID of another type would be refused as one the file does not have ('1' is not 1)
+    if assembly_id is not None and not isinstance(assembly_id, str):
+        raise TypeError(f"assembly_id must be a str, not {type(assembly_id).__name__}")
+
+
+@contextmanager
+def _opened(src, structure_format):
+    # The stream to read: a path opened here (decompressed if it ends in .gz, whatever its case) and closed after the
+    # read, or the caller's stream, rewound and left open. Opening a path is not reading the file: its OSError
+    # (FileNotFoundError, PermissionError, IsADirectoryError) propagates unchanged, outside _refusing
+    mode = "rb" if structure_format == "binarycif" else "rt"
+    if isinstance(src, (str, os.PathLike)):
+        path = os.fspath(src)
+        opener = gzip.open if Path(path).suffix.lower() == ".gz" else open
+        with opener(path, mode) as f:
+            yield f
+    else:
+        _rewind(src)
+        yield src
+
+
+@contextmanager
+def _refusing(action, src, structure_format):
+    # What the file's reading raises because the file is not a valid structure file, as a refusal naming the source
+    malformed = _MALFORMED_BINARYCIF if structure_format == "binarycif" else _MALFORMED
+    try:
+        yield
+    except RefusalError:
+        raise
+    except DeserializationError as e:
+        # biotite parses a block, a category or a column when it is first used, and wraps whatever that raises in a
+        # DeserializationError, without a cause: the error underneath says whether the file is at fault
+        underneath = _underneath(e)
+        if isinstance(underneath, MemoryError):
+            raise underneath
+        if underneath is not None and not isinstance(underneath, malformed):
+            raise
+        raise _refusal(action, src, e) from e
+    except malformed as e:
+        raise _refusal(action, src, e) from e
+    except BaseException as e:
+        # biotite's PDB reader is Rust: a non-ASCII character across one of its fixed columns makes it panic, which
+        # pyo3 raises as a PanicException, a BaseException that no "except Exception" catches
+        if type(e).__name__ == "PanicException" and type(e).__module__ == "pyo3_runtime":
+            raise _refusal(action, src, e) from e
+        raise
+
+
+def _refusal(action, src, error):
+    return RefusalError(f"Error reading {action} from {_describe(src)}: {str(error) or type(error).__name__}")
+
+
+def _underneath(error):
+    # The first error under a chain of biotite's DeserializationErrors, or None if one of them is the first
+    seen = set()
+    while isinstance(error, DeserializationError) and id(error) not in seen:
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return error
+
+
+@contextmanager
+def _internal(step):
+    # A failure in FoldMatch's own processing of a structure that biotite read: an InternalError (a RuntimeError), so
+    # that it is neither refused as the file's fault nor reported as a one-line error without its traceback. A
+    # MemoryError is the machine's, not a FoldMatch bug: it propagates unchanged
+    try:
+        yield
+    except (InternalError, MemoryError):
+        raise
+    except Exception as e:
+        raise InternalError(f"FoldMatch failed {step}: {type(e).__name__}: {e}") from e
+
+
+def _describe(src):
+    # The source as a message names it: the path, the stream's file name, or the kind of stream (never its repr, which
+    # holds a memory address, nor its content)
+    if isinstance(src, (str, os.PathLike)):
+        return str(os.fspath(src))
+    try:
+        name = getattr(src, "name", None)
+    except Exception:  # noqa: BLE001  (a stream whose name cannot be read is named by its kind)
+        name = None
+    if isinstance(name, str) and name:
+        return name
+    return f"a {type(src).__name__} stream"
+
+
+def _rewind(src):
     # A stream (a downloaded file) may be read more than once: its assemblies, then each assembly.
     seekable = getattr(src, "seekable", None)
     if seekable is not None and seekable():
         src.seek(0)
-
-
-def __is_path(val):
-    if isinstance(val, (str, os.PathLike)):
-        return True
-    else:
-        return False

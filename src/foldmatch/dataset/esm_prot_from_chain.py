@@ -57,7 +57,7 @@ class EsmProtFromChain(Dataset):
         item_name = self.data.iloc[idx][EsmProtFromChain.ITEM_NAME_ATTR]
         structure = self.__structure_provider.get_structure(
             src_name=src_name,
-            src_structure=stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
+            src_structure=stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
             structure_format=self.structure_format
         )
         # The protein chain with that chain ID, its pieces joined: found in the whole structure, because the atoms with

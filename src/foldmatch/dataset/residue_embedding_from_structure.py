@@ -63,7 +63,7 @@ class ResidueEmbeddingFromStructure(ResidueEmbeddingFromTensorFile):
             progress.set_postfix_str(src_structure)
             structure = self.__structure_provider.get_structure(
                 src_name=src_name,
-                src_structure=stringio_from_url(src_structure) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
+                src_structure=stringio_from_url(src_structure, self.structure_format) if get_structure_location(src_structure) == StructureLocation.remote else src_structure,
                 structure_format=self.structure_format
             )
             for ch in get_protein_chains(structure, self.min_res_n):
